@@ -1,0 +1,32 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: veloq-dev
+    container_name: veloq-dev
+    volumes:
+      - .:/root/workspace
+      # Mount host SSH public key to temporary location
+      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
+      - ./docker/entrypoint.sh:/entrypoint.sh
+      # Optional: Cache cargo registry/target to speed up rebuilds across containers
+      # - cargo_cache:/usr/local/cargo
+      # - target_cache:/workspace/target
+    ports:
+      # SSH port mapping: connect via `ssh root@localhost -p 2222`
+      - "2222:22"
+      # Reserve ports for application usage
+      - "8080:8080"
+      - "8081:8081"
+      - "9000:9000"
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_PTRACE
+      - NET_ADMIN
+    tty: true
+
+# volumes:
+#   cargo_cache:
+#   target_cache:
