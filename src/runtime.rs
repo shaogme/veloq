@@ -3,6 +3,7 @@ pub mod context;
 pub mod driver;
 pub mod executor;
 pub mod join;
+pub mod macros;
 pub mod net;
 pub mod op;
 pub(crate) mod sys;
@@ -16,6 +17,7 @@ pub use join::JoinHandle;
 #[cfg(test)]
 mod tests {
     mod basic;
+    mod select_test;
     mod tcp;
     mod udp;
 }
