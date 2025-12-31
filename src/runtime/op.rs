@@ -23,6 +23,8 @@ pub enum IoResources {
     Timeout(Timeout),
     Accept(Accept),
     Connect(Connect),
+    SendTo(SendTo),
+    RecvFrom(RecvFrom),
     // Placeholder for when we have no resource back yet or it's empty
     None,
 }
@@ -98,7 +100,7 @@ impl<T: IoOp + 'static> Future for Op<T> {
                 driver.submit_op_resources(user_data, resources);
 
                 op.state = State::Submitted;
-                
+
                 // Register waker immediately by polling the op
                 // This ensures that if the operation completes quickly, we get woken up
                 let _ = driver.poll_op(user_data, cx);
@@ -285,7 +287,7 @@ impl OpLifecycle for Accept {
     fn into_output(self, res: std::io::Result<u32>) -> std::io::Result<Self::Output> {
         #[cfg(unix)]
         let fd = res? as SysRawOp;
-        
+
         #[cfg(windows)]
         let fd = {
             res?;
@@ -331,6 +333,190 @@ impl IoOp for Connect {
         match res {
             IoResources::Connect(r) => r,
             _ => panic!("Resource type mismatch for Connect"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct SendTo {
+    pub fd: SysRawOp,
+    pub buf: FixedBuf,
+    pub addr: Box<[u8]>,
+    pub addr_len: u32,
+    pub msghdr: Box<libc::msghdr>,
+    pub iovec: Box<libc::iovec>,
+}
+
+#[cfg(target_os = "windows")]
+pub struct SendTo {
+    pub fd: SysRawOp,
+    pub buf: FixedBuf,
+    pub addr: Box<[u8]>,
+    pub addr_len: u32,
+    /// WSABUF must remain valid for the duration of the async operation.
+    /// The pointer inside points to self.buf's data.
+    pub wsabuf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
+}
+
+impl SendTo {
+    /// Create a new SendTo operation with the given buffer and target address.
+    pub fn new(fd: SysRawOp, buf: FixedBuf, target: std::net::SocketAddr) -> Self {
+        let (raw_addr, raw_addr_len) = crate::runtime::sys::socket::socket_addr_trans(target);
+        let addr = raw_addr.into_boxed_slice();
+        let addr_len = raw_addr_len as u32;
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut iovec = Box::new(libc::iovec {
+                iov_base: buf.as_slice().as_ptr() as *mut _,
+                iov_len: buf.len(),
+            });
+            let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+            msghdr.msg_name = addr.as_ptr() as *mut _;
+            msghdr.msg_namelen = addr_len;
+            msghdr.msg_iov = iovec.as_mut() as *mut _;
+            msghdr.msg_iovlen = 1;
+
+            Self {
+                fd,
+                buf,
+                addr,
+                addr_len,
+                msghdr,
+                iovec,
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::Networking::WinSock::WSABUF;
+            let wsabuf = Box::new(WSABUF {
+                len: buf.len() as u32,
+                buf: buf.as_slice().as_ptr() as *mut u8,
+            });
+            Self {
+                fd,
+                buf,
+                addr,
+                addr_len,
+                wsabuf,
+            }
+        }
+    }
+}
+
+impl IoOp for SendTo {
+    fn into_resource(self) -> IoResources {
+        IoResources::SendTo(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::SendTo(r) => r,
+            _ => panic!("Resource type mismatch for SendTo"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct RecvFrom {
+    pub fd: SysRawOp,
+    pub buf: FixedBuf,
+    pub addr: Box<[u8]>,
+    pub addr_len: Box<u32>,
+    pub msghdr: Box<libc::msghdr>,
+    pub iovec: Box<libc::iovec>,
+}
+
+#[cfg(target_os = "windows")]
+pub struct RecvFrom {
+    pub fd: SysRawOp,
+    pub buf: FixedBuf,
+    pub addr: Box<[u8]>,
+    /// WSARecvFrom uses i32 for address length (in/out parameter)
+    pub addr_len: Box<i32>,
+    /// Flags for WSARecvFrom (in/out parameter)
+    pub flags: Box<u32>,
+    /// WSABUF must remain valid for the duration of the async operation.
+    pub wsabuf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
+}
+
+impl RecvFrom {
+    /// Create a new RecvFrom operation with the given buffer.
+    pub fn new(fd: SysRawOp, mut buf: FixedBuf) -> Self {
+        // SOCKADDR_STORAGE size: 128 bytes on both Linux and Windows
+        #[cfg(target_os = "linux")]
+        let addr_buf_size = std::mem::size_of::<libc::sockaddr_storage>();
+        #[cfg(target_os = "windows")]
+        let addr_buf_size = 128usize;
+
+        let addr = vec![0u8; addr_buf_size].into_boxed_slice();
+
+        #[cfg(target_os = "linux")]
+        {
+            let addr_len = Box::new(addr_buf_size as u32);
+            let mut iovec = Box::new(libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut _,
+                iov_len: buf.capacity(),
+            });
+            let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+            msghdr.msg_name = addr.as_ptr() as *mut _;
+            msghdr.msg_namelen = *addr_len;
+            msghdr.msg_iov = iovec.as_mut() as *mut _;
+            msghdr.msg_iovlen = 1;
+
+            Self {
+                fd,
+                buf,
+                addr,
+                addr_len,
+                msghdr,
+                iovec,
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::Networking::WinSock::WSABUF;
+            let addr_len = Box::new(addr_buf_size as i32);
+            let wsabuf = Box::new(WSABUF {
+                len: buf.capacity() as u32,
+                buf: buf.as_mut_ptr(),
+            });
+            let flags = Box::new(0u32);
+            Self {
+                fd,
+                buf,
+                addr,
+                addr_len,
+                flags,
+                wsabuf,
+            }
+        }
+    }
+
+    /// Get the returned address length after the operation completes.
+    pub fn get_addr_len(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            self.msghdr.msg_namelen as usize
+        }
+        #[cfg(target_os = "windows")]
+        {
+            *self.addr_len as usize
+        }
+    }
+}
+
+impl IoOp for RecvFrom {
+    fn into_resource(self) -> IoResources {
+        IoResources::RecvFrom(self)
+    }
+
+    fn from_resource(res: IoResources) -> Self {
+        match res {
+            IoResources::RecvFrom(r) => r,
+            _ => panic!("Resource type mismatch for RecvFrom"),
         }
     }
 }

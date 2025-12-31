@@ -1,4 +1,4 @@
-use crate::runtime::op::{Accept, Connect, IoResources, ReadFixed, Recv, Send, Timeout, WriteFixed};
+use crate::runtime::op::{Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, WriteFixed};
 use io_uring::{opcode, squeue, types};
 
 // Internal trait to generate SQEs
@@ -42,6 +42,8 @@ impl UringOp for IoResources {
             IoResources::Timeout(op) => op.make_sqe(),
             IoResources::Accept(op) => op.make_sqe(),
             IoResources::Connect(op) => op.make_sqe(),
+            IoResources::SendTo(op) => op.make_sqe(),
+            IoResources::RecvFrom(op) => op.make_sqe(),
             IoResources::None => opcode::Nop::new().build(),
         }
     }
@@ -97,6 +99,18 @@ impl UringOp for Send {
             self.buf.len() as u32,
         )
         .build()
+    }
+}
+
+impl UringOp for SendTo {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        opcode::SendMsg::new(types::Fd(self.fd), &*self.msghdr as *const _).build()
+    }
+}
+
+impl UringOp for RecvFrom {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        opcode::RecvMsg::new(types::Fd(self.fd), &mut *self.msghdr as *mut _).build()
     }
 }
 

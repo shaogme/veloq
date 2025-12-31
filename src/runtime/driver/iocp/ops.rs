@@ -1,9 +1,9 @@
-use crate::runtime::op::{Accept, Connect, ReadFixed, Recv, Send, WriteFixed};
+use crate::runtime::op::{Accept, Connect, ReadFixed, Recv, RecvFrom, Send, SendTo, WriteFixed};
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, bind,
-    getsockname,
+    AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
+    WSAGetLastError, WSARecvFrom, WSASendTo, bind, getsockname,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
@@ -268,6 +268,95 @@ pub(crate) unsafe fn submit_connect(
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return (Some(io::Error::from_raw_os_error(err as i32)), true);
+        }
+    }
+    (None, false)
+}
+
+/// Submit an asynchronous UDP send operation using WSASendTo.
+///
+/// # Safety
+/// The caller must ensure that:
+/// - `op` remains valid for the duration of the async operation
+/// - `overlapped` points to a valid OVERLAPPED structure
+/// - The socket is associated with the completion port
+pub(crate) unsafe fn submit_send_to(
+    op: &mut SendTo,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+) -> (Option<io::Error>, bool) {
+    // Associate socket with IOCP
+    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+
+    // Update WSABUF to point to current buffer data
+    // This is safe because both wsabuf and buf are owned by op
+    op.wsabuf.len = op.buf.len() as u32;
+    op.wsabuf.buf = op.buf.as_slice().as_ptr() as *mut u8;
+
+    let mut bytes_sent = 0u32;
+    let ret = unsafe {
+        WSASendTo(
+            op.fd as SOCKET,
+            op.wsabuf.as_ref(),
+            1, // dwBufferCount
+            &mut bytes_sent,
+            0, // dwFlags
+            op.addr.as_ptr() as *const SOCKADDR,
+            op.addr_len as i32,
+            overlapped as *mut _,
+            None, // lpCompletionRoutine (not used with IOCP)
+        )
+    };
+
+    if ret == SOCKET_ERROR {
+        let err = unsafe { WSAGetLastError() };
+        // WSA_IO_PENDING = 997 = ERROR_IO_PENDING
+        if err != ERROR_IO_PENDING as i32 {
+            return (Some(io::Error::from_raw_os_error(err)), true);
+        }
+    }
+    (None, false)
+}
+
+/// Submit an asynchronous UDP receive operation using WSARecvFrom.
+///
+/// # Safety
+/// The caller must ensure that:
+/// - `op` remains valid for the duration of the async operation
+/// - `overlapped` points to a valid OVERLAPPED structure
+/// - The socket is associated with the completion port
+pub(crate) unsafe fn submit_recv_from(
+    op: &mut RecvFrom,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+) -> (Option<io::Error>, bool) {
+    // Associate socket with IOCP
+    unsafe { CreateIoCompletionPort(op.fd as HANDLE, port, 0, 0) };
+
+    // Update WSABUF to point to current buffer data
+    op.wsabuf.len = op.buf.capacity() as u32;
+    op.wsabuf.buf = op.buf.as_mut_ptr();
+
+    let mut bytes_received = 0u32;
+    let ret = unsafe {
+        WSARecvFrom(
+            op.fd as SOCKET,
+            op.wsabuf.as_ref(),
+            1, // dwBufferCount
+            &mut bytes_received,
+            op.flags.as_mut(), // lpFlags (in/out)
+            op.addr.as_mut_ptr() as *mut SOCKADDR,
+            op.addr_len.as_mut(), // lpFromlen (in/out)
+            overlapped as *mut _,
+            None, // lpCompletionRoutine (not used with IOCP)
+        )
+    };
+
+    if ret == SOCKET_ERROR {
+        let err = unsafe { WSAGetLastError() };
+        // WSA_IO_PENDING = 997 = ERROR_IO_PENDING
+        if err != ERROR_IO_PENDING as i32 {
+            return (Some(io::Error::from_raw_os_error(err)), true);
         }
     }
     (None, false)

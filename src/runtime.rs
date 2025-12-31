@@ -15,5 +15,5 @@ pub use executor::LocalExecutor;
 mod tests {
     mod basic;
     mod tcp;
+    mod udp;
 }
-

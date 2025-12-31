@@ -93,6 +93,14 @@ mod unix {
             Self::new_v6(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
         }
 
+        pub fn new_udp_v4() -> io::Result<Self> {
+            Self::new_v4(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        }
+
+        pub fn new_udp_v6() -> io::Result<Self> {
+            Self::new_v6(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        }
+
         pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
             let (raw_addr, raw_addr_len) = socket_addr_trans(addr);
             let ret =
@@ -184,9 +192,9 @@ mod windows {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::ptr;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
-        SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSADATA, WSASocketW, WSAStartup, bind, closesocket,
-        getsockname, listen,
+        AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM,
+        SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSADATA, WSASocketW, WSAStartup,
+        bind, closesocket, getsockname, listen,
     };
 
     /// Winsock Initialization Hook
@@ -276,6 +284,14 @@ mod windows {
 
         pub fn new_tcp_v6() -> io::Result<Self> {
             Self::new(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
+        }
+
+        pub fn new_udp_v4() -> io::Result<Self> {
+            Self::new(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        }
+
+        pub fn new_udp_v6() -> io::Result<Self> {
+            Self::new(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
         }
 
         pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {

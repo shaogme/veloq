@@ -339,6 +339,12 @@ impl Driver for IocpDriver {
                 });
                 (None, false)
             }
+            IoResources::SendTo(op) => unsafe {
+                ops::submit_send_to(op, self.port, overlapped_ptr)
+            },
+            IoResources::RecvFrom(op) => unsafe {
+                ops::submit_recv_from(op, self.port, overlapped_ptr)
+            },
         };
 
         if let Some(op) = self.ops.get_mut(user_data) {
@@ -408,6 +414,8 @@ impl Driver for IocpDriver {
                 IoResources::Send(r) => Some(r.fd as HANDLE),
                 IoResources::Accept(r) => Some(r.fd as HANDLE),
                 IoResources::Connect(r) => Some(r.fd as HANDLE),
+                IoResources::SendTo(r) => Some(r.fd as HANDLE),
+                IoResources::RecvFrom(r) => Some(r.fd as HANDLE),
                 _ => None,
             };
 
