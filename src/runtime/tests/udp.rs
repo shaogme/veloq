@@ -59,7 +59,7 @@ fn test_udp_send_recv() {
 
     exec.block_on(async move {
         // Receiver task: socket1 waits for data
-        spawn(async move {
+        let handler = spawn(async move {
             let mut buf = alloc_buf(&pool_clone);
             buf.set_len(buf.capacity());
             let (result, _buf) = socket1_clone.recv_from(buf).await;
@@ -77,6 +77,8 @@ fn test_udp_send_recv() {
         let (result, _) = socket2_rc.send_to(send_buf, addr1).await;
         let bytes_sent = result.expect("send_to failed");
         println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
+        
+        handler.await;
     });
 }
 
@@ -106,7 +108,7 @@ fn test_udp_echo() {
         let driver_inner = driver_weak.upgrade().unwrap();
 
         // Server task: receive and echo back
-        spawn(async move {
+        let server_h = spawn(async move {
             let driver = current_driver().upgrade().unwrap();
 
             // Receive data
@@ -153,6 +155,8 @@ fn test_udp_echo() {
         assert_eq!(bytes_sent as u32, bytes_received);
         assert_eq!(&recv_buf.as_slice()[..bytes_received as usize], test_data);
         println!("UDP echo test successful!");
+        
+        server_h.await;
     });
 }
 
@@ -178,7 +182,7 @@ fn test_udp_multiple_messages() {
 
     exec.block_on(async move {
         // Receiver task
-        spawn(async move {
+        let h_recv = spawn(async move {
             for i in 0..NUM_MESSAGES {
                 let mut buf = alloc_buf(&pool_clone);
                 buf.set_len(buf.capacity());
@@ -201,6 +205,8 @@ fn test_udp_multiple_messages() {
             println!("Sent message {}", i);
         }
         println!("Sent all {} messages", NUM_MESSAGES);
+        
+        h_recv.await;
     });
 }
 
@@ -226,7 +232,7 @@ fn test_udp_large_data() {
 
     exec.block_on(async move {
         // Receiver task
-        spawn(async move {
+        let h_recv = spawn(async move {
             let mut buf = alloc_buf(&pool_clone);
             buf.set_len(buf.capacity());
             let (result, buf) = socket1_clone.recv_from(buf).await;
@@ -253,6 +259,8 @@ fn test_udp_large_data() {
         let bytes = result.expect("send_to failed") as usize;
         assert_eq!(bytes, DATA_SIZE);
         println!("Sent {} bytes", bytes);
+        
+        h_recv.await;
     });
 }
 
@@ -307,7 +315,7 @@ fn test_multithread_udp() {
             let socket1_clone = socket1_rc.clone();
 
             // Receiver task
-            spawn(async move {
+            let h_recv = spawn(async move {
                 let driver = current_driver().upgrade().unwrap();
                 let mut buf = driver.borrow().alloc_fixed_buffer().unwrap();
                 buf.set_len(buf.capacity());
@@ -326,6 +334,8 @@ fn test_multithread_udp() {
             let (result, _) = socket2_rc.send_to(buf, addr1).await;
             result.expect("send_to failed");
             println!("Worker {} sent message", worker_id);
+            
+            h_recv.await;
 
             counter.fetch_add(1, Ordering::SeqCst);
         });

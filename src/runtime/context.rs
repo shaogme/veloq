@@ -9,6 +9,7 @@ use std::future::Future;
 use std::rc::{Rc, Weak};
 
 use crate::runtime::driver::PlatformDriver;
+use crate::runtime::join::JoinHandle;
 use crate::runtime::task::Task;
 
 // Thread-local storage for the current executor context.
@@ -58,9 +59,10 @@ pub(crate) fn enter(
 ///     println!("Hello from spawned task!");
 /// });
 /// ```
-pub fn spawn<F>(future: F)
+pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output = T> + 'static,
+    T: 'static,
 {
     CONTEXT.with(|ctx| {
         let ctx = ctx.borrow();
@@ -73,8 +75,13 @@ where
             .upgrade()
             .expect("executor has been dropped");
 
-        let task = Task::new(future, ctx.queue.clone());
+        let (handle, producer) = JoinHandle::new();
+        let task = Task::new(async move {
+            let output = future.await;
+            producer.set(output);
+        }, ctx.queue.clone());
         queue.borrow_mut().push_back(task);
+        handle
     })
 }
 

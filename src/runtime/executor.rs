@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::driver::{Driver, PlatformDriver};
+use crate::runtime::join::JoinHandle;
 use crate::runtime::task::Task;
 
 pub struct LocalExecutor {
@@ -28,12 +29,18 @@ impl LocalExecutor {
         Self { driver, queue }
     }
 
-    pub fn spawn<F>(&self, future: F)
+    pub fn spawn<F, T>(&self, future: F) -> JoinHandle<T>
     where
-        F: Future<Output = ()> + 'static,
+        F: Future<Output = T> + 'static,
+        T: 'static,
     {
-        let task = Task::new(future, Rc::downgrade(&self.queue));
+        let (handle, producer) = JoinHandle::new();
+        let task = Task::new(async move {
+            let output = future.await;
+            producer.set(output);
+        }, Rc::downgrade(&self.queue));
         self.queue.borrow_mut().push_back(task);
+        handle
     }
 
     pub fn block_on<F>(&self, future: F) -> F::Output

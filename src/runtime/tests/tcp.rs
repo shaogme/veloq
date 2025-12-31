@@ -35,7 +35,7 @@ fn test_tcp_connect_with_global_api() {
 
     exec.block_on(async move {
         // Server task using global spawn
-        spawn(async move {
+        let server_h = spawn(async move {
             let (stream, peer_addr) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted connection from: {}", peer_addr);
             drop(stream);
@@ -48,6 +48,8 @@ fn test_tcp_connect_with_global_api() {
             .expect("Failed to connect");
         println!("Connected successfully");
         drop(stream);
+        
+        server_h.await;
     });
 }
 
@@ -70,7 +72,7 @@ fn test_tcp_send_recv() {
         let driver_rc = driver_weak.upgrade().unwrap();
 
         // Server task
-        spawn(async move {
+        let server_h = spawn(async move {
             let driver = current_driver().upgrade().unwrap();
             let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
@@ -120,6 +122,8 @@ fn test_tcp_send_recv() {
         assert_eq!(bytes_sent as usize, bytes_received);
         assert_eq!(&recv_buf.as_slice()[..bytes_received], test_data);
         println!("Data verification successful!");
+        
+        server_h.await;
     });
 }
 
@@ -140,7 +144,7 @@ fn test_tcp_multiple_connections() {
 
     exec.block_on(async move {
         // Server task: accept all connections
-        spawn(async move {
+        let server_h = spawn(async move {
             for i in 0..NUM_CONNECTIONS {
                 let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
                 println!("Accepted connection {} from {}", i, peer);
@@ -159,6 +163,8 @@ fn test_tcp_multiple_connections() {
             drop(stream);
         }
         println!("All {} connections completed", NUM_CONNECTIONS);
+        
+        server_h.await;
     });
 }
 
@@ -182,7 +188,7 @@ fn test_tcp_large_data_transfer() {
 
     exec.block_on(async move {
         // Server task
-        spawn(async move {
+        let server_h = spawn(async move {
             let (stream, _) = listener_clone.accept().await.expect("Accept failed");
 
             let mut total_received = 0;
@@ -229,6 +235,8 @@ fn test_tcp_large_data_transfer() {
 
         assert_eq!(total_sent, DATA_SIZE);
         println!("Client sent all {} bytes", DATA_SIZE);
+        
+        server_h.await;
     });
 }
 
@@ -283,7 +291,7 @@ fn test_tcp_recv_zero_bytes() {
 
     exec.block_on(async move {
         // Server: accept and immediately close
-        spawn(async move {
+        let server_h = spawn(async move {
             let (stream, _) = listener_clone.accept().await.expect("Accept failed");
             println!("Server accepted and closing connection");
             drop(stream);
@@ -305,6 +313,8 @@ fn test_tcp_recv_zero_bytes() {
         } else {
             println!("Received error on closed connection: {:?}", result.err());
         }
+        
+        server_h.await;
     });
 }
 
@@ -331,7 +341,7 @@ fn test_tcp_ipv6() {
     let listener_clone = listener_rc.clone();
 
     exec.block_on(async move {
-        spawn(async move {
+        let server_h = spawn(async move {
             let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted IPv6 connection from: {}", peer);
             drop(stream);
@@ -344,6 +354,8 @@ fn test_tcp_ipv6() {
 
         println!("IPv6 connection successful");
         drop(stream);
+        
+        server_h.await;
     });
 }
 
@@ -372,7 +384,7 @@ fn test_multithread_tcp_connections() {
             let listener_clone = listener_rc.clone();
 
             // Server task
-            spawn(async move {
+            let server_h = spawn(async move {
                 let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
                 println!("Worker {} accepted from {}", worker_id, peer);
                 drop(stream);
@@ -384,6 +396,8 @@ fn test_multithread_tcp_connections() {
                 .expect("Failed to connect");
             println!("Worker {} connected to self", worker_id);
             drop(stream);
+            
+            server_h.await;
 
             counter.fetch_add(1, Ordering::SeqCst);
         });
