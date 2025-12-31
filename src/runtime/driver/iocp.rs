@@ -149,6 +149,15 @@ impl IocpDriver {
         let user_data = entry.user_data;
 
         if self.ops.contains(user_data) {
+            // Check if the operation was cancelled.
+            // If it was cancelled, the Future waiting for it is gone (dropped).
+            // We must clean up resources (OpEntry, Buffer, Overlapped) immediately
+            // to prevent memory leaks.
+            if self.ops[user_data].cancelled {
+                self.ops.remove(user_data);
+                return Ok(());
+            }
+
             let op = &mut self.ops[user_data];
 
             if op.result.is_none() {
@@ -388,6 +397,19 @@ impl Driver for IocpDriver {
     }
 
     fn cancel_op(&mut self, user_data: usize) {
+        // Optimization: if the op is just a Timer/Timeout (no kernel resources),
+        // we can remove it immediately.
+        let is_timeout = if let Some(op) = self.ops.get_mut(user_data) {
+            matches!(op.resources, IoResources::Timeout(_))
+        } else {
+            false
+        };
+
+        if is_timeout {
+            self.ops.remove(user_data);
+            return;
+        }
+
         if let Some(op) = self.ops.get_mut(user_data) {
             op.cancelled = true;
 
