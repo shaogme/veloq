@@ -399,7 +399,29 @@ impl Driver for IocpDriver {
     fn cancel_op(&mut self, user_data: usize) {
         if let Some(op) = self.ops.get_mut(user_data) {
             op.cancelled = true;
-            // TODO: call CancelIoEx with op.fd and op.overlapped
+
+            // Extract fd from resources
+            let fd = match &op.resources {
+                IoResources::ReadFixed(r) => Some(r.fd as HANDLE),
+                IoResources::WriteFixed(r) => Some(r.fd as HANDLE),
+                IoResources::Recv(r) => Some(r.fd as HANDLE),
+                IoResources::Send(r) => Some(r.fd as HANDLE),
+                IoResources::Accept(r) => Some(r.fd as HANDLE),
+                IoResources::Connect(r) => Some(r.fd as HANDLE),
+                _ => None,
+            };
+
+            // Call CancelIoEx if we have both fd and overlapped
+            if let (Some(fd), Some(overlapped)) = (fd, &op.overlapped) {
+                unsafe {
+                    use windows_sys::Win32::System::IO::CancelIoEx;
+                    let _ = CancelIoEx(fd, &overlapped.inner as *const _ as *mut _);
+                    // We ignore the result because:
+                    // 1. The operation might have already completed
+                    // 2. The handle might be invalid
+                    // 3. We've already marked it as cancelled
+                }
+            }
         }
     }
 
