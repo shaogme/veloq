@@ -1,7 +1,7 @@
-use crate::buffer::FixedBuf;
-use crate::driver::PlatformDriver;
-use crate::op::{Accept, Connect, IoFd, Op, Recv, Send, SysRawOp};
-use crate::sys::socket::Socket;
+use crate::io::buffer::FixedBuf;
+use crate::io::driver::PlatformDriver;
+use crate::io::op::{Accept, Connect, IoFd, Op, Recv, Send, SysRawOp};
+use crate::io::sys::socket::Socket;
 use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -19,14 +19,14 @@ pub struct TcpStream {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        use crate::sys::socket::Socket;
+        use crate::io::sys::socket::Socket;
         let _ = unsafe { Socket::from_raw(self.fd) };
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        use crate::sys::socket::Socket;
+        use crate::io::sys::socket::Socket;
         let _ = unsafe { Socket::from_raw(self.fd) };
     }
 }
@@ -58,7 +58,7 @@ impl TcpListener {
     }
 
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        use crate::op::OpLifecycle;
+        use crate::io::op::OpLifecycle;
 
         // 1. Pre-allocate resources (platform specific)
         let pre_alloc = Accept::pre_alloc(self.fd)?;
@@ -83,7 +83,7 @@ impl TcpListener {
     }
     
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        use crate::sys::socket::Socket;
+        use crate::io::sys::socket::Socket;
         use std::mem::ManuallyDrop;
 
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.fd)) };
@@ -103,7 +103,7 @@ impl TcpStream {
         };
         let fd = socket.into_raw();
 
-        let (raw_addr, raw_addr_len) = crate::sys::socket::socket_addr_trans(addr);
+        let (raw_addr, raw_addr_len) = crate::io::sys::socket::socket_addr_trans(addr);
         let op = Connect {
             fd: IoFd::Raw(fd),
             addr: raw_addr.into_boxed_slice(),

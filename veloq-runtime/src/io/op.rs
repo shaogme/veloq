@@ -13,7 +13,7 @@ pub type SysRawOp = RawFd;
 #[cfg(windows)]
 pub type SysRawOp = RawHandle;
 
-use crate::buffer::FixedBuf;
+use crate::io::buffer::FixedBuf;
 
 /// Represents the source of an IO operation: either a raw handle/fd or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,7 @@ enum State {
     Completed,
 }
 
-use crate::driver::{Driver, PlatformDriver};
+use crate::io::driver::{Driver, PlatformDriver};
 use std::cell::RefCell;
 use std::rc::Weak;
 
@@ -276,7 +276,7 @@ impl OpLifecycle for Accept {
         {
             // FIXME: accurately detect family from _fd or generic
             // For now assuming IPv4 or relying on internal logic
-            use crate::sys::socket::Socket;
+            use crate::io::sys::socket::Socket;
             Ok(Socket::new_tcp_v4()?.into_raw())
         }
         #[cfg(unix)]
@@ -316,7 +316,7 @@ impl OpLifecycle for Accept {
             self.accept_socket
         };
 
-        use crate::sys::socket::to_socket_addr;
+        use crate::io::sys::socket::to_socket_addr;
         let addr = if let Some(a) = self.remote_addr {
             a
         } else {
@@ -383,7 +383,7 @@ pub struct SendTo {
 impl SendTo {
     /// Create a new SendTo operation with the given buffer and target address.
     pub fn new(fd: SysRawOp, buf: FixedBuf, target: std::net::SocketAddr) -> Self {
-        let (raw_addr, raw_addr_len) = crate::sys::socket::socket_addr_trans(target);
+        let (raw_addr, raw_addr_len) = crate::io::sys::socket::socket_addr_trans(target);
         let addr = raw_addr.into_boxed_slice();
         let addr_len = raw_addr_len as u32;
 

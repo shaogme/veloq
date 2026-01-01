@@ -4,11 +4,11 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use crate::driver::{Driver, PlatformDriver};
-use crate::join::JoinHandle;
-use crate::task::Task;
+use crate::io::driver::{Driver, PlatformDriver};
+use crate::runtime::join::JoinHandle;
+use crate::runtime::task::Task;
 
-use crate::buffer::BufferPool;
+use crate::io::buffer::BufferPool;
 
 pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
@@ -64,7 +64,7 @@ impl LocalExecutor {
         F: Future,
     {
         // Enter the runtime context - this enables spawn() and current_driver()
-        let _guard = crate::context::enter(
+        let _guard = crate::runtime::context::enter(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
             Rc::downgrade(&self.buffer_pool),

@@ -1,4 +1,4 @@
-use crate::op::{
+use crate::io::op::{
     Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, WriteFixed,
 };
 use io_uring::{opcode, squeue, types};
@@ -11,7 +11,7 @@ pub(crate) trait UringOp {
 impl UringOp for ReadFixed {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => opcode::ReadFixed::new(
+            crate::io::op::IoFd::Raw(fd) => opcode::ReadFixed::new(
                 types::Fd(fd),
                 self.buf.as_mut_ptr(),
                 self.buf.capacity() as u32,
@@ -19,7 +19,7 @@ impl UringOp for ReadFixed {
             )
             .offset(self.offset)
             .build(),
-            crate::op::IoFd::Fixed(idx) => opcode::ReadFixed::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::ReadFixed::new(
                 types::Fixed(idx),
                 self.buf.as_mut_ptr(),
                 self.buf.capacity() as u32,
@@ -34,7 +34,7 @@ impl UringOp for ReadFixed {
 impl UringOp for WriteFixed {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => opcode::WriteFixed::new(
+            crate::io::op::IoFd::Raw(fd) => opcode::WriteFixed::new(
                 types::Fd(fd),
                 self.buf.as_slice().as_ptr(),
                 self.buf.len() as u32,
@@ -42,7 +42,7 @@ impl UringOp for WriteFixed {
             )
             .offset(self.offset)
             .build(),
-            crate::op::IoFd::Fixed(idx) => opcode::WriteFixed::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::WriteFixed::new(
                 types::Fixed(idx),
                 self.buf.as_slice().as_ptr(),
                 self.buf.len() as u32,
@@ -83,13 +83,13 @@ impl UringOp for Timeout {
 impl UringOp for Accept {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => opcode::Accept::new(
+            crate::io::op::IoFd::Raw(fd) => opcode::Accept::new(
                 types::Fd(fd),
                 self.addr.as_mut_ptr() as *mut _,
                 self.addr_len.as_mut() as *mut _,
             )
             .build(),
-            crate::op::IoFd::Fixed(idx) => opcode::Accept::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::Accept::new(
                 types::Fixed(idx),
                 self.addr.as_mut_ptr() as *mut _,
                 self.addr_len.as_mut() as *mut _,
@@ -102,11 +102,11 @@ impl UringOp for Accept {
 impl UringOp for Connect {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => {
+            crate::io::op::IoFd::Raw(fd) => {
                 opcode::Connect::new(types::Fd(fd), self.addr.as_ptr() as *const _, self.addr_len)
                     .build()
             }
-            crate::op::IoFd::Fixed(idx) => opcode::Connect::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::Connect::new(
                 types::Fixed(idx),
                 self.addr.as_ptr() as *const _,
                 self.addr_len,
@@ -119,13 +119,13 @@ impl UringOp for Connect {
 impl UringOp for Recv {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => opcode::Recv::new(
+            crate::io::op::IoFd::Raw(fd) => opcode::Recv::new(
                 types::Fd(fd),
                 self.buf.as_mut_ptr(),
                 self.buf.capacity() as u32,
             )
             .build(),
-            crate::op::IoFd::Fixed(idx) => opcode::Recv::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::Recv::new(
                 types::Fixed(idx),
                 self.buf.as_mut_ptr(),
                 self.buf.capacity() as u32,
@@ -138,13 +138,13 @@ impl UringOp for Recv {
 impl UringOp for Send {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => opcode::Send::new(
+            crate::io::op::IoFd::Raw(fd) => opcode::Send::new(
                 types::Fd(fd),
                 self.buf.as_slice().as_ptr(),
                 self.buf.len() as u32,
             )
             .build(),
-            crate::op::IoFd::Fixed(idx) => opcode::Send::new(
+            crate::io::op::IoFd::Fixed(idx) => opcode::Send::new(
                 types::Fixed(idx),
                 self.buf.as_slice().as_ptr(),
                 self.buf.len() as u32,
@@ -161,10 +161,10 @@ impl UringOp for SendTo {
         // If not, we might need to error or use Fd(idx) + FIXED_FILE flag manually.
         // For now, let's assume types::Fixed works if the crate is up to date.
         match self.fd {
-            crate::op::IoFd::Raw(fd) => {
+            crate::io::op::IoFd::Raw(fd) => {
                 opcode::SendMsg::new(types::Fd(fd), &*self.msghdr as *const _).build()
             }
-            crate::op::IoFd::Fixed(idx) => {
+            crate::io::op::IoFd::Fixed(idx) => {
                 opcode::SendMsg::new(types::Fixed(idx), &*self.msghdr as *const _).build()
             }
         }
@@ -174,10 +174,10 @@ impl UringOp for SendTo {
 impl UringOp for RecvFrom {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            crate::op::IoFd::Raw(fd) => {
+            crate::io::op::IoFd::Raw(fd) => {
                 opcode::RecvMsg::new(types::Fd(fd), &mut *self.msghdr as *mut _).build()
             }
-            crate::op::IoFd::Fixed(idx) => {
+            crate::io::op::IoFd::Fixed(idx) => {
                 opcode::RecvMsg::new(types::Fixed(idx), &mut *self.msghdr as *mut _).build()
             }
         }

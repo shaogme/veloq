@@ -1,18 +1,13 @@
-pub mod buffer;
-pub mod context;
-pub mod driver;
-pub mod executor;
-pub mod join;
 pub mod macros;
 pub mod net;
-pub mod op;
-pub(crate) mod sys;
-pub mod task;
+pub mod io;
+pub mod runtime;
 
 // Re-export key functions for convenient access
-pub use context::{current_buffer_pool, current_driver, spawn, yield_now};
-pub use executor::LocalExecutor;
-pub use join::JoinHandle;
+pub use runtime::{current_buffer_pool, current_driver, spawn, yield_now};
+pub use runtime::LocalExecutor;
+pub use runtime::JoinHandle;
+
 
 #[cfg(test)]
 mod tests {

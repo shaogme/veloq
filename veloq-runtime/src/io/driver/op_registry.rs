@@ -1,4 +1,4 @@
-use crate::op::IoResources;
+use crate::io::op::IoResources;
 use slab::Slab;
 use std::io;
 use std::ops::{Index, IndexMut};

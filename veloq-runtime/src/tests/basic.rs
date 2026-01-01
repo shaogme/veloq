@@ -1,8 +1,8 @@
 //! Basic runtime tests for executor, context, and spawn functionality.
 
-use crate::buffer::BufferPool;
-use crate::executor::{LocalExecutor, Runtime};
-use crate::op::{IoOp, IoResources, Op};
+use crate::io::buffer::BufferPool;
+use crate::runtime::executor::{LocalExecutor, Runtime};
+use crate::io::op::{IoOp, IoResources, Op};
 use crate::{current_driver, spawn};
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -1,5 +1,5 @@
 // use crate::buffer::FixedBuf;
-use crate::op::IoResources;
+use crate::io::op::IoResources;
 
 pub(crate) mod op_registry;
 use std::io;
@@ -33,15 +33,15 @@ pub trait Driver {
 
     /// Register a buffer pool with the driver.
     /// This allows the driver to optimize buffer access (e.g. fixed buffers in io_uring).
-    fn register_buffer_pool(&mut self, pool: &crate::buffer::BufferPool) -> io::Result<()>;
+    fn register_buffer_pool(&mut self, pool: &crate::io::buffer::BufferPool) -> io::Result<()>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.
-    fn register_files(&mut self, files: &[crate::op::SysRawOp])
-    -> io::Result<Vec<crate::op::IoFd>>;
+    fn register_files(&mut self, files: &[crate::io::op::SysRawOp])
+    -> io::Result<Vec<crate::io::op::IoFd>>;
 
     /// Unregister a set of file descriptors/handles.
-    fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()>;
 }
 
 // Platform-specific driver implementations

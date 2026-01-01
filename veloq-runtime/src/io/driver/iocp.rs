@@ -3,10 +3,10 @@ mod ops;
 #[cfg(test)]
 mod tests;
 
-// use crate::buffer::{BufferPool, FixedBuf};
-use crate::driver::Driver;
-use crate::driver::op_registry::{OpEntry, OpRegistry};
-use crate::op::IoResources;
+// use crate::io::buffer::{BufferPool, FixedBuf};
+use crate::io::driver::Driver;
+use crate::io::driver::op_registry::{OpEntry, OpRegistry};
+use crate::io::op::IoResources;
 use ext::Extensions;
 use ops::IocpSubmit;
 use std::io;
@@ -377,7 +377,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -391,7 +391,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -403,7 +403,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -415,7 +415,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -427,7 +427,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -439,7 +439,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -451,7 +451,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -463,7 +463,7 @@ impl Driver for IocpDriver {
                                 r.fd.raw()
                                     .is_none()
                                     .then(|| {
-                                        if let crate::op::IoFd::Fixed(i) = r.fd {
+                                        if let crate::io::op::IoFd::Fixed(i) = r.fd {
                                             Some(i)
                                         } else {
                                             None
@@ -507,15 +507,15 @@ impl Driver for IocpDriver {
         }
     }
 
-    fn register_buffer_pool(&mut self, _pool: &crate::buffer::BufferPool) -> io::Result<()> {
+    fn register_buffer_pool(&mut self, _pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
         // No-op for Windows currently
         Ok(())
     }
 
     fn register_files(
         &mut self,
-        files: &[crate::op::SysRawOp],
-    ) -> io::Result<Vec<crate::op::IoFd>> {
+        files: &[crate::io::op::SysRawOp],
+    ) -> io::Result<Vec<crate::io::op::IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
@@ -525,14 +525,14 @@ impl Driver for IocpDriver {
                 self.registered_files.push(Some(handle as HANDLE));
                 self.registered_files.len() - 1
             };
-            registered.push(crate::op::IoFd::Fixed(idx as u32));
+            registered.push(crate::io::op::IoFd::Fixed(idx as u32));
         }
         Ok(registered)
     }
 
-    fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
         for fd in files {
-            if let crate::op::IoFd::Fixed(idx) = fd {
+            if let crate::io::op::IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
                 if idx < self.registered_files.len() {
                     if self.registered_files[idx].is_some() {

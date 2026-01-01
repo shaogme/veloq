@@ -1,4 +1,4 @@
-use crate::executor::LocalExecutor;
+use crate::runtime::executor::LocalExecutor;
 use crate::select;
 use std::future::Future;
 use std::pin::Pin;

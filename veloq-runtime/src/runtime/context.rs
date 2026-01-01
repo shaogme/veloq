@@ -8,11 +8,11 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::{Rc, Weak};
 
-use crate::driver::PlatformDriver;
-use crate::join::JoinHandle;
-use crate::task::Task;
+use crate::io::driver::PlatformDriver;
+use crate::runtime::join::JoinHandle;
+use crate::runtime::task::Task;
 
-use crate::buffer::BufferPool;
+use crate::io::buffer::BufferPool;
 
 // Thread-local storage for the current executor context.
 thread_local! {

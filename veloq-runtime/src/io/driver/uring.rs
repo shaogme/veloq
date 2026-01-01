@@ -1,6 +1,6 @@
-// use crate::buffer::{BufferPool, FixedBuf};
-use crate::driver::op_registry::{OpEntry, OpRegistry};
-use crate::op::IoResources;
+// use crate::io::buffer::{BufferPool, FixedBuf};
+use crate::io::driver::op_registry::{OpEntry, OpRegistry};
+use crate::io::op::IoResources;
 use io_uring::{IoUring, opcode, squeue};
 use std::io;
 use std::task::{Context, Poll};
@@ -184,7 +184,7 @@ impl UringDriver {
 
 
 
-    pub fn register_files(&mut self, files: &[crate::op::SysRawOp]) -> io::Result<Vec<crate::op::IoFd>> {
+    pub fn register_files(&mut self, files: &[crate::io::op::SysRawOp]) -> io::Result<Vec<crate::io::op::IoFd>> {
         // Note: this replaces the entire file table in io_uring currently.
         // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
         // to incrementally add files, or manage a sparse table.
@@ -193,12 +193,12 @@ impl UringDriver {
         
         let mut fixed_fds = Vec::with_capacity(files.len());
         for i in 0..files.len() {
-            fixed_fds.push(crate::op::IoFd::Fixed(i as u32));
+            fixed_fds.push(crate::io::op::IoFd::Fixed(i as u32));
         }
         Ok(fixed_fds)
     }
 
-    pub fn unregister_files(&mut self, _files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    pub fn unregister_files(&mut self, _files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
         // specific file unregistration not strictly supported by raw unregister_files (which kills all)
         // unless we use update with -1.
         // For now, unregister all.
@@ -206,7 +206,7 @@ impl UringDriver {
     }
 }
 
-use crate::driver::Driver;
+use crate::io::driver::Driver;
 
 impl Driver for UringDriver {
     fn reserve_op(&mut self) -> usize {
@@ -241,16 +241,16 @@ impl Driver for UringDriver {
         self.cancel_op(user_data);
     }
 
-    fn register_buffer_pool(&mut self, pool: &crate::buffer::BufferPool) -> io::Result<()> {
+    fn register_buffer_pool(&mut self, pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
         let iovecs = pool.get_all_ptrs();
         self.register_buffers(iovecs)
     }
 
-    fn register_files(&mut self, files: &[crate::op::SysRawOp]) -> io::Result<Vec<crate::op::IoFd>> {
+    fn register_files(&mut self, files: &[crate::io::op::SysRawOp]) -> io::Result<Vec<crate::io::op::IoFd>> {
         self.register_files(files)
     }
 
-    fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
         self.unregister_files(files)
     }
 }

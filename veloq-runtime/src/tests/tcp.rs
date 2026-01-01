@@ -1,7 +1,7 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use crate::buffer::{BufferPool, FixedBuf};
-use crate::executor::{LocalExecutor, Runtime};
+use crate::io::buffer::{BufferPool, FixedBuf};
+use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::{current_driver, spawn};
 use std::net::SocketAddr;
