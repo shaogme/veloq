@@ -1,6 +1,6 @@
 use super::*;
 use crate::io::op::{Accept, Connect, IoOp, IoResources, OpLifecycle, Timeout};
-use crate::io::sys::socket::Socket;
+use crate::io::socket::Socket;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -104,7 +104,7 @@ fn test_iocp_connect() {
     let client_handle = client.into_raw();
 
     // Create Connect Op manually as it doesn't have into_op
-    use crate::io::sys::socket::socket_addr_trans;
+    use crate::io::socket::socket_addr_trans;
     let (addr_buf, addr_len) = socket_addr_trans(addr);
 
     let connect_op = Connect {

@@ -1,7 +1,7 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{Op, RecvFrom, SendTo, SysRawOp};
-use crate::io::sys::socket::Socket;
+use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -57,7 +57,7 @@ impl UdpSocket {
         match res {
             Ok(n) => {
                 let len = op_back.get_addr_len();
-                let addr = crate::io::sys::socket::to_socket_addr(&op_back.addr[..len])
+                let addr = crate::io::socket::to_socket_addr(&op_back.addr[..len])
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                 (Ok((n, addr)), op_back.buf)
             }

@@ -1,6 +1,6 @@
-use std::time::Duration;
-use crate::io::buffer::FixedBuf;
 use super::{IoFd, IoOp, IoResources, OpLifecycle, SysRawOp};
+use crate::io::buffer::FixedBuf;
+use std::time::Duration;
 
 pub struct Timeout {
     pub duration: Duration,
@@ -51,15 +51,15 @@ impl OpLifecycle for Accept {
     }
 
     fn into_output(self, res: std::io::Result<u32>) -> std::io::Result<Self::Output> {
-         let fd = res? as SysRawOp;
-         use crate::io::sys::socket::to_socket_addr;
-         let addr = if let Some(a) = self.remote_addr {
-             a
-         } else {
-             to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-         };
+        let fd = res? as SysRawOp;
+        use crate::io::socket::to_socket_addr;
+        let addr = if let Some(a) = self.remote_addr {
+            a
+        } else {
+            to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        };
 
-         Ok((fd, addr))
+        Ok((fd, addr))
     }
 }
 
@@ -87,7 +87,7 @@ pub struct SendTo {
 
 impl SendTo {
     pub fn new(fd: SysRawOp, buf: FixedBuf, target: std::net::SocketAddr) -> Self {
-        let (raw_addr, raw_addr_len) = crate::io::sys::socket::socket_addr_trans(target);
+        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
         let addr = raw_addr.into_boxed_slice();
         let addr_len = raw_addr_len as u32;
 
@@ -139,7 +139,7 @@ impl RecvFrom {
         let addr_buf_size = std::mem::size_of::<libc::sockaddr_storage>();
         let addr = vec![0u8; addr_buf_size].into_boxed_slice();
         let addr_len = Box::new(addr_buf_size as u32);
-        
+
         let mut iovec = Box::new(libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut _,
             iov_len: buf.capacity(),

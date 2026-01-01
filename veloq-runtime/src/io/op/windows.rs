@@ -1,6 +1,6 @@
-use std::time::Duration;
-use crate::io::buffer::FixedBuf;
 use super::{IoFd, IoOp, IoResources, OpLifecycle, SysRawOp};
+use crate::io::buffer::FixedBuf;
+use std::time::Duration;
 
 pub struct Timeout {
     pub duration: Duration,
@@ -34,7 +34,7 @@ impl OpLifecycle for Accept {
     fn pre_alloc(_fd: SysRawOp) -> std::io::Result<Self::PreAlloc> {
         // FIXME: accurately detect family from _fd or generic
         // For now assuming IPv4 or relying on internal logic
-        use crate::io::sys::socket::Socket;
+        use crate::io::socket::Socket;
         Ok(Socket::new_tcp_v4()?.into_raw())
     }
 
@@ -57,7 +57,7 @@ impl OpLifecycle for Accept {
         res?;
         let fd = self.accept_socket;
 
-        use crate::io::sys::socket::to_socket_addr;
+        use crate::io::socket::to_socket_addr;
         let addr = if let Some(a) = self.remote_addr {
             a
         } else {
@@ -91,7 +91,7 @@ pub struct SendTo {
 
 impl SendTo {
     pub fn new(fd: SysRawOp, buf: FixedBuf, target: std::net::SocketAddr) -> Self {
-        let (raw_addr, raw_addr_len) = crate::io::sys::socket::socket_addr_trans(target);
+        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
         let addr = raw_addr.into_boxed_slice();
         let addr_len = raw_addr_len as u32;
 
