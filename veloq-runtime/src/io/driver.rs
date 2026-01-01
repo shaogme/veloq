@@ -17,7 +17,7 @@ pub trait Driver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<u32>, IoResources)>;
+    ) -> Poll<(io::Result<usize>, IoResources)>;
 
     /// Submit queued operations to the kernel.
     fn submit(&mut self) -> io::Result<()>;

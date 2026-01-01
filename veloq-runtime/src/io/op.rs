@@ -68,7 +68,7 @@ pub trait OpLifecycle: Sized {
     fn into_op(fd: SysRawOp, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed Op back into the desired output.
-    fn into_output(self, res: std::io::Result<u32>) -> std::io::Result<Self::Output>;
+    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
 }
 
 pub trait IoOp: Sized {
@@ -105,7 +105,7 @@ impl<T: IoOp> Op<T> {
 }
 
 impl<T: IoOp + 'static> Future for Op<T> {
-    type Output = (std::io::Result<u32>, T);
+    type Output = (std::io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };

@@ -6,7 +6,7 @@ use std::task::{Context, Poll, Waker};
 
 pub struct OpEntry<P> {
     pub waker: Option<Waker>,
-    pub result: Option<io::Result<u32>>,
+    pub result: Option<io::Result<usize>>,
     pub resources: IoResources,
     pub cancelled: bool,
     #[allow(dead_code)]
@@ -61,7 +61,7 @@ impl<P> OpRegistry<P> {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<u32>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, IoResources)> {
         if let Some(op) = self.slab.get_mut(user_data) {
             if let Some(res) = op.result.take() {
                 let entry = self.slab.remove(user_data);

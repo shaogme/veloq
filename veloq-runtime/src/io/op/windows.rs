@@ -53,7 +53,7 @@ impl OpLifecycle for Accept {
         }
     }
 
-    fn into_output(self, res: std::io::Result<u32>) -> std::io::Result<Self::Output> {
+    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
         res?;
         let fd = self.accept_socket;
 

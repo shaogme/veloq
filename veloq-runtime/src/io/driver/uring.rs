@@ -153,7 +153,7 @@ impl UringDriver {
                 if self.ops.contains(user_data) {
                     let op = &mut self.ops[user_data];
                     let res = if cqe.result() >= 0 {
-                        Ok(cqe.result() as u32)
+                        Ok(cqe.result() as usize)
                     } else {
                         Err(io::Error::from_raw_os_error(-cqe.result()))
                     };
@@ -230,7 +230,7 @@ impl UringDriver {
         &mut self,
         user_data: usize,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<(io::Result<u32>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, IoResources)> {
         self.ops.poll_op(user_data, cx)
     }
 
@@ -293,7 +293,7 @@ impl Driver for UringDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<u32>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, IoResources)> {
         self.poll_op(user_data, cx)
     }
 

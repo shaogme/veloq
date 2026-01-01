@@ -106,38 +106,109 @@
 
 位于 `io_uring::opcode` 模块。遵循 Builder 模式：`opcode::Name::new(...).field(...).build()`。
 
-常用操作包括：
+### 1. 空操作 (No-op)
+*   `Nop`: 空操作，仅用于测试或占位。
 
-*   **No-op**:
-    *   `Nop`: 空操作，仅用于测试或占位。
+### 2. 读写操作 (Read/Write)
+*   `Read`: 读取文件 (等同于 `read` / `pread`)。
+*   `Write`: 写入文件 (等同于 `write` / `pwrite`)。
+*   `Readv`: 向量化读取 (等同于 `preadv2`)。
+*   `Writev`: 向量化写入 (等同于 `pwritev2`)。
+*   `ReadFixed`: 使用已注册缓冲区的读取。
+*   `WriteFixed`: 使用已注册缓冲区的写入。
+*   `ReadvFixed`: 使用已注册缓冲区的向量化读取 (Kernel 6.15+)。
+*   `WritevFixed`: 使用已注册缓冲区的向量化写入 (Kernel 6.15+)。
+*   `ReadMulti`: 多射读取 (Multishot Read) (Kernel 6.7+)。
 
-*   **读写操作**:
-    *   `Readv`, `Writev`: 向量化读写 (类似 `preadv2`, `pwritev2`)。
-    *   `ReadFixed`, `WriteFixed`: 使用注册缓冲区的读写。
-    *   `Fsync`: 文件同步。
-    *   `SyncFileRange`: 同步文件范围。
+### 3. 文件同步与控制 (File Sync & Control)
+*   `Fsync`: 文件数据同步 (等同于 `fsync`)。
+*   `SyncFileRange`: 同步文件片段 (等同于 `sync_file_range`)。
+*   `Fallocate`: 文件空间预分配 (等同于 `fallocate`)。
+*   `Ftruncate`: 截断文件 (等同于 `ftruncate`) (Kernel 6.9+)。
+*   `Fadvise`: 文件访问模式建议 (等同于 `posix_fadvise`)。
+*   `Madvise`: 内存使用建议 (等同于 `madvise`)。
 
-*   **文件管理**:
-    *   `OpenAt`: 打开文件（`openat2` 语义）。
-    *   `Fallocate`: 文件空间预分配。
-    *   `Statx`: 获取文件状态。
+### 4. 文件描述符管理 (File Management)
+*   `OpenAt`: 打开文件 (等同于 `openat`)。
+*   `OpenAt2`: 打开文件扩展版 (等同于 `openat2`)。
+*   `Close`: 关闭文件描述符 (等同于 `close`)。
+*   `Statx`: 获取文件状态 (等同于 `statx`)。
+*   `RenameAt`: 重命名文件 (等同于 `renameat2`) (Kernel 5.11+)。
+*   `UnlinkAt`: 删除文件链接 (等同于 `unlinkat`) (Kernel 5.11+)。
+*   `MkDirAt`: 创建目录 (等同于 `mkdirat`) (Kernel 5.15+)。
+*   `SymlinkAt`: 创建符号链接 (等同于 `symlinkat`) (Kernel 5.15+)。
+*   `LinkAt`: 创建硬链接 (等同于 `linkat`) (Kernel 5.15+)。
+*   `FilesUpdate`: 更新注册的文件描述符表。
+*   `FixedFdInstall`: 将固定描述符转换为普通描述符 (Kernel 6.8+)。
 
-*   **网络操作**:
-    *   `Connect`: 连接 Socket。
-    *   `Accept`: 接受连接。
-    *   `SendMsg`, `RecvMsg`: 发送/接收消息。
-    *   `RecvMsgMulti`: 多射接收 (Multishot Recv)。
-    *   `Socket`: 创建 Socket (Kernel 5.19+)。
+### 5. 网络操作 (Networking)
+**连接管理**:
+*   `Connect`: 连接 Socket (等同于 `connect`)。
+*   `Accept`: 接受连接 (等同于 `accept4`)。
+*   `AcceptMulti`: 多射接受连接 (Multishot Accept) (Kernel 5.19+)。
+*   `Shutdown`: 关闭 Socket 连接 (等同于 `shutdown`) (Kernel 5.11+)。
+*   `Bind`: 绑定地址 (等同于 `bind`) (Kernel 6.11+)。
+*   `Listen`: 监听 Socket (等同于 `listen`) (Kernel 6.11+)。
+*   `Socket`: 创建 Socket (等同于 `socket`) (Kernel 5.19+)。
+*   `SetSockOpt`: 设置 Socket 选项 (通过 `uring_cmd` 实现)。
 
-*   **其他**:
-    *   `PollAdd`: 添加文件描述符轮询。
-    *   `PollRemove`: 移除轮询。
-    *   `Timeout`: 注册超时。
-    *   `TimeoutRemove`: 移除超时。
-    *   `LinkTimeout`: 链接超时。
-    *   `AsyncCancel`: 异步取消请求。
-    *   `ProvideBuffers`: 提供缓冲区组。
-    *   `RemoveBuffers`: 移除缓冲区组。
+**数据传输**:
+*   `Send`: 发送数据 (等同于 `send`)。
+*   `Recv`: 接收数据 (等同于 `recv`)。
+*   `SendMsg`: 发送消息 (等同于 `sendmsg`)。
+*   `RecvMsg`: 接收消息 (等同于 `recvmsg`)。
+*   `RecvMulti`: 多射接收 (Multishot Recv)。
+*   `RecvMsgMulti`: 多射接收消息 (Multishot RecvMsg)。
+*   `SendBundle`: 发送捆绑数据 (Send Bundle) (Kernel 6.10+)。
+*   `RecvBundle`: 接收捆绑数据 (Recv Bundle) (Kernel 6.10+)。
+*   `RecvMultiBundle`: 多射接收捆绑数据 (Kernel 6.10+)。
+
+**零拷贝 (Zero Copy)**:
+*   `SendZc`: 零拷贝发送 (Kernel 6.0+)。
+*   `SendMsgZc`: 零拷贝发送消息 (Kernel 6.1+)。
+*   `RecvZc`: 零拷贝接收 (Kernel 6.15+)。
+
+### 6. 轮询与事件 (Poll & Events)
+*   `PollAdd`: 添加轮询监视。
+*   `PollRemove`: 移除轮询监视。
+*   `EpollCtl`: 控制 Epoll 实例 (等同于 `epoll_ctl`)。
+*   `EpollWait`: 等待 Epoll 事件 (等同于 `epoll_wait`) (Kernel 6.15+)。
+
+### 7. 超时控制 (Timeout)
+*   `Timeout`: 注册超时事件。
+*   `TimeoutRemove`: 移除超时事件。
+*   `TimeoutUpdate`: 更新超时参数。
+*   `LinkTimeout`: 为关联的请求设置超时。
+
+### 8. 缓冲区管理 (Buffers)
+*   `ProvideBuffers`: 提供缓冲区组 (Buffer Group)。
+*   `RemoveBuffers`: 移除缓冲区组。
+
+### 9. 管道与拼接 (Splice & Pipe)
+*   `Splice`: 数据拼接 (等同于 `splice`) (Kernel 5.7+)。
+*   `Tee`: 复制管道数据 (等同于 `tee`) (Kernel 5.8+)。
+*   `Pipe`: 创建管道 (等同于 `pipe`) (Kernel 6.16+)。
+
+### 10. 扩展属性 (Extended Attributes)
+(Kernel 5.17+)
+*   `GetXattr`: 获取扩展属性 (等同于 `getxattr`)。
+*   `SetXattr`: 设置扩展属性 (等同于 `setxattr`)。
+*   `FGetXattr`: 获取文件描述符的扩展属性 (等同于 `fgetxattr`)。
+*   `FSetXattr`: 设置文件描述符的扩展属性 (等同于 `fsetxattr`)。
+
+### 11. 异步控制与 Ring 间通信
+*   `AsyncCancel`: 异步取消请求。
+*   `AsyncCancel2`: 增强版异步取消 (Kernel 5.19+)。
+*   `MsgRingData`: 向另一个 Ring 发送数据 (Kernel 5.18+)。
+*   `MsgRingSendFd`: 向另一个 Ring 发送固定文件描述符 (Kernel 6.0+)。
+*   `UringCmd16`: 发送 16 字节 io_uring 命令。
+*   `UringCmd80`: 发送 80 字节 io_uring 命令。
+
+### 12. 锁与等待 (Futex & Wait)
+*   `FutexWait`: 等待 Futex (等同于 `futex_wait`) (Kernel 6.7+)。
+*   `FutexWake`: 唤醒 Futex (等同于 `futex_wake`) (Kernel 6.7+)。
+*   `FutexWaitV`: 等待多个 Futex (等同于 `futex_waitv`) (Kernel 6.7+)。
+*   `WaitId`: 等待进程状态改变 (等同于 `waitid`) (Kernel 6.7+)。
 
 **示例**:
 ```rust

@@ -42,14 +42,14 @@ impl UdpSocket {
         })
     }
 
-    pub async fn send_to(&self, buf: FixedBuf, target: SocketAddr) -> (io::Result<u32>, FixedBuf) {
+    pub async fn send_to(&self, buf: FixedBuf, target: SocketAddr) -> (io::Result<usize>, FixedBuf) {
         let op = SendTo::new(self.fd, buf, target);
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(u32, SocketAddr)>, FixedBuf) {
+    pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
         let op = RecvFrom::new(self.fd, buf);
         let future = Op::new(op, self.driver.clone());
         let (res, op_back) = future.await;

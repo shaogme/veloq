@@ -117,7 +117,7 @@ impl TcpStream {
         Ok(Self { fd, driver })
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<u32>, FixedBuf) {
+    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Recv {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -127,7 +127,7 @@ impl TcpStream {
         (res, op_back.buf)
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> (io::Result<u32>, FixedBuf) {
+    pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Send {
             fd: IoFd::Raw(self.fd),
             buf,

@@ -45,8 +45,6 @@ pub struct IocpDriver {
     free_slots: Vec<usize>,
 }
 
-
-
 #[repr(C)]
 pub struct OverlappedEntry {
     inner: OVERLAPPED,
@@ -176,12 +174,12 @@ impl IocpDriver {
                 let result = if res == 0 {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_HANDLE_EOF {
-                        Ok(bytes_transferred)
+                        Ok(bytes_transferred as usize)
                     } else {
                         Err(io::Error::from_raw_os_error(err as i32))
                     }
                 } else {
-                    Ok(bytes_transferred)
+                    Ok(bytes_transferred as usize)
                 };
 
                 if result.is_ok() {
@@ -362,7 +360,7 @@ impl Driver for IocpDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<u32>, IoResources)> {
+    ) -> Poll<(io::Result<usize>, IoResources)> {
         self.ops.poll_op(user_data, cx)
     }
 
