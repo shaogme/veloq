@@ -29,6 +29,7 @@ struct WorkerHandle {
     injector: Arc<SegQueue<Job>>,
     waker: Arc<dyn RemoteWaker>,
     injected_load: Arc<AtomicUsize>,
+    local_load: Arc<AtomicUsize>,
 }
 
 impl Spawner {
@@ -67,8 +68,10 @@ impl Spawner {
         let worker1 = &workers[idx1];
         let worker2 = &workers[idx2];
 
-        let load1 = worker1.injected_load.load(Ordering::Relaxed);
-        let load2 = worker2.injected_load.load(Ordering::Relaxed);
+        let load1 = worker1.injected_load.load(Ordering::Relaxed)
+            + worker1.local_load.load(Ordering::Relaxed);
+        let load2 = worker2.injected_load.load(Ordering::Relaxed)
+            + worker2.local_load.load(Ordering::Relaxed);
 
         let worker = if load1 <= load2 { worker1 } else { worker2 };
 
@@ -87,6 +90,7 @@ pub struct LocalExecutor {
     buffer_pool: Rc<BufferPool>,
     injector: Option<Arc<SegQueue<Job>>>,
     injected_load: Option<Arc<AtomicUsize>>,
+    local_load: Option<Arc<AtomicUsize>>,
     spawner: Option<Spawner>,
 }
 
@@ -97,16 +101,23 @@ impl LocalExecutor {
 
     /// Create a new local executor for testing (no global injection).
     pub fn new() -> Self {
-        Self::create_internal(None, None, None, None)
+        Self::create_internal(None, None, None, None, None)
     }
 
     /// Create a new local executor with global injection support.
     pub fn with_injector(
         injector: Arc<SegQueue<Job>>,
         injected_load: Arc<AtomicUsize>,
+        local_load: Arc<AtomicUsize>,
         spawner: Spawner,
     ) -> Self {
-        Self::create_internal(None, Some(injector), Some(injected_load), Some(spawner))
+        Self::create_internal(
+            None,
+            Some(injector),
+            Some(injected_load),
+            Some(local_load),
+            Some(spawner),
+        )
     }
 
     /// Create a new local executor from an existing driver (used for worker threads).
@@ -114,12 +125,14 @@ impl LocalExecutor {
         driver: PlatformDriver,
         injector: Arc<SegQueue<Job>>,
         injected_load: Arc<AtomicUsize>,
+        local_load: Arc<AtomicUsize>,
         spawner: Spawner,
     ) -> Self {
         Self::create_internal(
             Some(driver),
             Some(injector),
             Some(injected_load),
+            Some(local_load),
             Some(spawner),
         )
     }
@@ -128,6 +141,7 @@ impl LocalExecutor {
         driver: Option<PlatformDriver>,
         injector: Option<Arc<SegQueue<Job>>>,
         injected_load: Option<Arc<AtomicUsize>>,
+        local_load: Option<Arc<AtomicUsize>>,
         spawner: Option<Spawner>,
     ) -> Self {
         // Initialize Driver with 1024 entries if not provided
@@ -149,6 +163,7 @@ impl LocalExecutor {
             buffer_pool,
             injector,
             injected_load,
+            local_load,
             spawner,
         }
     }
@@ -167,6 +182,9 @@ impl LocalExecutor {
             Rc::downgrade(&self.queue),
         );
         self.queue.borrow_mut().push_back(task);
+        if let Some(load) = &self.local_load {
+            load.fetch_add(1, Ordering::Relaxed);
+        }
         handle
     }
 
@@ -210,6 +228,10 @@ impl LocalExecutor {
                             if let Some(load) = &self.injected_load {
                                 load.fetch_sub(1, Ordering::Relaxed);
                             }
+                            // Increase local load
+                            if let Some(load) = &self.local_load {
+                                load.fetch_add(1, Ordering::Relaxed);
+                            }
                             // Create local task from job
                             let task = Task::new(job, Rc::downgrade(&self.queue));
                             self.queue.borrow_mut().push_back(task);
@@ -242,6 +264,9 @@ impl LocalExecutor {
                                     target.injected_load.fetch_sub(1, Ordering::Relaxed);
 
                                     // Run it locally
+                                    if let Some(load) = &self.local_load {
+                                        load.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     let task = Task::new(job, Rc::downgrade(&self.queue));
                                     self.queue.borrow_mut().push_back(task);
                                     break; // Found one, go back to main loop to execute
@@ -254,6 +279,9 @@ impl LocalExecutor {
 
             let task = self.queue.borrow_mut().pop_front();
             if let Some(task) = task {
+                if let Some(load) = &self.local_load {
+                    load.fetch_sub(1, Ordering::Relaxed);
+                }
                 task.run();
             }
 
@@ -299,6 +327,7 @@ impl Runtime {
     {
         let injector = Arc::new(SegQueue::new());
         let injected_load = Arc::new(AtomicUsize::new(0));
+        let local_load = Arc::new(AtomicUsize::new(0));
 
         // Solution 2: Executor creates driver. Signal back waker.
         let (waker_tx, waker_rx) = std::sync::mpsc::channel();
@@ -314,10 +343,15 @@ impl Runtime {
 
         let injector_clone = injector.clone();
         let injected_load_clone = injected_load.clone();
+        let local_load_clone = local_load.clone();
 
         let handle = std::thread::spawn(move || {
-            let executor =
-                LocalExecutor::with_injector(injector_clone, injected_load_clone, spawner);
+            let executor = LocalExecutor::with_injector(
+                injector_clone,
+                injected_load_clone,
+                local_load_clone,
+                spawner,
+            );
 
             // Send waker back to main thread
             let waker = executor.driver.borrow().create_waker();
@@ -341,6 +375,7 @@ impl Runtime {
             injector,
             waker,
             injected_load,
+            local_load,
         });
 
         // Notify worker it can start
