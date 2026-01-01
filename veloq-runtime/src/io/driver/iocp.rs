@@ -652,6 +652,34 @@ impl Driver for IocpDriver {
         Ok(())
     }
 
+    fn submit_background(&mut self, op: IoResources) -> io::Result<()> {
+        match op {
+            IoResources::Close(close) => {
+                if let Some(fd) = close.fd.raw() {
+                    // Offload CloseHandle to thread pool
+                    // We must own the fd. SysRawOp is Copy (u32/size_t or similar handle), so we copy it.
+                    let fd_val = fd as usize;
+
+                    self.pool
+                        .execute(move || unsafe {
+                            windows_sys::Win32::Foundation::CloseHandle(fd_val as HANDLE);
+                        })
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "blocking pool overloaded")
+                        })?;
+
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported background op",
+            )),
+        }
+    }
+
     fn wake(&mut self) -> io::Result<()> {
         let res = unsafe {
             PostQueuedCompletionStatus(self.port, 0, WAKEUP_USER_DATA, std::ptr::null_mut())

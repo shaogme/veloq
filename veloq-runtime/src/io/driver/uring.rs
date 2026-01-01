@@ -41,6 +41,7 @@ impl Drop for UringWaker {
 /// We use u64::MAX - 1 because u64::MAX is already reserved.
 /// CQEs with this user_data are ignored (they're just confirmations that cancel was submitted).
 const CANCEL_USER_DATA: u64 = u64::MAX - 1;
+const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 
 pub struct UringDriver {
     /// The actual io_uring instance
@@ -51,8 +52,6 @@ pub struct UringDriver {
     waker_fd: RawFd,
     waker_token: Option<usize>,
 }
-
-
 
 impl UringDriver {
     pub fn new(entries: u32) -> io::Result<Self> {
@@ -130,7 +129,7 @@ impl UringDriver {
     /// Process the completion queue.
     pub fn process_completions_internal(&mut self) {
         let mut needs_waker_resubmit = false;
-        
+
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
@@ -141,7 +140,11 @@ impl UringDriver {
                 // Skip special user_data values:
                 // - u64::MAX: reserved/special
                 // - CANCEL_USER_DATA: completion of our cancel requests (we don't need to handle these)
-                if user_data == u64::MAX as usize || user_data == CANCEL_USER_DATA as usize {
+                // - BACKGROUND_USER_DATA: fire-and-forget background ops (e.g. Close)
+                if user_data == u64::MAX as usize
+                    || user_data == CANCEL_USER_DATA as usize
+                    || user_data == BACKGROUND_USER_DATA as usize
+                {
                     continue;
                 }
 
@@ -172,12 +175,12 @@ impl UringDriver {
                 }
             }
         }
-        
+
         if needs_waker_resubmit {
-             if let Some(token) = self.waker_token.take() {
-                 self.ops.remove(token);
-             }
-             self.submit_waker();
+            if let Some(token) = self.waker_token.take() {
+                self.ops.remove(token);
+            }
+            self.submit_waker();
         }
     }
 
@@ -254,15 +257,16 @@ impl UringDriver {
         }
     }
 
-
-
-    pub fn register_files(&mut self, files: &[crate::io::op::SysRawOp]) -> io::Result<Vec<crate::io::op::IoFd>> {
+    pub fn register_files(
+        &mut self,
+        files: &[crate::io::op::SysRawOp],
+    ) -> io::Result<Vec<crate::io::op::IoFd>> {
         // Note: this replaces the entire file table in io_uring currently.
         // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE
         // to incrementally add files, or manage a sparse table.
         // For now, we assume this is called once or manages the full set.
         self.ring.submitter().register_files(files)?;
-        
+
         let mut fixed_fds = Vec::with_capacity(files.len());
         for i in 0..files.len() {
             fixed_fds.push(crate::io::op::IoFd::Fixed(i as u32));
@@ -287,6 +291,34 @@ impl Driver for UringDriver {
 
     fn submit_op_resources(&mut self, user_data: usize, resources: IoResources) {
         self.submit_op_resources_internal(user_data, resources);
+    }
+
+    fn submit_background(&mut self, mut op: IoResources) -> io::Result<()> {
+        match op {
+            IoResources::Close(_) => {
+                let sqe = op.make_sqe().user_data(BACKGROUND_USER_DATA);
+
+                // Try to push
+                // Optimization: direct access to ring submission to handle full queue
+
+                let mut sq = self.ring.submission();
+                if unsafe { sq.push(&sqe) }.is_err() {
+                    // Queue is full. Try to submit existing to clear space.
+                    drop(sq); // mutable borrow end
+                    self.ring.submit()?;
+
+                    let mut sq = self.ring.submission();
+                    if unsafe { sq.push(&sqe) }.is_err() {
+                        return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "background op only supports Close",
+            )),
+        }
     }
 
     fn poll_op(
@@ -318,7 +350,10 @@ impl Driver for UringDriver {
         self.register_buffers(iovecs)
     }
 
-    fn register_files(&mut self, files: &[crate::io::op::SysRawOp]) -> io::Result<Vec<crate::io::op::IoFd>> {
+    fn register_files(
+        &mut self,
+        files: &[crate::io::op::SysRawOp],
+    ) -> io::Result<Vec<crate::io::op::IoFd>> {
         self.register_files(files)
     }
 

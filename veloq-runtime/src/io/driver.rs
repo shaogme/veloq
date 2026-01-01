@@ -47,6 +47,10 @@ pub trait Driver {
     /// Unregister a set of file descriptors/handles.
     fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()>;
 
+    /// Submit a fire-and-forget operation (e.g. Close).
+    /// The driver takes ownership of resources and ensures cleanup.
+    fn submit_background(&mut self, _op: IoResources) -> io::Result<()>;
+
     /// Wake up the driver from blocking wait.
     fn wake(&mut self) -> io::Result<()>;
 
