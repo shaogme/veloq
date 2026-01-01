@@ -1,6 +1,5 @@
 use std::path::Path;
-use crate::io::op::Open;
-use crate::io::op::Op;
+use crate::io::op::{Op, Open};
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -61,91 +60,103 @@ impl OpenOptions {
         self
     }
 
+    /// 对外的公共 API：清晰、线性、无平台噪音
     pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
-        let path = path.as_ref();
-        
-        #[cfg(unix)]
-        let (path_c, flags) = {
-            use std::os::unix::ffi::OsStrExt;
-            let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-            let mut flags = 0;
-            
-            if self.read && !self.write && !self.append {
-                flags |= libc::O_RDONLY;
-            } else if !self.read && self.write && !self.append {
-                flags |= libc::O_WRONLY;
-            } else if self.append {
-                flags |= libc::O_WRONLY | libc::O_APPEND;
-            } else {
-                flags |= libc::O_RDWR;
-            }
-            
-            if self.create { flags |= libc::O_CREAT; }
-            if self.create_new { flags |= libc::O_EXCL | libc::O_CREAT; }
-            if self.truncate { flags |= libc::O_TRUNC; }
-            
-            (path_c, flags)
+        // 1. 根据不同平台生成对应的 Op 参数
+        let op = self.build_op(path.as_ref())?;
+
+        // 2. 提交给 runtime (这一部分没有任何变化，但现在看起来更显眼了)
+        let driver = crate::runtime::current_driver();
+        let (res, _) = Op::new(op, driver).await;
+
+        // 3. 转换结果
+        let fd = res? as crate::io::op::SysRawOp;
+        use crate::io::op::IoFd;
+        Ok(super::file::File { fd: IoFd::Raw(fd) })
+    }
+
+    // ==========================================
+    // Unix 平台实现
+    // ==========================================
+    #[cfg(unix)]
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // 路径转换
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+
+        // 标志位计算
+        let mut flags = if self.read && !self.write && !self.append {
+            libc::O_RDONLY
+        } else if !self.read && self.write && !self.append {
+            libc::O_WRONLY
+        } else if self.append {
+            libc::O_WRONLY | libc::O_APPEND
+        } else {
+            libc::O_RDWR
         };
 
-        #[cfg(windows)]
-        let (path_w, flags, mode) = {
-             use std::os::windows::ffi::OsStrExt;
-             let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
-             path_w.push(0);
-             
-             // Mapping to Win32 constants
-             const GENERIC_READ: u32 = 0x80000000;
-             const GENERIC_WRITE: u32 = 0x40000000;
-             const OPEN_EXISTING: u32 = 3;
-             const CREATE_NEW: u32 = 1;
-             const CREATE_ALWAYS: u32 = 2; // Overwrite
-             const OPEN_ALWAYS: u32 = 4; // Create if not exists
-             const TRUNCATE_EXISTING: u32 = 5;
-             
-             let mut access = 0;
-             if self.read { access |= GENERIC_READ; }
-             if self.write { access |= GENERIC_WRITE; }
-             if self.append { 
-                 access |= 0x0004; // FILE_APPEND_DATA (approx)
-             }
-             
-             let mut disposition = OPEN_EXISTING;
-             if self.create_new {
-                 disposition = CREATE_NEW;
-             } else if self.create {
-                 if self.truncate {
-                     disposition = CREATE_ALWAYS;
-                 } else {
-                     disposition = OPEN_ALWAYS;
-                 }
-             } else if self.truncate {
-                 disposition = TRUNCATE_EXISTING;
-             }
-             
-             (path_w, access as i32, disposition)
-        };
+        if self.create {
+            flags |= libc::O_CREAT;
+        }
+        if self.create_new {
+            flags |= libc::O_EXCL | libc::O_CREAT;
+        }
+        if self.truncate {
+            flags |= libc::O_TRUNC;
+        }
 
-        #[cfg(unix)]
-        let op = Open {
+        Ok(Open {
             path: path_c,
             flags,
             mode: self.mode,
+        })
+    }
+
+    // ==========================================
+    // Windows 平台实现
+    // ==========================================
+    #[cfg(windows)]
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+
+        // 1. 处理路径
+        let mut path_w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        path_w.push(0);
+
+        // 2. 处理 Access (读写权限)
+        let mut access = 0;
+        if self.read {
+            access |= GENERIC_READ;
+        }
+        if self.write {
+            access |= GENERIC_WRITE;
+        }
+        if self.append {
+            access |= FILE_APPEND_DATA;
+        } // 注意: append在windows下比较特殊
+
+        // 3. Disposition (创建/打开策略) - 使用 match 模式匹配更清晰
+        const OPEN_EXISTING: u32 = 3;
+        const CREATE_NEW: u32 = 1;
+        const CREATE_ALWAYS: u32 = 2;
+        const OPEN_ALWAYS: u32 = 4;
+        const TRUNCATE_EXISTING: u32 = 5;
+
+        let disposition = match (self.create, self.create_new, self.truncate) {
+            (_, true, _) => CREATE_NEW,            // create_new 优先级最高
+            (true, _, true) => CREATE_ALWAYS,      // create + truncate = 覆盖创建
+            (true, _, false) => OPEN_ALWAYS,       // create = 不存在建，存在开
+            (false, _, true) => TRUNCATE_EXISTING, // truncate = 必须存在并截断
+            (false, _, false) => OPEN_EXISTING,    // 默认 = 必须存在
         };
 
-        #[cfg(windows)]
-        let op = Open {
+        Ok(Open {
             path: path_w,
-            flags: flags, // access
-            mode: mode, // disposition
-        };
-
-        let driver = crate::runtime::current_driver();
-        let (res, _) = Op::new(op, driver).await;
-        let fd = res? as crate::io::op::SysRawOp;
-
-        use crate::io::op::IoFd;
-        Ok(super::file::File {
-            fd: IoFd::Raw(fd),
+            flags: access as i32, // 对应 Win32 dwDesiredAccess
+            mode: disposition,    // 对应 Win32 dwCreationDisposition
         })
     }
 }
