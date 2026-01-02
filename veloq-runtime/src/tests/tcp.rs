@@ -1,6 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{BufferPool, FixedBuf};
+use crate::io::buffer::{FixedBuf, HybridPool};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use std::net::SocketAddr;
@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
-use crate::io::buffer::BufferSize;
+use crate::io::buffer::hybrid::BufferSize;
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &BufferPool, size: BufferSize) -> FixedBuf<BufferPool> {
+fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -23,7 +23,7 @@ fn alloc_buf(pool: &BufferPool, size: BufferSize) -> FixedBuf<BufferPool> {
 /// Test basic TCP connection using global spawn and current_driver
 #[test]
 fn test_tcp_connect_with_global_api() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let driver = exec.driver_handle();
 
     // Create listener before block_on
@@ -63,7 +63,7 @@ fn test_tcp_connect_with_global_api() {
 fn test_tcp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
         let driver = exec.driver_handle();
 
         let listener =
@@ -152,7 +152,7 @@ fn test_tcp_send_recv() {
 /// Test multiple concurrent connections on single thread
 #[test]
 fn test_tcp_multiple_connections() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let driver = exec.driver_handle();
 
     let listener =
@@ -197,9 +197,9 @@ fn test_tcp_multiple_connections() {
 #[test]
 fn test_tcp_large_data_transfer() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
         let driver = exec.driver_handle();
-        let pool = Rc::new(BufferPool::new());
+        let pool = Rc::new(HybridPool::new());
 
         let listener =
             TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
@@ -287,7 +287,7 @@ fn test_tcp_large_data_transfer() {
 /// Test listener local_addr
 #[test]
 fn test_listener_local_addr() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let driver = exec.driver_handle();
 
     exec.block_on(|_cx| async move {
@@ -306,7 +306,7 @@ fn test_listener_local_addr() {
 /// Test connection refused
 #[test]
 fn test_tcp_connect_refused() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
 
     exec.block_on(|cx| {
         let cx = cx.clone();
@@ -326,9 +326,9 @@ fn test_tcp_connect_refused() {
 #[test]
 fn test_tcp_recv_zero_bytes() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
         let driver = exec.driver_handle();
-        let pool = Rc::new(BufferPool::new());
+        let pool = Rc::new(HybridPool::new());
 
         let listener =
             TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
@@ -373,7 +373,7 @@ fn test_tcp_recv_zero_bytes() {
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let driver = exec.driver_handle();
 
     let listener_result = TcpListener::bind("::1:0", driver.clone());
@@ -426,7 +426,7 @@ fn test_multithread_tcp_connections() {
 
     for worker_id in 0..NUM_WORKERS {
         let counter = connection_count.clone();
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             let cx = cx.clone();
             // Each worker has its own executor, driver, and listener
             let driver = cx.driver();
@@ -476,7 +476,7 @@ fn test_multithread_tcp_echo() {
         let mut runtime = Runtime::new(crate::config::Config::default());
 
         // Worker 1: Echo server
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             let cx = cx.clone();
             let driver = cx.driver();
 
@@ -509,7 +509,7 @@ fn test_multithread_tcp_echo() {
         });
 
         // Worker 2: Client
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             // Wait for server address
             let listen_addr = addr_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -563,7 +563,7 @@ fn test_multithread_concurrent_clients() {
     const NUM_CLIENTS: usize = 3;
 
     // Server worker
-    runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+    runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
         let cx = cx.clone();
         let driver = cx.driver();
 
@@ -592,7 +592,7 @@ fn test_multithread_concurrent_clients() {
     for client_id in 0..NUM_CLIENTS {
         let rx = addr_rx.clone();
         let counter = connection_count.clone();
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             // Get address from shared receiver
             let listen_addr = {
                 let rx_guard = rx.lock().unwrap();

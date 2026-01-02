@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
-use veloq_runtime::io::buffer::{BuddyPool, BufferSize};
+use veloq_runtime::io::buffer::BuddyPool;
+use veloq_runtime::io::buffer::buddy::BufferSize;
 use veloq_runtime::io::fs::File;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
@@ -26,7 +27,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             exec.block_on(|cx| {
                 let cx = cx.clone();
                 async move {
-                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Custom(4 * 1024 * 1024);
+                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
                     let chunk_size = CHUNK_SIZE_ENUM.size();
                     let file_path = Path::new("bench_1gb_test.tmp");
 
@@ -121,7 +122,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
             exec.block_on(|cx| {
                 let cx = cx.clone();
                 async move {
-                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Custom(4 * 1024 * 1024);
+                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
                     let chunk_size = CHUNK_SIZE_ENUM.size();
 
                     let mut files = Vec::with_capacity(FILE_COUNT);

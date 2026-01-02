@@ -2,7 +2,7 @@
 
 use crate::runtime::executor::{LocalExecutor, Runtime};
 // use crate::{spawn, spawn_local}; // globals removed
-use crate::io::buffer::BufferPool;
+use crate::io::buffer::HybridPool;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// This verifies that tasks are executed on the same thread.
 #[test]
 fn test_spawn_local_basic() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let result = Rc::new(RefCell::new(0));
     let result_clone = result.clone();
 
@@ -35,7 +35,7 @@ fn test_spawn_local_basic() {
 /// Test that spawn_local supports !Send futures (like Rc).
 #[test]
 fn test_spawn_local_not_send() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     // Rc is !Send
     let data = Rc::new(vec![1, 2, 3]);
     let data_clone = data.clone();
@@ -57,7 +57,7 @@ fn test_spawn_local_not_send() {
 /// Test nested spawn_local calls.
 #[test]
 fn test_nested_spawn_local() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
     let counter = Rc::new(RefCell::new(0));
     let c1 = counter.clone();
 
@@ -91,7 +91,7 @@ fn test_runtime_global_spawn() {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Spawn 1 worker that stays alive
-    runtime.spawn_worker::<_, _, BufferPool>(move |_cx| async move {
+    runtime.spawn_worker::<_, _, HybridPool>(move |_cx| async move {
         // Keep alive for a bit to allow receiving tasks
         let mut i = 0;
         while i < 10 {
@@ -121,7 +121,7 @@ fn test_spawn_from_worker() {
     let mut runtime = Runtime::new(crate::config::Config::default());
     let (tx, rx) = std::sync::mpsc::channel();
 
-    runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+    runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
         // We are inside a worker, so we should have a Spawner in context.
         // Needs clone to move into async block if used there
         let cx = cx.clone();
@@ -143,7 +143,7 @@ fn test_mixed_spawn_in_worker() {
     let mut runtime = Runtime::new(crate::config::Config::default());
     let (tx, rx) = std::sync::mpsc::channel();
 
-    runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+    runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
         let cx = cx.clone();
         // 1. spawn_local (!Send)
         let rc_val = Rc::new(5);
@@ -174,7 +174,7 @@ fn test_multi_worker_throughput() {
     let c_worker = counter.clone();
     for _ in 0..2 {
         let c = c_worker.clone();
-        runtime.spawn_worker::<_, _, BufferPool>(move |_cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |_cx| async move {
             let start = std::time::Instant::now();
             // Run until we see 50 tasks done or timeout
             while c.load(Ordering::SeqCst) < 50 {

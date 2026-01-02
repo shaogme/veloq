@@ -1,6 +1,6 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{BufferPool, FixedBuf};
+use crate::io::buffer::{FixedBuf, HybridPool};
 use crate::net::udp::UdpSocket;
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use std::net::SocketAddr;
@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 // ============ Helper Functions ============
 
-use crate::io::buffer::BufferSize;
+use crate::io::buffer::hybrid::BufferSize;
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &BufferPool, size: BufferSize) -> FixedBuf<BufferPool> {
+fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -23,7 +23,7 @@ fn alloc_buf(pool: &BufferPool, size: BufferSize) -> FixedBuf<BufferPool> {
 /// Test basic UDP socket binding and local_addr
 #[test]
 fn test_udp_bind() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
 
     exec.block_on(|cx| {
         let cx = cx.clone();
@@ -47,7 +47,7 @@ fn test_udp_bind() {
 fn test_udp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
         // Since we are inside the runtime, we can get buffer pool from cx, or create one.
         // The original test created a separate Rc<BufferPool>.
         // Ideally we use the runtime's buffer pool via cx.
@@ -107,7 +107,7 @@ fn test_udp_send_recv() {
 fn test_udp_echo() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -196,7 +196,7 @@ fn test_udp_echo() {
 #[test]
 fn test_udp_multiple_messages() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -254,7 +254,7 @@ fn test_udp_multiple_messages() {
 #[test]
 fn test_udp_large_data() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
-        let exec = LocalExecutor::<BufferPool>::new();
+        let exec = LocalExecutor::<HybridPool>::new();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -324,7 +324,7 @@ fn test_udp_large_data() {
 /// Test IPv6 UDP
 #[test]
 fn test_udp_ipv6() {
-    let exec = LocalExecutor::<BufferPool>::new();
+    let exec = LocalExecutor::<HybridPool>::new();
 
     exec.block_on(|cx| {
         let cx = cx.clone();
@@ -361,7 +361,7 @@ fn test_multithread_udp() {
 
         for worker_id in 0..NUM_WORKERS {
             let counter = message_count.clone();
-            runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+            runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
                 let cx = cx.clone();
                 let driver = cx.driver();
                 let pool = cx.buffer_pool().upgrade().unwrap();
@@ -427,7 +427,7 @@ fn test_multithread_udp_echo() {
         let mut runtime = Runtime::new(crate::config::Config::default());
 
         // Worker 1: Echo server
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             let cx = cx.clone();
             let driver = cx.driver();
 
@@ -459,7 +459,7 @@ fn test_multithread_udp_echo() {
         });
 
         // Worker 2: Client
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             // Wait for server address
             let server_addr = addr_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -513,7 +513,7 @@ fn test_multithread_concurrent_udp_clients() {
         const NUM_CLIENTS: usize = 3;
 
         // Server worker
-        runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+        runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
             let cx = cx.clone();
             let driver = cx.driver();
 
@@ -545,7 +545,7 @@ fn test_multithread_concurrent_udp_clients() {
         for client_id in 0..NUM_CLIENTS {
             let rx = addr_rx.clone();
             let counter = message_count.clone();
-            runtime.spawn_worker::<_, _, BufferPool>(move |cx| async move {
+            runtime.spawn_worker::<_, _, HybridPool>(move |cx| async move {
                 // Get address from shared receiver
                 let server_addr = {
                     let rx_guard = rx.lock().unwrap();

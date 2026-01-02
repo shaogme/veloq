@@ -1,15 +1,15 @@
-use crate::io::buffer::BufferPool;
+use crate::io::buffer::HybridPool;
 use crate::io::fs::File;
 use std::fs;
 use std::path::Path;
 
 #[test]
 fn test_file_integrity() {
-    use crate::io::buffer::BufferSize;
+    use crate::io::buffer::hybrid::BufferSize;
 
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
-        crate::runtime::LocalExecutor::<BufferPool>::new().block_on(|cx| {
+        crate::runtime::LocalExecutor::<HybridPool>::new().block_on(|cx| {
             let cx = cx.clone();
             async move {
                 let file_path = Path::new("test_file_integrity.tmp");

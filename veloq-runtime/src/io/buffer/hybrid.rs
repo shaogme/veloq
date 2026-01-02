@@ -1,7 +1,57 @@
-use super::{AllocResult, BufPool, BufferSize, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX};
+use super::{AllocResult, BufPool, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
+
+const SIZE_4K: usize = 4096;
+const SIZE_16K: usize = 16384;
+const SIZE_64K: usize = 65536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BufferSize {
+    /// 4KB
+    Size4K,
+    /// 16KB
+    Size16K,
+    /// 64KB
+    Size64K,
+    /// Custom size
+    Custom(usize),
+}
+
+impl BufferSize {
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        match self {
+            BufferSize::Size4K => SIZE_4K,
+            BufferSize::Size16K => SIZE_16K,
+            BufferSize::Size64K => SIZE_64K,
+            BufferSize::Custom(size) => *size,
+        }
+    }
+
+    #[inline(always)]
+    pub fn slab_index(&self) -> Option<usize> {
+        match self {
+            BufferSize::Size4K => Some(0),
+            BufferSize::Size16K => Some(1),
+            BufferSize::Size64K => Some(2),
+            BufferSize::Custom(_) => None,
+        }
+    }
+
+    pub fn best_fit(size: usize) -> Self {
+        if size <= SIZE_4K {
+            BufferSize::Size4K
+        } else if size <= SIZE_16K {
+            BufferSize::Size16K
+        } else if size <= SIZE_64K {
+            BufferSize::Size64K
+        } else {
+            BufferSize::Custom(size)
+        }
+    }
+}
 
 // Slab configuration definition
 struct SlabConfig {
@@ -16,15 +66,15 @@ struct SlabConfig {
 // Total memory: ~8MB
 const SLABS: [SlabConfig; 3] = [
     SlabConfig {
-        block_size: 4096,
+        block_size: SIZE_4K,
         count: 1024,
     },
     SlabConfig {
-        block_size: 16384,
+        block_size: SIZE_16K,
         count: 128,
     },
     SlabConfig {
-        block_size: 65536,
+        block_size: SIZE_64K,
         count: 32,
     },
 ];
@@ -103,15 +153,23 @@ impl HybridPool {
 }
 
 impl BufPool for HybridPool {
+    type BufferSize = BufferSize;
+
     fn new() -> Self {
         HybridPool::new_inner()
+    }
+
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>> {
+        self.alloc(size)
     }
 
     fn alloc_mem(&self, size: usize) -> AllocResult {
         let mut inner = self.inner.borrow_mut();
 
         // Try to find best slab (smallest that fits)
-        if let Some(slab_idx) = SLABS.iter().position(|c| c.block_size >= size) {
+        // Try to find best slab (smallest that fits)
+        let best = BufferSize::best_fit(size);
+        if let Some(slab_idx) = best.slab_index() {
             let slab = &mut inner.slabs[slab_idx];
 
             if let Some(index) = slab.free_indices.pop() {
@@ -131,8 +189,7 @@ impl BufPool for HybridPool {
         }
 
         // Fallback: Global Allocator (Hybrid Strategy)
-        let max_slab_size = SLABS.last().map(|s| s.block_size).unwrap_or(0);
-        if size > max_slab_size {
+        if size > SIZE_64K {
             let mut vec = Vec::with_capacity(size);
             let ptr = unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) };
             let cap = vec.capacity();

@@ -6,34 +6,9 @@ pub mod hybrid;
 pub use buddy::BuddyPool;
 pub use hybrid::HybridPool;
 
-// Backward compatibility or default choice
-pub type BufferPool = HybridPool;
+// Default implementations are removed to enforce explicit choices
 
 pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferSize {
-    /// 4KB
-    Size4K,
-    /// 16KB
-    Size16K,
-    /// 64KB
-    Size64K,
-    /// Custom size
-    Custom(usize),
-}
-
-impl BufferSize {
-    #[inline(always)]
-    pub fn size(&self) -> usize {
-        match self {
-            BufferSize::Size4K => 4096,
-            BufferSize::Size16K => 16384,
-            BufferSize::Size64K => 65536,
-            BufferSize::Custom(size) => *size,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct DeallocParams {
@@ -55,8 +30,14 @@ pub enum AllocResult {
 
 /// Trait for memory pool implementation allows custom memory management
 pub trait BufPool: Clone + std::fmt::Debug + 'static {
+    type BufferSize: Copy + std::fmt::Debug;
+
     fn new() -> Self;
-    /// Allocate memory of at least `size` bytes.
+
+    /// Allocate memory.
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>>;
+
+    /// Allocate memory of at least `size` bytes (Low level).
     fn alloc_mem(&self, size: usize) -> AllocResult;
 
     /// Deallocate memory.

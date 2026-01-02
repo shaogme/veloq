@@ -1,5 +1,6 @@
 use super::*;
-use crate::io::buffer::{BufferPool, BufferSize};
+use crate::io::buffer::HybridPool;
+use crate::io::buffer::hybrid::BufferSize;
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
@@ -27,14 +28,14 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let driver: Result<IocpDriver<BufferPool>, io::Error> =
+    let driver: Result<IocpDriver<HybridPool>, io::Error> =
         IocpDriver::new(&crate::config::Config::default());
     assert!(driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver: IocpDriver<BufferPool> =
+    let mut driver: IocpDriver<HybridPool> =
         IocpDriver::new(&crate::config::Config::default()).expect("Driver creation failed");
 
     // Listener (Bind to random port)
@@ -106,7 +107,7 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver: IocpDriver<BufferPool> =
+    let mut driver: IocpDriver<HybridPool> =
         IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     // Listener
@@ -155,7 +156,7 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_timeout() {
-    let mut driver: IocpDriver<BufferPool> =
+    let mut driver: IocpDriver<HybridPool> =
         IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     let timeout_op = Timeout {
@@ -198,8 +199,8 @@ fn test_iocp_timeout() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
-    let pool = BufferPool::new();
+    let mut driver = IocpDriver::<HybridPool>::new(&crate::config::Config::default()).unwrap();
+    let pool = HybridPool::new();
 
     // Setup connection
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
