@@ -21,6 +21,14 @@ pub enum SubmissionResult {
     Offload(Box<dyn FnOnce() -> io::Result<usize> + Send>),
 }
 
+#[inline(always)]
+fn offload_task<F>(f: F) -> io::Result<SubmissionResult>
+where
+    F: FnOnce() -> io::Result<usize> + Send + 'static,
+{
+    Ok(SubmissionResult::Offload(Box::new(f)))
+}
+
 pub(crate) trait IocpSubmit {
     unsafe fn submit(
         &mut self,
@@ -525,7 +533,7 @@ impl IocpSubmit for crate::io::op::Open {
         let flags = self.flags;
         let mode = self.mode;
 
-        Ok(SubmissionResult::Offload(Box::new(move || {
+        offload_task(move || {
             // Synchronous open for IOCP MVP
             use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             use windows_sys::Win32::Storage::FileSystem::{
@@ -553,7 +561,7 @@ impl IocpSubmit for crate::io::op::Open {
             }
 
             Ok(handle as usize)
-        })))
+        })
     }
 }
 
@@ -569,14 +577,14 @@ impl IocpSubmit for crate::io::op::Close {
         let handle = resolve_fd(self.fd, registered_files)?;
         let handle = handle as usize;
 
-        Ok(SubmissionResult::Offload(Box::new(move || {
+        offload_task(move || {
             let ret = unsafe { CloseHandle(handle as HANDLE) };
             if ret == 0 {
                 let err = unsafe { GetLastError() };
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
             Ok(0)
-        })))
+        })
     }
 }
 
@@ -592,13 +600,13 @@ impl IocpSubmit for crate::io::op::Fsync {
         let handle = resolve_fd(self.fd, registered_files)?;
         let handle = handle as usize;
 
-        Ok(SubmissionResult::Offload(Box::new(move || {
+        offload_task(move || {
             let ret = unsafe { FlushFileBuffers(handle as HANDLE) };
             if ret == 0 {
                 let err = unsafe { GetLastError() };
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
             Ok(0)
-        })))
+        })
     }
 }
