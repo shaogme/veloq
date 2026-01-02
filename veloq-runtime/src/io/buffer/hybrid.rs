@@ -152,12 +152,14 @@ impl HybridPool {
     }
 }
 
+impl Default for HybridPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BufPool for HybridPool {
     type BufferSize = BufferSize;
-
-    fn new() -> Self {
-        HybridPool::new_inner()
-    }
 
     fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>> {
         self.alloc(size)

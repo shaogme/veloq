@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// This verifies that tasks are executed on the same thread.
 #[test]
 fn test_spawn_local_basic() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let result = Rc::new(RefCell::new(0));
     let result_clone = result.clone();
 
@@ -35,7 +35,7 @@ fn test_spawn_local_basic() {
 /// Test that spawn_local supports !Send futures (like Rc).
 #[test]
 fn test_spawn_local_not_send() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     // Rc is !Send
     let data = Rc::new(vec![1, 2, 3]);
     let data_clone = data.clone();
@@ -57,7 +57,7 @@ fn test_spawn_local_not_send() {
 /// Test nested spawn_local calls.
 #[test]
 fn test_nested_spawn_local() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let counter = Rc::new(RefCell::new(0));
     let c1 = counter.clone();
 

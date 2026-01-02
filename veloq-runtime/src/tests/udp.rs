@@ -23,7 +23,7 @@ fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
 /// Test basic UDP socket binding and local_addr
 #[test]
 fn test_udp_bind() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
 
     exec.block_on(|cx| {
         let cx = cx.clone();
@@ -47,7 +47,7 @@ fn test_udp_bind() {
 fn test_udp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
         // Since we are inside the runtime, we can get buffer pool from cx, or create one.
         // The original test created a separate Rc<BufferPool>.
         // Ideally we use the runtime's buffer pool via cx.
@@ -107,7 +107,7 @@ fn test_udp_send_recv() {
 fn test_udp_echo() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -196,7 +196,7 @@ fn test_udp_echo() {
 #[test]
 fn test_udp_multiple_messages() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -254,7 +254,7 @@ fn test_udp_multiple_messages() {
 #[test]
 fn test_udp_large_data() {
     for size in [BufferSize::Size4K, BufferSize::Size16K] {
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
 
         exec.block_on(|cx| {
             let cx = cx.clone();
@@ -324,7 +324,7 @@ fn test_udp_large_data() {
 /// Test IPv6 UDP
 #[test]
 fn test_udp_ipv6() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
 
     exec.block_on(|cx| {
         let cx = cx.clone();

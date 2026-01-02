@@ -363,12 +363,14 @@ impl BuddyPool {
     }
 }
 
+impl Default for BuddyPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BufPool for BuddyPool {
     type BufferSize = BufferSize;
-
-    fn new() -> Self {
-        BuddyPool::new()
-    }
 
     fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>> {
         self.alloc(size)

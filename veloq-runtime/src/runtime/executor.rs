@@ -101,13 +101,14 @@ impl<P: BufPool> LocalExecutor<P> {
     }
 
     /// Create a new local executor for testing (no global injection).
-    pub fn new() -> Self {
+    pub fn new(pool: P) -> Self {
         Self::create_internal(
             None,
             None,
             None,
             None,
             None,
+            pool,
             crate::config::Config::default(),
         )
     }
@@ -118,6 +119,7 @@ impl<P: BufPool> LocalExecutor<P> {
         injected_load: Arc<AtomicUsize>,
         local_load: Arc<AtomicUsize>,
         spawner: Spawner,
+        pool: P,
         config: crate::config::Config,
     ) -> Self {
         Self::create_internal(
@@ -126,6 +128,7 @@ impl<P: BufPool> LocalExecutor<P> {
             Some(injected_load),
             Some(local_load),
             Some(spawner),
+            pool,
             config,
         )
     }
@@ -137,6 +140,7 @@ impl<P: BufPool> LocalExecutor<P> {
         injected_load: Arc<AtomicUsize>,
         local_load: Arc<AtomicUsize>,
         spawner: Spawner,
+        pool: P,
     ) -> Self {
         Self::create_internal(
             Some(driver),
@@ -144,6 +148,7 @@ impl<P: BufPool> LocalExecutor<P> {
             Some(injected_load),
             Some(local_load),
             Some(spawner),
+            pool,
             crate::config::Config::default(),
         )
     }
@@ -154,6 +159,7 @@ impl<P: BufPool> LocalExecutor<P> {
         injected_load: Option<Arc<AtomicUsize>>,
         local_load: Option<Arc<AtomicUsize>>,
         spawner: Option<Spawner>,
+        pool: P,
         config: crate::config::Config,
     ) -> Self {
         // Initialize Driver with config if not provided
@@ -161,7 +167,7 @@ impl<P: BufPool> LocalExecutor<P> {
             PlatformDriver::new(&config).expect("Failed to create driver")
         })));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
-        let buffer_pool = Rc::new(P::new());
+        let buffer_pool = Rc::new(pool);
 
         // Register buffer pool with driver
         driver
@@ -332,6 +338,12 @@ impl<P: BufPool> LocalExecutor<P> {
     }
 }
 
+impl<P: BufPool + Default> Default for LocalExecutor<P> {
+    fn default() -> Self {
+        Self::new(P::default())
+    }
+}
+
 /// A Thread-per-Core Runtime that manages multiple independent worker threads.
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
@@ -355,7 +367,7 @@ impl Runtime {
     /// It receives a `RuntimeContext` which can be used to spawn tasks.
     pub fn spawn_worker<F, Fut, P>(&mut self, future_factory: F)
     where
-        P: BufPool + 'static,
+        P: BufPool + Default + 'static,
         F: FnOnce(RuntimeContext<P>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
@@ -387,6 +399,7 @@ impl Runtime {
                 injected_load_clone,
                 local_load_clone,
                 spawner,
+                P::default(),
                 (*config).clone(),
             );
 

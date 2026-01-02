@@ -23,7 +23,7 @@ fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
 /// Test basic TCP connection using global spawn and current_driver
 #[test]
 fn test_tcp_connect_with_global_api() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let driver = exec.driver_handle();
 
     // Create listener before block_on
@@ -63,7 +63,7 @@ fn test_tcp_connect_with_global_api() {
 fn test_tcp_send_recv() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
         let driver = exec.driver_handle();
 
         let listener =
@@ -152,7 +152,7 @@ fn test_tcp_send_recv() {
 /// Test multiple concurrent connections on single thread
 #[test]
 fn test_tcp_multiple_connections() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let driver = exec.driver_handle();
 
     let listener =
@@ -197,7 +197,7 @@ fn test_tcp_multiple_connections() {
 #[test]
 fn test_tcp_large_data_transfer() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
         let driver = exec.driver_handle();
         let pool = Rc::new(HybridPool::new());
 
@@ -287,7 +287,7 @@ fn test_tcp_large_data_transfer() {
 /// Test listener local_addr
 #[test]
 fn test_listener_local_addr() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let driver = exec.driver_handle();
 
     exec.block_on(|_cx| async move {
@@ -306,7 +306,7 @@ fn test_listener_local_addr() {
 /// Test connection refused
 #[test]
 fn test_tcp_connect_refused() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
 
     exec.block_on(|cx| {
         let cx = cx.clone();
@@ -326,7 +326,7 @@ fn test_tcp_connect_refused() {
 #[test]
 fn test_tcp_recv_zero_bytes() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
-        let exec = LocalExecutor::<HybridPool>::new();
+        let exec = LocalExecutor::<HybridPool>::default();
         let driver = exec.driver_handle();
         let pool = Rc::new(HybridPool::new());
 
@@ -373,7 +373,7 @@ fn test_tcp_recv_zero_bytes() {
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {
-    let exec = LocalExecutor::<HybridPool>::new();
+    let exec = LocalExecutor::<HybridPool>::default();
     let driver = exec.driver_handle();
 
     let listener_result = TcpListener::bind("::1:0", driver.clone());

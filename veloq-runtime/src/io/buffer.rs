@@ -32,8 +32,6 @@ pub enum AllocResult {
 pub trait BufPool: Clone + std::fmt::Debug + 'static {
     type BufferSize: Copy + std::fmt::Debug;
 
-    fn new() -> Self;
-
     /// Allocate memory.
     fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>>;
 

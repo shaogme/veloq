@@ -21,7 +21,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_1gb_concurrent", |b| {
-        let exec = LocalExecutor::<BuddyPool>::new();
+        let exec = LocalExecutor::<BuddyPool>::default();
         b.iter(|| {
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(|cx| {
@@ -117,7 +117,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_32_files_concurrent", |b| {
-        let exec = LocalExecutor::<BuddyPool>::new();
+        let exec = LocalExecutor::<BuddyPool>::default();
         b.iter(|| {
             exec.block_on(|cx| {
                 let cx = cx.clone();

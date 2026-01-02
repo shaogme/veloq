@@ -9,7 +9,7 @@ fn test_file_integrity() {
 
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
-        crate::runtime::LocalExecutor::<HybridPool>::new().block_on(|cx| {
+        crate::runtime::LocalExecutor::<HybridPool>::default().block_on(|cx| {
             let cx = cx.clone();
             async move {
                 let file_path = Path::new("test_file_integrity.tmp");
