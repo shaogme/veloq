@@ -1,4 +1,4 @@
-use super::{BufPool, BufferSize, FixedBuf, NO_REGISTRATION_INDEX};
+use super::{AllocResult, BufPool, BufferSize, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -90,10 +90,15 @@ impl HybridPool {
 
     /// Allocate a buffer from the specified size class.
     pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf<HybridPool>> {
-        self.alloc_mem(size.size())
-            .map(|(ptr, cap, global_index, context)| {
-                FixedBuf::new(self.clone(), ptr, cap, global_index, context)
-            })
+        match self.alloc_mem(size.size()) {
+            AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index,
+                context,
+            } => Some(FixedBuf::new(self.clone(), ptr, cap, global_index, context)),
+            AllocResult::Failed => None,
+        }
     }
 }
 
@@ -102,7 +107,7 @@ impl BufPool for HybridPool {
         HybridPool::new_inner()
     }
 
-    fn alloc_mem(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)> {
+    fn alloc_mem(&self, size: usize) -> AllocResult {
         let mut inner = self.inner.borrow_mut();
 
         // Try to find best slab (smallest that fits)
@@ -116,12 +121,12 @@ impl BufPool for HybridPool {
                 // Using (slab_idx << 16) | index
                 let context = (slab_idx << 16) | index;
 
-                return Some((
-                    NonNull::new(ptr).unwrap(),
-                    slab.config.block_size,
-                    slab.global_index_offset + index as u16,
+                return AllocResult::Allocated {
+                    ptr: NonNull::new(ptr).unwrap(),
+                    cap: slab.config.block_size,
+                    global_index: slab.global_index_offset + index as u16,
                     context,
-                ));
+                };
             }
         }
 
@@ -133,13 +138,21 @@ impl BufPool for HybridPool {
             let cap = vec.capacity();
             std::mem::forget(vec);
 
-            return Some((ptr, cap, NO_REGISTRATION_INDEX, GLOBAL_ALLOC_CONTEXT));
+            return AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index: NO_REGISTRATION_INDEX,
+                context: GLOBAL_ALLOC_CONTEXT,
+            };
         }
 
-        None
+        AllocResult::Failed
     }
 
-    unsafe fn dealloc_mem(&self, ptr: NonNull<u8>, cap: usize, context: usize) {
+    unsafe fn dealloc_mem(&self, params: DeallocParams) {
+        let ptr = params.ptr;
+        let cap = params.cap;
+        let context = params.context;
         if context == GLOBAL_ALLOC_CONTEXT {
             // Global dealloc
             let _ = unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) };
