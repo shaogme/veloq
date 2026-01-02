@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
@@ -26,7 +26,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             exec.block_on(|cx| {
                 let cx = cx.clone();
                 async move {
-                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size64K;
+                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Custom(4 * 1024 * 1024);
                     let chunk_size = CHUNK_SIZE_ENUM.size();
                     let file_path = Path::new("bench_1gb_test.tmp");
 
@@ -59,12 +59,6 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                                 cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
                             {
                                 let remaining = TOTAL_SIZE - offset;
-                                // 对于 O_DIRECT，读写长度和偏移量通常需要对齐（如 512 或 4096 字节）
-                                // BufferPool 的块大小是 64K，是对齐的。
-                                // 最后一块如果不满 64K，如果 align 不对可能会报错。
-                                // 但通常 BufferSize 是 4K 对齐的。如果最后剩余不足，我们仍需小心。
-                                // 这里 min 之后，如果 alignment issue 发生，write 会报错 EINVAL。
-                                // 假设 TOTAL_SIZE (1GB) 是 64K 的倍数。
                                 let write_len =
                                     std::cmp::min(remaining, chunk_size as u64) as usize;
                                 buf.set_len(write_len);
@@ -110,5 +104,124 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_1gb_write);
+fn benchmark_32_files_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fs_throughput_32_files");
+
+    // 1GB Total Size
+    const FILE_COUNT: usize = 32;
+    const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+    const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
+
+    group.throughput(Throughput::Bytes(TOTAL_SIZE));
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(120));
+
+    group.bench_function("write_32_files_concurrent", |b| {
+        let exec = LocalExecutor::<BufferPool>::new();
+        b.iter(|| {
+            exec.block_on(|cx| {
+                let cx = cx.clone();
+                async move {
+                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Custom(4 * 1024 * 1024);
+                    let chunk_size = CHUNK_SIZE_ENUM.size();
+
+                    let mut files = Vec::with_capacity(FILE_COUNT);
+                    let mut file_paths = Vec::with_capacity(FILE_COUNT);
+
+                    for i in 0..FILE_COUNT {
+                        let path_str = format!("bench_32_{}.tmp", i);
+                        let path = PathBuf::from(path_str);
+
+                        if path.exists() {
+                            let _ = std::fs::remove_file(&path);
+                        }
+
+                        let file = File::create(&path, &cx)
+                            .await
+                            .expect("Failed to create");
+                        let file = Rc::new(file);
+
+                        file.fallocate(0, FILE_SIZE)
+                            .await
+                            .expect("Fallocate failed");
+
+                        files.push(file);
+                        file_paths.push(path);
+                    }
+
+                    let concurrency_limit = 32;
+                    let mut tasks = VecDeque::new();
+                    let mut offsets = vec![0u64; FILE_COUNT];
+                    let mut current_file_idx = 0;
+
+                    loop {
+                        let all_submitted = offsets.iter().all(|&o| o >= FILE_SIZE);
+
+                        if all_submitted && tasks.is_empty() {
+                            break;
+                        }
+
+                        // 1. 尝试分配并在此窗口内提交任务
+                        if tasks.len() < concurrency_limit && !all_submitted {
+                            // Find next file that needs writing
+                            let mut found = None;
+                            for _ in 0..FILE_COUNT {
+                                if offsets[current_file_idx] < FILE_SIZE {
+                                    found = Some(current_file_idx);
+                                    current_file_idx = (current_file_idx + 1) % FILE_COUNT;
+                                    break;
+                                }
+                                current_file_idx = (current_file_idx + 1) % FILE_COUNT;
+                            }
+
+                            if let Some(idx) = found {
+                                if let Some(mut buf) =
+                                    cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
+                                {
+                                    let remaining = FILE_SIZE - offsets[idx];
+                                    let write_len =
+                                        std::cmp::min(remaining, chunk_size as u64) as usize;
+                                    buf.set_len(write_len);
+
+                                    let file_clone = files[idx].clone();
+                                    let current_offset = offsets[idx];
+
+                                    let fut = async move {
+                                        file_clone.write_at(buf, current_offset).await
+                                    };
+
+                                    tasks.push_back(cx.spawn_local(fut));
+                                    offsets[idx] += write_len as u64;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
+                        if let Some(handle) = tasks.pop_front() {
+                            let (res, _buf) = handle.await;
+                            res.expect("Write failed");
+                        } else {
+                            if !all_submitted {
+                                panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                            }
+                        }
+                    }
+
+                    for file in &files {
+                        file.sync_range(0, FILE_SIZE).await.expect("Sync failed");
+                    }
+
+                    drop(files);
+                    for path in file_paths {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            });
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, benchmark_1gb_write, benchmark_32_files_write);
 criterion_main!(benches);

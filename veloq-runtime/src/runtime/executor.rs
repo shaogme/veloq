@@ -222,93 +222,110 @@ impl<P: BufPool> LocalExecutor<P> {
         let waker = main_task_waker(main_woken.clone());
         let mut cx = Context::from_waker(&waker);
 
+        // Budget for batch polling to reduce syscall overhead
+        const BUDGET: usize = 64;
+
         loop {
-            // 1. If main future was woken, poll it
-            if *main_woken.borrow() {
-                *main_woken.borrow_mut() = false;
+            let mut executed = 0;
 
-                if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
-                    return val;
-                }
-            }
+            // Run a batch of tasks before checking IO to allow SQE batching
+            while executed < BUDGET {
+                let mut did_work = false;
 
-            // 2. Run ONE spawned task (not all!) - this is key for fair scheduling
-            // Also check injector if present
-            if let Some(injector) = &self.injector {
-                loop {
-                    match injector.pop() {
-                        Some(job) => {
-                            // Update load counter
-                            if let Some(load) = &self.injected_load {
-                                load.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            // Increase local load
-                            if let Some(load) = &self.local_load {
-                                load.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Create local task from job
-                            let task = Task::new(job, Rc::downgrade(&self.queue));
-                            self.queue.borrow_mut().push_back(task);
-                        }
-                        None => break,
+                // 1. If main future was woken, poll it
+                if *main_woken.borrow() {
+                    *main_woken.borrow_mut() = false;
+                    did_work = true;
+
+                    if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
+                        return val;
                     }
                 }
-            }
 
-            // 3. Steal tasks if local queue is empty
-            if self.queue.borrow().is_empty() {
-                if let Some(spawner) = &self.spawner {
-                    if let Ok(workers) = spawner.workers.try_lock() {
-                        let worker_count = workers.len();
-                        if worker_count > 1 {
-                            // Random start index to avoid contention
-                            // Use ptr addr as seed source since we don't have good rng here
-                            let seed = self as *const _ as usize;
-                            let start_idx = seed % worker_count;
-
-                            for i in 0..worker_count {
-                                let idx = (start_idx + i) % worker_count;
-                                let target = &workers[idx];
-
-                                // Don't steal from self (simple check by injector ptr comparison not perfect but functional)
-                                // Or just rely on the fact that self.injector is empty (checked above)
-
-                                if let Some(job) = target.injector.pop() {
-                                    // Decrement their load
-                                    target.injected_load.fetch_sub(1, Ordering::Relaxed);
-
-                                    // Run it locally
+                // 2. Refill: Check Injector if local queue is empty
+                if self.queue.borrow().is_empty() {
+                    if let Some(injector) = &self.injector {
+                        // Optimistically drain injector to local queue
+                        loop {
+                            match injector.pop() {
+                                Some(job) => {
+                                    if let Some(load) = &self.injected_load {
+                                        load.fetch_sub(1, Ordering::Relaxed);
+                                    }
                                     if let Some(load) = &self.local_load {
                                         load.fetch_add(1, Ordering::Relaxed);
                                     }
                                     let task = Task::new(job, Rc::downgrade(&self.queue));
                                     self.queue.borrow_mut().push_back(task);
-                                    break; // Found one, go back to main loop to execute
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+
+                // 3. Refill: Steal tasks if local queue is still empty
+                if self.queue.borrow().is_empty() {
+                    if let Some(spawner) = &self.spawner {
+                        if let Ok(workers) = spawner.workers.try_lock() {
+                            let worker_count = workers.len();
+                            if worker_count > 1 {
+                                let seed = self as *const _ as usize;
+                                let start_idx = seed % worker_count;
+
+                                for i in 0..worker_count {
+                                    let idx = (start_idx + i) % worker_count;
+                                    let target = &workers[idx];
+
+                                    // Don't steal from self check handled implicitly by empty queue check + separate injector logic
+                                    if let Some(job) = target.injector.pop() {
+                                        target.injected_load.fetch_sub(1, Ordering::Relaxed);
+                                        if let Some(load) = &self.local_load {
+                                            load.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        let task = Task::new(job, Rc::downgrade(&self.queue));
+                                        self.queue.borrow_mut().push_back(task);
+                                        break; // Found one, loop back to execute
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            let task = self.queue.borrow_mut().pop_front();
-            if let Some(task) = task {
-                if let Some(load) = &self.local_load {
-                    load.fetch_sub(1, Ordering::Relaxed);
+                // 4. Run ONE task
+                let task = self.queue.borrow_mut().pop_front();
+                if let Some(task) = task {
+                    if let Some(load) = &self.local_load {
+                        load.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    task.run();
+                    did_work = true;
                 }
-                task.run();
+
+                if did_work {
+                    executed += 1;
+                } else {
+                    // No work found in this attempt
+                    break;
+                }
             }
 
-            // 3. Handle IO completions
+            // 5. Handle IO completions
+            // If we did work, we might have generated IO requests.
+            // If the queue is non-empty (budget exhausted), we just flush and poll casually.
+            // If the queue is empty, we must block.
             let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
 
             let mut driver = self.driver.borrow_mut();
             if has_pending_tasks {
-                // There are tasks waiting to run, don't block on IO
+                // There are tasks waiting to run, don't block on IO, just flush and check
+                // This call should be fast (non-blocking syscall or just queue logic)
                 driver.submit_queue().unwrap();
                 driver.process_completions();
             } else {
                 // No tasks ready, we MUST wait for IO to make progress
+                // This will block until at least one completion arrives
                 driver.wait().unwrap();
             }
         }

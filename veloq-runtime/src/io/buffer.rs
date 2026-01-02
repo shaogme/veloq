@@ -28,19 +28,29 @@ const SLABS: [SlabConfig; 3] = [
     },
 ];
 
+pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+const GLOBAL_ALLOC_CONTEXT: usize = usize::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSize {
     /// 4KB
-    Size4K = 0,
+    Size4K,
     /// 16KB
-    Size16K = 1,
+    Size16K,
     /// 64KB
-    Size64K = 2,
+    Size64K,
+    /// Custom size
+    Custom(usize),
 }
 
 impl BufferSize {
     pub fn size(&self) -> usize {
-        SLABS[*self as usize].block_size
+        match self {
+            BufferSize::Size4K => 4096,
+            BufferSize::Size16K => 16384,
+            BufferSize::Size64K => 65536,
+            BufferSize::Custom(size) => *size,
+        }
     }
 }
 
@@ -49,7 +59,7 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
     fn new() -> Self;
     /// Allocate memory of at least `size` bytes.
     /// Returns (ptr, capacity, global_index, context)
-    /// 
+    ///
     /// - `global_index` is the index used for io_uring registration (if applicable)
     /// - `context` is an opaque value passed back to dealloc
     fn alloc_mem(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)>;
@@ -80,8 +90,7 @@ pub struct BufferPool {
 
 impl std::fmt::Debug for BufferPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferPool")
-            .finish_non_exhaustive()
+        f.debug_struct("BufferPool").finish_non_exhaustive()
     }
 }
 
@@ -130,7 +139,6 @@ impl BufferPool {
     }
 
     // Support registering these buffers with io_uring
-
 }
 
 impl BufPool for BufferPool {
@@ -140,34 +148,55 @@ impl BufPool for BufferPool {
 
     fn alloc_mem(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)> {
         let mut inner = self.inner.borrow_mut();
-        // Determine best slab (smallest that fits)
-        let slab_idx = SLABS
-            .iter()
-            .position(|c| c.block_size >= size)?;
 
-        // Safety: SLABS indices map 1:1 if we used position. 
-        // But we must be sure inner.slabs matches SLABS. It does by construction.
-        let slab = &mut inner.slabs[slab_idx];
+        // Try to find best slab (smallest that fits)
+        if let Some(slab_idx) = SLABS.iter().position(|c| c.block_size >= size) {
+            let slab = &mut inner.slabs[slab_idx];
 
-        if let Some(index) = slab.free_indices.pop() {
-            let ptr = unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
-            
-            // Encode slab_idx (0-2) and index (0-1024) into usize context
-            // Using (slab_idx << 16) | index
-            let context = (slab_idx << 16) | index;
+            if let Some(index) = slab.free_indices.pop() {
+                let ptr = unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
 
-            Some((
-                NonNull::new(ptr).unwrap(), 
-                slab.config.block_size, 
-                slab.global_index_offset + index as u16,
-                context
-            ))
-        } else {
-            None
+                // Encode slab_idx (0-2) and index (0-1024) into usize context
+                // Using (slab_idx << 16) | index
+                let context = (slab_idx << 16) | index;
+
+                return Some((
+                    NonNull::new(ptr).unwrap(),
+                    slab.config.block_size,
+                    slab.global_index_offset + index as u16,
+                    context,
+                ));
+            }
         }
+
+        // Fallback: Global Allocator (Hybrid Strategy)
+        // Used when requested size is larger than largest slab, or slab is full (optional fallback)
+        // For simplicity, we only fallback if size is explicitly large or if we want to support graceful degradation.
+        // Current logic: If it fits a slab config but slab is empty, we return None (standard pool behavior).
+        // Only if it doesn't fit ANY slab config (i.e. too big), we go to global alloc.
+
+        // However, to support the "Larger chunks" requirement:
+        // If size > largest slab block size, we MUST use global alloc.
+        let max_slab_size = SLABS.last().map(|s| s.block_size).unwrap_or(0);
+        if size > max_slab_size {
+            let mut vec = Vec::with_capacity(size);
+            let ptr = unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) };
+            let cap = vec.capacity();
+            std::mem::forget(vec);
+
+            return Some((ptr, cap, NO_REGISTRATION_INDEX, GLOBAL_ALLOC_CONTEXT));
+        }
+
+        None
     }
 
-    unsafe fn dealloc_mem(&self, _ptr: NonNull<u8>, _cap: usize, context: usize) {
+    unsafe fn dealloc_mem(&self, ptr: NonNull<u8>, cap: usize, context: usize) {
+        if context == GLOBAL_ALLOC_CONTEXT {
+            // Global dealloc
+            let _ = unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) };
+            return;
+        }
+
         let mut inner = self.inner.borrow_mut();
         let slab_idx = context >> 16;
         let index = context & 0xFFFF;

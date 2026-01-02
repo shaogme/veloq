@@ -32,50 +32,90 @@ pub(crate) trait UringSubmit {
 // Direct Operations (Cross-Platform Structs)
 // ============================================================================
 
-use crate::io::buffer::BufPool;
+use crate::io::buffer::{BufPool, NO_REGISTRATION_INDEX};
 
 impl<P: BufPool> UringSubmit for ReadFixed<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::ReadFixed::new(
-                types::Fd(fd as i32),
-                self.buf.as_mut_ptr(),
-                self.buf.capacity() as u32,
-                self.buf.buf_index(),
-            )
-            .offset(self.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::ReadFixed::new(
-                types::Fixed(idx),
-                self.buf.as_mut_ptr(),
-                self.buf.capacity() as u32,
-                self.buf.buf_index(),
-            )
-            .offset(self.offset)
-            .build(),
+        let buf_index = self.buf.buf_index();
+        if buf_index == NO_REGISTRATION_INDEX {
+            match self.fd {
+                IoFd::Raw(fd) => opcode::Read::new(
+                    types::Fd(fd as i32),
+                    self.buf.as_mut_ptr(),
+                    self.buf.capacity() as u32,
+                )
+                .offset(self.offset)
+                .build(),
+                IoFd::Fixed(idx) => opcode::Read::new(
+                    types::Fixed(idx),
+                    self.buf.as_mut_ptr(),
+                    self.buf.capacity() as u32,
+                )
+                .offset(self.offset)
+                .build(),
+            }
+        } else {
+            match self.fd {
+                IoFd::Raw(fd) => opcode::ReadFixed::new(
+                    types::Fd(fd as i32),
+                    self.buf.as_mut_ptr(),
+                    self.buf.capacity() as u32,
+                    buf_index,
+                )
+                .offset(self.offset)
+                .build(),
+                IoFd::Fixed(idx) => opcode::ReadFixed::new(
+                    types::Fixed(idx),
+                    self.buf.as_mut_ptr(),
+                    self.buf.capacity() as u32,
+                    buf_index,
+                )
+                .offset(self.offset)
+                .build(),
+            }
         }
     }
 }
 
 impl<P: BufPool> UringSubmit for WriteFixed<P> {
     fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::WriteFixed::new(
-                types::Fd(fd as i32),
-                self.buf.as_slice().as_ptr(),
-                self.buf.len() as u32,
-                self.buf.buf_index(),
-            )
-            .offset(self.offset)
-            .build(),
-            IoFd::Fixed(idx) => opcode::WriteFixed::new(
-                types::Fixed(idx),
-                self.buf.as_slice().as_ptr(),
-                self.buf.len() as u32,
-                self.buf.buf_index(),
-            )
-            .offset(self.offset)
-            .build(),
+        let buf_index = self.buf.buf_index();
+        if buf_index == NO_REGISTRATION_INDEX {
+            match self.fd {
+                IoFd::Raw(fd) => opcode::Write::new(
+                    types::Fd(fd as i32),
+                    self.buf.as_slice().as_ptr(),
+                    self.buf.len() as u32,
+                )
+                .offset(self.offset)
+                .build(),
+                IoFd::Fixed(idx) => opcode::Write::new(
+                    types::Fixed(idx),
+                    self.buf.as_slice().as_ptr(),
+                    self.buf.len() as u32,
+                )
+                .offset(self.offset)
+                .build(),
+            }
+        } else {
+            match self.fd {
+                IoFd::Raw(fd) => opcode::WriteFixed::new(
+                    types::Fd(fd as i32),
+                    self.buf.as_slice().as_ptr(),
+                    self.buf.len() as u32,
+                    buf_index,
+                )
+                .offset(self.offset)
+                .build(),
+                IoFd::Fixed(idx) => opcode::WriteFixed::new(
+                    types::Fixed(idx),
+                    self.buf.as_slice().as_ptr(),
+                    self.buf.len() as u32,
+                    buf_index,
+                )
+                .offset(self.offset)
+                .build(),
+            }
         }
     }
 }
@@ -204,20 +244,14 @@ impl UringSubmit for Accept {
 impl UringSubmit for SyncFileRange {
     fn make_sqe(&mut self) -> squeue::Entry {
         match self.fd {
-            IoFd::Raw(fd) => opcode::SyncFileRange::new(
-                types::Fd(fd as i32),
-                self.nbytes as u32,
-            )
-            .offset(self.offset)
-            .flags(self.flags)
-            .build(),
-            IoFd::Fixed(idx) => opcode::SyncFileRange::new(
-                types::Fixed(idx),
-                self.nbytes as u32,
-            )
-            .offset(self.offset)
-            .flags(self.flags)
-            .build(),
+            IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd as i32), self.nbytes as u32)
+                .offset(self.offset)
+                .flags(self.flags)
+                .build(),
+            IoFd::Fixed(idx) => opcode::SyncFileRange::new(types::Fixed(idx), self.nbytes as u32)
+                .offset(self.offset)
+                .flags(self.flags)
+                .build(),
         }
     }
 }
@@ -250,7 +284,7 @@ impl<P: BufPool> UringSubmit for UringOp<P> {
             UringOp::SyncFileRange(op, _) => op.make_sqe(),
             UringOp::Fallocate(op, _) => op.make_sqe(),
             UringOp::Accept(op, _) => op.make_sqe(),
-            
+
             UringOp::SendTo(op, extras) => {
                 // Initialize internal pointers
                 extras.iovec[0].iov_base = op.buf.as_slice().as_ptr() as *mut _;
@@ -265,7 +299,8 @@ impl<P: BufPool> UringSubmit for UringOp<P> {
 
                 match op.fd {
                     IoFd::Raw(fd) => {
-                        opcode::SendMsg::new(types::Fd(fd as i32), &extras.msghdr as *const _).build()
+                        opcode::SendMsg::new(types::Fd(fd as i32), &extras.msghdr as *const _)
+                            .build()
                     }
                     IoFd::Fixed(idx) => {
                         opcode::SendMsg::new(types::Fixed(idx), &extras.msghdr as *const _).build()
@@ -287,10 +322,12 @@ impl<P: BufPool> UringSubmit for UringOp<P> {
 
                 match op.fd {
                     IoFd::Raw(fd) => {
-                        opcode::RecvMsg::new(types::Fd(fd as i32), &mut extras.msghdr as *mut _).build()
+                        opcode::RecvMsg::new(types::Fd(fd as i32), &mut extras.msghdr as *mut _)
+                            .build()
                     }
                     IoFd::Fixed(idx) => {
-                        opcode::RecvMsg::new(types::Fixed(idx), &mut extras.msghdr as *mut _).build()
+                        opcode::RecvMsg::new(types::Fixed(idx), &mut extras.msghdr as *mut _)
+                            .build()
                     }
                 }
             }
@@ -336,38 +373,38 @@ impl<P: BufPool> UringSubmit for UringOp<P> {
             UringOp::SyncFileRange(op, _) => op.on_complete(result),
             UringOp::Fallocate(op, _) => op.on_complete(result),
             UringOp::Accept(op, _) => op.on_complete(result),
-            
+
             // Ops with custom logic if needed, otherwise default
             UringOp::SendTo(_, _) => {
-                 if result >= 0 {
+                if result >= 0 {
                     Ok(result as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(-result))
                 }
             }
             UringOp::RecvFrom(_, _) => {
-                 if result >= 0 {
+                if result >= 0 {
                     Ok(result as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(-result))
                 }
             }
-             UringOp::Open(_, _) => {
-                 if result >= 0 {
+            UringOp::Open(_, _) => {
+                if result >= 0 {
                     Ok(result as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(-result))
                 }
             }
-             UringOp::Wakeup(_, _) => {
-                 if result >= 0 {
+            UringOp::Wakeup(_, _) => {
+                if result >= 0 {
                     Ok(result as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(-result))
                 }
             }
-             UringOp::Timeout(_, _) => {
-                 if result >= 0 {
+            UringOp::Timeout(_, _) => {
+                if result >= 0 {
                     Ok(result as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(-result))
