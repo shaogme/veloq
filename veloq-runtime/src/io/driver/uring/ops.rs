@@ -1,5 +1,6 @@
 use crate::io::op::{
-    Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, Wakeup, WriteFixed,
+    Accept, Connect, IoResources, ReadFixed, Recv, RecvFrom, Send, SendTo, Timeout, Wakeup,
+    WriteFixed,
 };
 use io_uring::{opcode, squeue, types};
 
@@ -63,18 +64,23 @@ impl UringOp for WriteFixed {
 }
 
 macro_rules! impl_uring_op {
-    ($($Variant:ident($Inner:ty)),* $(,)?) => {
+    (
+        WithFd { $( $(#[$meta_fd:meta])* $VariantFd:ident($InnerFd:ty) ),* $(,)? },
+        WithoutFd { $( $(#[$meta_no_fd:meta])* $VariantNoFd:ident($InnerNoFd:ty) ),* $(,)? }
+    ) => {
         impl UringOp for IoResources {
             fn make_sqe(&mut self) -> squeue::Entry {
                 match self {
-                    $(IoResources::$Variant(op) => op.make_sqe(),)*
+                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => op.make_sqe(),)*
+                    $( $(#[$meta_no_fd])* IoResources::$VariantNoFd(op) => op.make_sqe(),)*
                     IoResources::None => opcode::Nop::new().build(),
                 }
             }
 
             fn on_complete(&mut self, result: i32) -> std::io::Result<usize> {
                 match self {
-                    $(IoResources::$Variant(op) => op.on_complete(result),)*
+                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => op.on_complete(result),)*
+                    $( $(#[$meta_no_fd])* IoResources::$VariantNoFd(op) => op.on_complete(result),)*
                     IoResources::None => {
                         if result >= 0 {
                             Ok(result as usize)
@@ -226,7 +232,6 @@ impl UringOp for Wakeup {
     }
 }
 
-
 impl UringOp for crate::io::op::Open {
     fn make_sqe(&mut self) -> squeue::Entry {
         let path_ptr = self.path.as_ptr();
@@ -244,8 +249,8 @@ impl UringOp for crate::io::op::Close {
         match self.fd {
             crate::io::op::IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd)).build(),
             crate::io::op::IoFd::Fixed(idx) => {
-                 // Assume Raw for now as File usually holds Raw Fd.
-                 opcode::Close::new(types::Fixed(idx)).build()
+                // Assume Raw for now as File usually holds Raw Fd.
+                opcode::Close::new(types::Fixed(idx)).build()
             }
         }
     }
@@ -254,15 +259,17 @@ impl UringOp for crate::io::op::Close {
 impl UringOp for crate::io::op::Fsync {
     fn make_sqe(&mut self) -> squeue::Entry {
         let flags = if self.datasync {
-             // IORING_FSYNC_DATASYNC
-             io_uring::types::FsyncFlags::DATASYNC
+            // IORING_FSYNC_DATASYNC
+            io_uring::types::FsyncFlags::DATASYNC
         } else {
-             io_uring::types::FsyncFlags::empty()
+            io_uring::types::FsyncFlags::empty()
         };
 
         match self.fd {
             crate::io::op::IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
-            crate::io::op::IoFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx)).flags(flags).build(),
+            crate::io::op::IoFd::Fixed(idx) => {
+                opcode::Fsync::new(types::Fixed(idx)).flags(flags).build()
+            }
         }
     }
 }

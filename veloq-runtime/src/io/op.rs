@@ -38,21 +38,50 @@ impl IoFd {
 }
 
 macro_rules! define_io_resources_enum {
-    ( $($Variant:ident($Inner:ty)),* $(,)? ) => {
+    (
+        WithFd { $( $(#[$meta_fd:meta])* $VariantFd:ident($InnerFd:ty) ),* $(,)? },
+        WithoutFd { $( $(#[$meta_no_fd:meta])* $VariantNoFd:ident($InnerNoFd:ty) ),* $(,)? }
+    ) => {
         pub enum IoResources {
-            $($Variant($Inner),)*
+            $( $(#[$meta_fd])* $VariantFd($InnerFd), )*
+            $( $(#[$meta_no_fd])* $VariantNoFd($InnerNoFd), )*
             None,
         }
 
+        impl IoResources {
+            pub fn get_fd(&self) -> Option<IoFd> {
+                match self {
+                    $( $(#[$meta_fd])* IoResources::$VariantFd(op) => Some(op.fd), )*
+                    _ => None,
+                }
+            }
+        }
+
         $(
-            impl IoOp for $Inner {
+            $(#[$meta_fd])*
+            impl IoOp for $InnerFd {
                 fn into_resource(self) -> IoResources {
-                    IoResources::$Variant(self)
+                    IoResources::$VariantFd(self)
                 }
                 fn from_resource(res: IoResources) -> Self {
                     match res {
-                        IoResources::$Variant(r) => r,
-                        _ => panic!(concat!("Resource type mismatch for ", stringify!($Variant))),
+                        IoResources::$VariantFd(r) => r,
+                        _ => panic!(concat!("Resource type mismatch for ", stringify!($VariantFd))),
+                    }
+                }
+            }
+        )*
+
+        $(
+            $(#[$meta_no_fd])*
+            impl IoOp for $InnerNoFd {
+                fn into_resource(self) -> IoResources {
+                    IoResources::$VariantNoFd(self)
+                }
+                fn from_resource(res: IoResources) -> Self {
+                    match res {
+                        IoResources::$VariantNoFd(r) => r,
+                        _ => panic!(concat!("Resource type mismatch for ", stringify!($VariantNoFd))),
                     }
                 }
             }
