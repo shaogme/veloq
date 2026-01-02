@@ -70,7 +70,7 @@ impl OpenOptions {
         let (res, _) = Op::new(op, driver).await;
 
         // 3. 转换结果
-        let fd = res? as crate::io::op::SysRawOp;
+        let fd = res? as crate::io::op::RawHandle;
         use crate::io::op::IoFd;
         Ok(super::file::File { fd: IoFd::Raw(fd) })
     }
@@ -155,9 +155,7 @@ impl OpenOptions {
 
         // Convert Vec<u16> to Vec<u8> for storage
         // The platform driver will convert back to Vec<u16> when needed
-        let path_bytes: Vec<u8> = path_w.iter()
-            .flat_map(|&c| c.to_le_bytes())
-            .collect();
+        let path_bytes: Vec<u8> = path_w.iter().flat_map(|&c| c.to_le_bytes()).collect();
 
         Ok(Open {
             path: path_bytes,

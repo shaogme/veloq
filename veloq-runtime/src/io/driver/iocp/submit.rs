@@ -621,21 +621,30 @@ impl IocpSubmit for IocpOp {
     ) -> io::Result<SubmissionResult> {
         unsafe {
             match self {
-                IocpOp::ReadFixed(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::WriteFixed(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Recv(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Send(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Accept(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Connect(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::RecvFrom(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::SendTo(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Open(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Close(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Fsync(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Wakeup(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Timeout(op) => op.submit(port, overlapped, ext, registered_files),
-                IocpOp::Offload(op) => {
-                    if let Some(f) = op.take() {
+                IocpOp::ReadFixed { data, .. } => {
+                    data.submit(port, overlapped, ext, registered_files)
+                }
+                IocpOp::WriteFixed { data, .. } => {
+                    data.submit(port, overlapped, ext, registered_files)
+                }
+                IocpOp::Recv { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Send { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Accept { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Connect { data, .. } => {
+                    data.submit(port, overlapped, ext, registered_files)
+                }
+                IocpOp::RecvFrom { data, .. } => {
+                    data.submit(port, overlapped, ext, registered_files)
+                }
+                IocpOp::SendTo { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Open { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Close { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Fsync { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Wakeup { data, .. } => data.submit(port, overlapped, ext, registered_files),
+                IocpOp::Timeout(t) => t.submit(port, overlapped, ext, registered_files),
+                IocpOp::Offload { task, .. } => {
+                    // The task is taken out to be executed
+                    if let Some(f) = task.take() {
                         Ok(SubmissionResult::Offload(f))
                     } else {
                         Err(io::Error::new(
@@ -650,20 +659,20 @@ impl IocpSubmit for IocpOp {
 
     fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
         match self {
-            IocpOp::ReadFixed(op) => op.on_complete(result, ext),
-            IocpOp::WriteFixed(op) => op.on_complete(result, ext),
-            IocpOp::Recv(op) => op.on_complete(result, ext),
-            IocpOp::Send(op) => op.on_complete(result, ext),
-            IocpOp::Accept(op) => op.on_complete(result, ext),
-            IocpOp::Connect(op) => op.on_complete(result, ext),
-            IocpOp::RecvFrom(op) => op.on_complete(result, ext),
-            IocpOp::SendTo(op) => op.on_complete(result, ext),
-            IocpOp::Open(op) => op.on_complete(result, ext),
-            IocpOp::Close(op) => op.on_complete(result, ext),
-            IocpOp::Fsync(op) => op.on_complete(result, ext),
-            IocpOp::Wakeup(op) => op.on_complete(result, ext),
-            IocpOp::Timeout(op) => op.on_complete(result, ext),
-            IocpOp::Offload(_) => Ok(result),
+            IocpOp::ReadFixed { data, .. } => data.on_complete(result, ext),
+            IocpOp::WriteFixed { data, .. } => data.on_complete(result, ext),
+            IocpOp::Recv { data, .. } => data.on_complete(result, ext),
+            IocpOp::Send { data, .. } => data.on_complete(result, ext),
+            IocpOp::Accept { data, .. } => data.on_complete(result, ext),
+            IocpOp::Connect { data, .. } => data.on_complete(result, ext),
+            IocpOp::RecvFrom { data, .. } => data.on_complete(result, ext),
+            IocpOp::SendTo { data, .. } => data.on_complete(result, ext),
+            IocpOp::Open { data, .. } => data.on_complete(result, ext),
+            IocpOp::Close { data, .. } => data.on_complete(result, ext),
+            IocpOp::Fsync { data, .. } => data.on_complete(result, ext),
+            IocpOp::Wakeup { data, .. } => data.on_complete(result, ext),
+            IocpOp::Timeout(t) => t.on_complete(result, ext),
+            IocpOp::Offload { .. } => Ok(result),
         }
     }
 }

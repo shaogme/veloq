@@ -1,5 +1,5 @@
+use super::stable_slab::StableSlab;
 use crate::io::driver::PlatformOp;
-use slab::Slab;
 use std::io;
 use std::ops::{Index, IndexMut};
 use std::task::{Context, Poll, Waker};
@@ -26,13 +26,13 @@ impl<Op: PlatformOp, P> OpEntry<Op, P> {
 }
 
 pub struct OpRegistry<Op: PlatformOp, P> {
-    slab: Slab<OpEntry<Op, P>>,
+    slab: StableSlab<OpEntry<Op, P>>,
 }
 
 impl<Op: PlatformOp, P> OpRegistry<Op, P> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            slab: Slab::with_capacity(capacity),
+            slab: StableSlab::with_capacity(capacity),
         }
     }
 

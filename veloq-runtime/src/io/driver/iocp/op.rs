@@ -265,24 +265,90 @@ impl From<IocpOpen> for Open {
 // IocpOp Enum Definition
 // ============================================================================
 
+// ============================================================================
+// OverlappedEntry Definition
+// ============================================================================
+
+#[repr(C)]
+pub struct OverlappedEntry {
+    pub inner: windows_sys::Win32::System::IO::OVERLAPPED,
+    pub user_data: usize,
+    pub blocking_result: Option<io::Result<usize>>,
+}
+
+impl OverlappedEntry {
+    pub fn new(user_data: usize) -> Self {
+        Self {
+            inner: unsafe { std::mem::zeroed() },
+            user_data,
+            blocking_result: None,
+        }
+    }
+}
+
+// ============================================================================
+// IocpOp Enum Definition
+// ============================================================================
+
 /// The IOCP platform-specific operation enum.
 /// Each variant wraps either a cross-platform op struct or a platform-specific state.
 pub enum IocpOp {
-    ReadFixed(ReadFixed),
-    WriteFixed(WriteFixed),
-    Recv(Recv),
-    Send(OpSend),
-    Accept(IocpAccept),
-    Connect(Connect),
-    RecvFrom(IocpRecvFrom),
-    SendTo(IocpSendTo),
-    Open(IocpOpen),
-    Close(Close),
-    Fsync(Fsync),
-    Wakeup(IocpWakeup),
+    ReadFixed {
+        data: ReadFixed,
+        entry: OverlappedEntry,
+    },
+    WriteFixed {
+        data: WriteFixed,
+        entry: OverlappedEntry,
+    },
+    Recv {
+        data: Recv,
+        entry: OverlappedEntry,
+    },
+    Send {
+        data: OpSend,
+        entry: OverlappedEntry,
+    },
+    Accept {
+        data: IocpAccept,
+        entry: OverlappedEntry,
+    },
+    Connect {
+        data: Connect,
+        entry: OverlappedEntry,
+    },
+    RecvFrom {
+        data: IocpRecvFrom,
+        entry: OverlappedEntry,
+    },
+    SendTo {
+        data: IocpSendTo,
+        entry: OverlappedEntry,
+    },
+    Open {
+        data: IocpOpen,
+        entry: OverlappedEntry,
+    },
+    Close {
+        data: Close,
+        entry: OverlappedEntry,
+    },
+    Fsync {
+        data: Fsync,
+        entry: OverlappedEntry,
+    },
+    // Wakeup does not need OVERLAPPED in the same way if strictly used for cancellation,
+    // but PostQueuedCompletionStatus can use it.
+    Wakeup {
+        data: IocpWakeup,
+        entry: OverlappedEntry,
+    },
     Timeout(IocpTimeout),
     /// Offload operation for synchronous tasks run in thread pool.
-    Offload(Option<Box<dyn FnOnce() -> io::Result<usize> + Send>>),
+    Offload {
+        task: Option<Box<dyn FnOnce() -> io::Result<usize> + Send>>,
+        entry: OverlappedEntry,
+    },
 }
 
 // IocpOp needs to be Send so it can be passed to the Driver
@@ -298,11 +364,14 @@ macro_rules! impl_into_iocp_op_direct {
     ($Type:ident) => {
         impl IntoPlatformOp<IocpDriver> for $Type {
             fn into_platform_op(self) -> IocpOp {
-                IocpOp::$Type(self)
+                IocpOp::$Type {
+                    data: self,
+                    entry: OverlappedEntry::new(0),
+                }
             }
             fn from_platform_op(op: IocpOp) -> Self {
                 match op {
-                    IocpOp::$Type(val) => val,
+                    IocpOp::$Type { data, .. } => data,
                     _ => panic!(concat!(
                         "Driver returned mismatched Op type: expected ",
                         stringify!($Type)
@@ -317,11 +386,14 @@ macro_rules! impl_into_iocp_op_convert {
     ($GenericType:ident, $IocpType:ident, $Variant:ident) => {
         impl IntoPlatformOp<IocpDriver> for $GenericType {
             fn into_platform_op(self) -> IocpOp {
-                IocpOp::$Variant(self.into())
+                IocpOp::$Variant {
+                    data: self.into(),
+                    entry: OverlappedEntry::new(0),
+                }
             }
             fn from_platform_op(op: IocpOp) -> Self {
                 match op {
-                    IocpOp::$Variant(val) => val.into(),
+                    IocpOp::$Variant { data, .. } => data.into(),
                     _ => panic!(concat!(
                         "Driver returned mismatched Op type: expected ",
                         stringify!($Variant)
@@ -345,17 +417,32 @@ impl_into_iocp_op_convert!(Accept, IocpAccept, Accept);
 impl_into_iocp_op_convert!(SendTo, IocpSendTo, SendTo);
 impl_into_iocp_op_convert!(RecvFrom, IocpRecvFrom, RecvFrom);
 impl_into_iocp_op_convert!(Open, IocpOpen, Open);
-impl_into_iocp_op_convert!(Timeout, IocpTimeout, Timeout);
+// Timeout doesn't use Overlapped
+impl IntoPlatformOp<IocpDriver> for Timeout {
+    fn into_platform_op(self) -> IocpOp {
+        IocpOp::Timeout(self.into())
+    }
+    fn from_platform_op(op: IocpOp) -> Self {
+        match op {
+            IocpOp::Timeout(t) => t.into(),
+            _ => panic!("Driver returned mismatched Op type: expected Timeout"),
+        }
+    }
+}
+
 impl_into_iocp_op_convert!(Wakeup, IocpWakeup, Wakeup);
 
 // Manual implementation for Send because of name conflict with OpSend
 impl IntoPlatformOp<IocpDriver> for OpSend {
     fn into_platform_op(self) -> IocpOp {
-        IocpOp::Send(self)
+        IocpOp::Send {
+            data: self,
+            entry: OverlappedEntry::new(0),
+        }
     }
     fn from_platform_op(op: IocpOp) -> Self {
         match op {
-            IocpOp::Send(val) => val,
+            IocpOp::Send { data, .. } => data,
             _ => panic!("Driver returned mismatched Op type: expected Send"),
         }
     }
@@ -365,17 +452,39 @@ impl IocpOp {
     /// Get the file descriptor associated with this operation (if any).
     pub fn get_fd(&self) -> Option<IoFd> {
         match self {
-            IocpOp::ReadFixed(op) => Some(op.fd),
-            IocpOp::WriteFixed(op) => Some(op.fd),
-            IocpOp::Recv(op) => Some(op.fd),
-            IocpOp::Send(op) => Some(op.fd),
-            IocpOp::Accept(op) => Some(op.fd),
-            IocpOp::Connect(op) => Some(op.fd),
-            IocpOp::RecvFrom(op) => Some(op.fd),
-            IocpOp::SendTo(op) => Some(op.fd),
-            IocpOp::Close(op) => Some(op.fd),
-            IocpOp::Fsync(op) => Some(op.fd),
-            IocpOp::Open(_) | IocpOp::Wakeup(_) | IocpOp::Timeout(_) | IocpOp::Offload(_) => None,
+            IocpOp::ReadFixed { data, .. } => Some(data.fd),
+            IocpOp::WriteFixed { data, .. } => Some(data.fd),
+            IocpOp::Recv { data, .. } => Some(data.fd),
+            IocpOp::Send { data, .. } => Some(data.fd),
+            IocpOp::Accept { data, .. } => Some(data.fd),
+            IocpOp::Connect { data, .. } => Some(data.fd),
+            IocpOp::RecvFrom { data, .. } => Some(data.fd),
+            IocpOp::SendTo { data, .. } => Some(data.fd),
+            IocpOp::Close { data, .. } => Some(data.fd),
+            IocpOp::Fsync { data, .. } => Some(data.fd),
+            IocpOp::Open { .. }
+            | IocpOp::Wakeup { .. }
+            | IocpOp::Timeout(_)
+            | IocpOp::Offload { .. } => None,
+        }
+    }
+
+    pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
+        match self {
+            IocpOp::ReadFixed { entry, .. } => Some(entry),
+            IocpOp::WriteFixed { entry, .. } => Some(entry),
+            IocpOp::Recv { entry, .. } => Some(entry),
+            IocpOp::Send { entry, .. } => Some(entry),
+            IocpOp::Accept { entry, .. } => Some(entry),
+            IocpOp::Connect { entry, .. } => Some(entry),
+            IocpOp::RecvFrom { entry, .. } => Some(entry),
+            IocpOp::SendTo { entry, .. } => Some(entry),
+            IocpOp::Open { entry, .. } => Some(entry),
+            IocpOp::Close { entry, .. } => Some(entry),
+            IocpOp::Fsync { entry, .. } => Some(entry),
+            IocpOp::Wakeup { entry, .. } => Some(entry),
+            IocpOp::Offload { entry, .. } => Some(entry),
+            IocpOp::Timeout(_) => None,
         }
     }
 }

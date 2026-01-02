@@ -5,7 +5,7 @@ mod submit;
 mod tests;
 
 // use crate::io::buffer::{BufferPool, FixedBuf};
-use super::blocking::{ThreadPool, ThreadPoolError};
+use super::blocking::ThreadPool;
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
 use ext::Extensions;
@@ -28,8 +28,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
+use op::OverlappedEntry;
+
 pub enum PlatformData {
-    Overlapped(Box<OverlappedEntry>),
     Timer(TaskId),
     None,
 }
@@ -42,13 +43,6 @@ pub struct IocpDriver {
     registered_files: Vec<Option<HANDLE>>,
     free_slots: Vec<usize>,
     pool: ThreadPool,
-}
-
-#[repr(C)]
-pub struct OverlappedEntry {
-    inner: OVERLAPPED,
-    user_data: usize,
-    blocking_result: Option<io::Result<usize>>,
 }
 
 struct IocpWaker(HANDLE);
@@ -89,10 +83,6 @@ impl IocpDriver {
         // Load extensions
         let extensions = Extensions::new()?;
 
-        // Use a default capacity if not specified in config (since I need to add it)
-        // For now, I'll assume we update Config to have entries or use a default constant/config val.
-        // Actually, the previous code used `entries` passed in.
-        // I will add `entries` to IocpConfig.
         let entries = config.iocp.entries;
 
         Ok(Self {
@@ -176,41 +166,44 @@ impl IocpDriver {
             let mut result_is_ready = false;
 
             if op.result.is_none() {
-                match &mut op.platform_data {
-                    PlatformData::Overlapped(entry) => {
-                        // Check if this was a blocking task offloaded to thread pool
+                // If op.resources is Some(op), we have the op.
+                // We should access 'entry' from op.resources.
+
+                if let Some(iocp_op) = op.resources.as_mut() {
+                    if let Some(entry) = iocp_op.entry_mut() {
                         if let Some(res) = entry.blocking_result.take() {
                             op.result = Some(res);
                             result_is_ready = true;
-                        } else {
-                            // Standard IOCP completion
-                            let result = if res == 0 {
-                                let err = unsafe { GetLastError() };
-                                if err == ERROR_HANDLE_EOF {
-                                    Ok(bytes_transferred as usize)
-                                } else {
-                                    Err(io::Error::from_raw_os_error(err as i32))
-                                }
-                            } else {
-                                Ok(bytes_transferred as usize)
-                            };
-
-                            if result.is_ok() {
-                                // Apply post-processing (Accept/Connect fixups)
-                                let bytes = result.unwrap();
-                                let final_res = op
-                                    .resources
-                                    .as_mut()
-                                    .unwrap()
-                                    .on_complete(bytes, &self.extensions);
-                                op.result = Some(final_res);
-                            } else {
-                                op.result = Some(result);
-                            }
-                            result_is_ready = true;
                         }
                     }
-                    _ => {}
+                }
+
+                if !result_is_ready {
+                    // Standard IOCP completion
+                    let result = if res == 0 {
+                        let err = unsafe { GetLastError() };
+                        if err == ERROR_HANDLE_EOF {
+                            Ok(bytes_transferred as usize)
+                        } else {
+                            Err(io::Error::from_raw_os_error(err as i32))
+                        }
+                    } else {
+                        Ok(bytes_transferred as usize)
+                    };
+
+                    if result.is_ok() {
+                        // Apply post-processing (Accept/Connect fixups)
+                        let bytes = result.unwrap();
+                        let final_res = op
+                            .resources
+                            .as_mut()
+                            .unwrap()
+                            .on_complete(bytes, &self.extensions);
+                        op.result = Some(final_res);
+                    } else {
+                        op.result = Some(result);
+                    }
+                    result_is_ready = true;
                 }
             }
 
@@ -234,7 +227,7 @@ impl Driver for IocpDriver {
         self.ops.insert(OpEntry::new(None, PlatformData::None))
     }
 
-    fn submit(&mut self, user_data: usize, mut op: Self::Op) {
+    fn submit(&mut self, user_data: usize, op: Self::Op) {
         if let IocpOp::Timeout(t) = &op {
             // Handle timeout
             let id = self.wheel.insert(user_data, t.duration);
@@ -245,82 +238,93 @@ impl Driver for IocpDriver {
             return;
         }
 
-        // 1. Prepare stable Overlapped
-        let mut entry = Box::new(OverlappedEntry {
-            inner: unsafe { std::mem::zeroed() },
-            user_data,
-            blocking_result: None,
-        });
+        // 1. Move Op into Registry to pin it immediately
+        let op_entry = self
+            .ops
+            .get_mut(user_data)
+            .expect("Invalid user_data reserved");
+        op_entry.resources = Some(op);
 
-        let overlapped_ptr = &mut entry.inner as *mut OVERLAPPED;
+        // 2. Access the stabilized Op and its OverlappedEntry
+        // Split borrows manually to satisfy borrow checker
+        let port = self.port;
+        let extensions = &self.extensions;
+        let registered_files = &self.registered_files;
 
-        // Pass registered_files to submit
-        let submission_result = unsafe {
-            op.submit(
-                self.port,
-                overlapped_ptr,
-                &self.extensions,
-                &self.registered_files,
-            )
-        };
+        // We get the stable reference now.
+        let op_ref = self
+            .ops
+            .get_mut(user_data)
+            .unwrap()
+            .resources
+            .as_mut()
+            .unwrap();
 
-        if let Some(op_entry) = self.ops.get_mut(user_data) {
-            match submission_result {
-                Ok(SubmissionResult::Pending) => {
-                    op_entry.resources = Some(op);
-                    op_entry.platform_data = PlatformData::Overlapped(entry);
-                    // Start async operation, wait for completion on port
-                }
+        // Initialize stable Overlapped within the pinned op
+        if let Some(entry) = op_ref.entry_mut() {
+            entry.user_data = user_data;
+            entry.inner = unsafe { std::mem::zeroed() };
+            entry.blocking_result = None;
+        }
 
-                Ok(SubmissionResult::PostToQueue) => {
-                    op_entry.resources = Some(op);
-                    op_entry.platform_data = PlatformData::Overlapped(entry);
+        // Get pointer to the pinned OVERLAPPED
+        let overlapped_ptr = op_ref
+            .entry_mut()
+            .map(|e| &mut e.inner as *mut OVERLAPPED)
+            .unwrap_or(std::ptr::null_mut());
+
+        // 3. Submit to kernel/pool
+        let submission_result =
+            unsafe { op_ref.submit(port, overlapped_ptr, extensions, registered_files) };
+
+        match submission_result {
+            Ok(SubmissionResult::Pending) => {
+                // Op is pinned and pending.
+            }
+            Ok(SubmissionResult::PostToQueue) => unsafe {
+                PostQueuedCompletionStatus(port, 0, 0, overlapped_ptr);
+            },
+            Ok(SubmissionResult::Offload(task_fn)) => {
+                let entry_ptr_val = overlapped_ptr as usize;
+                let port_val = port as usize;
+
+                // We perform the spawn. self.pool execute might fail.
+                let spawn_result = self.pool.execute(move || {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task_fn()))
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "blocking task panicked",
+                                ))
+                            });
+
+                    // Access via raw pointer to pinned entry is safe
+                    let ptr = entry_ptr_val as *mut OverlappedEntry;
                     unsafe {
-                        PostQueuedCompletionStatus(self.port, 0, 0, overlapped_ptr);
+                        (*ptr).blocking_result = Some(result);
+                        PostQueuedCompletionStatus(
+                            port_val as HANDLE,
+                            0,
+                            user_data,
+                            ptr as *mut OVERLAPPED,
+                        );
+                    }
+                });
+
+                if spawn_result.is_err() {
+                    // Pool overloaded or error
+                    if let Some(op_entry) = self.ops.get_mut(user_data) {
+                        op_entry.result = Some(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "blocking pool overloaded",
+                        )));
                     }
                 }
-                Ok(SubmissionResult::Offload(task_fn)) => {
-                    op_entry.resources = Some(op);
-                    // Keep the entry alive in platform_data
-                    op_entry.platform_data = PlatformData::Overlapped(entry);
-
-                    let entry_ptr_val = overlapped_ptr as usize;
-                    let port_val = self.port as usize;
-
-                    match self.pool.execute(move || {
-                        // Catch panic inside the task to ensure we always report completion
-                        let result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task_fn()))
-                                .unwrap_or_else(|_| {
-                                    Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        "blocking task panicked",
-                                    ))
-                                });
-
-                        let ptr = entry_ptr_val as *mut OverlappedEntry;
-                        unsafe {
-                            (*ptr).blocking_result = Some(result);
-                            PostQueuedCompletionStatus(
-                                port_val as HANDLE,
-                                0,
-                                user_data,
-                                ptr as *mut OVERLAPPED,
-                            );
-                        }
-                    }) {
-                        Ok(_) => {}
-                        Err(ThreadPoolError::Overloaded) => {
-                            // Fail the operation immediately
-                            op_entry.result = Some(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "blocking pool overloaded",
-                            )));
-                        }
-                    }
-                }
-                Err(e) => {
-                    op_entry.resources = Some(op);
+            }
+            Err(e) => {
+                // Submission failed immediately
+                if let Some(op_entry) = self.ops.get_mut(user_data) {
                     op_entry.result = Some(Err(e));
                 }
             }
@@ -347,8 +351,6 @@ impl Driver for IocpDriver {
     }
 
     fn process_completions(&mut self) {
-        // Use a short timeout (1ms) instead of 0 to avoid busy-waiting
-        // when IO operations are pending but not yet complete
         let _ = self.get_completion(1);
     }
 
@@ -359,35 +361,39 @@ impl Driver for IocpDriver {
             match &mut op.platform_data {
                 PlatformData::Timer(id) => {
                     self.wheel.cancel(*id);
-                    // Remove immediately as no kernel resource is held
-                    // Actually, modifying self.ops while holding RefMut from get_mut is unsafe/impossible?
-                    // But here we obtained `op` via `get_mut`. To remove, we need access to `ops`.
-                    // We must release `op` reference before removing.
+                    // Timer removal logic?
                 }
-                PlatformData::Overlapped(overlapped) => {
-                    // Check for handles and CancelIoEx
-                    if let Some(res) = &op.resources {
+                PlatformData::None => {
+                    // Try to CancelIoEx if resources exist
+                    if let Some(res) = &mut op.resources {
                         if let Some(fd) = res.get_fd() {
                             if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
-                                unsafe {
-                                    use windows_sys::Win32::System::IO::CancelIoEx;
-                                    let _ =
-                                        CancelIoEx(handle, &overlapped.inner as *const _ as *mut _);
+                                if let Some(entry) = res.entry_mut() {
+                                    unsafe {
+                                        use windows_sys::Win32::System::IO::CancelIoEx;
+                                        let _ =
+                                            CancelIoEx(handle, &entry.inner as *const _ as *mut _);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                PlatformData::None => {}
             }
         }
 
-        // Post-processing for removal
         let should_remove = if let Some(op) = self.ops.get_mut(user_data) {
-            matches!(
-                op.platform_data,
-                PlatformData::Timer(_) | PlatformData::None
-            )
+            match op.platform_data {
+                PlatformData::Timer(_) => true,
+                PlatformData::None => {
+                    // For IO ops, we only remove if completion happened.
+                    // But if we just cancelled, we wait for CancelIo completion?
+                    // Usually yes. But if it was never submitted?
+                    // We assume it was submitted if it is in None state with resources.
+                    // So we do NOT remove immediately for IO.
+                    false
+                }
+            }
         } else {
             false
         };
@@ -398,13 +404,12 @@ impl Driver for IocpDriver {
     }
 
     fn register_buffer_pool(&mut self, _pool: &crate::io::buffer::BufferPool) -> io::Result<()> {
-        // No-op for Windows currently
         Ok(())
     }
 
     fn register_files(
         &mut self,
-        files: &[crate::io::op::SysRawOp],
+        files: &[crate::io::op::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
@@ -437,12 +442,9 @@ impl Driver for IocpDriver {
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         match op {
-            IocpOp::Close(close) => {
-                if let Some(fd) = close.fd.raw() {
-                    // Offload CloseHandle to thread pool
-                    // We must own the fd. SysRawOp is Copy (u32/size_t or similar handle), so we copy it.
+            IocpOp::Close { data, .. } => {
+                if let Some(fd) = data.fd.raw() {
                     let fd_val = fd as usize;
-
                     self.pool
                         .execute(move || unsafe {
                             windows_sys::Win32::Foundation::CloseHandle(fd_val as HANDLE);
@@ -450,7 +452,6 @@ impl Driver for IocpDriver {
                         .map_err(|_| {
                             io::Error::new(io::ErrorKind::Other, "blocking pool overloaded")
                         })?;
-
                     Ok(())
                 } else {
                     Ok(())

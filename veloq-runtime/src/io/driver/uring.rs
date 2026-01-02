@@ -329,7 +329,7 @@ impl Driver for UringDriver {
 
     fn register_files(
         &mut self,
-        files: &[crate::io::op::SysRawOp],
+        files: &[crate::io::op::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>> {
         // Note: this replaces the entire file table in io_uring currently.
         // A more advanced implementation would use IORING_REGISTER_FILES_UPDATE

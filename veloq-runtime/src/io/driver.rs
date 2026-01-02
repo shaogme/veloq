@@ -3,6 +3,7 @@
 #[cfg(target_os = "windows")]
 pub(crate) mod blocking;
 pub(crate) mod op_registry;
+pub(crate) mod stable_slab;
 use std::io;
 use std::task::{Context, Poll};
 
@@ -46,7 +47,7 @@ pub trait Driver {
     /// Returns a list of `IoFd` that can be used in subsequent operations.
     fn register_files(
         &mut self,
-        files: &[crate::io::op::SysRawOp],
+        files: &[crate::io::op::RawHandle],
     ) -> io::Result<Vec<crate::io::op::IoFd>>;
 
     /// Unregister a set of file descriptors/handles.

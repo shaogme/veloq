@@ -26,10 +26,6 @@ use std::rc::Weak;
 /// Uses `usize` to represent any platform's handle (fd on Unix, HANDLE on Windows).
 pub type RawHandle = usize;
 
-/// Alias for RawHandle for backwards compatibility.
-/// Deprecated: Use `RawHandle` instead.
-pub type SysRawOp = RawHandle;
-
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoFd {

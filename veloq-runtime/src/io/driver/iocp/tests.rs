@@ -3,7 +3,7 @@ use crate::io::buffer::{BufferPool, BufferSize};
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
-use op::{IocpAccept, IocpOp};
+use op::{IocpAccept, IocpOp, OverlappedEntry};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -52,7 +52,10 @@ fn test_iocp_accept() {
     let mut iocp_accept: IocpAccept = accept_op.into();
     iocp_accept.accept_socket = acceptor_handle;
 
-    let iocp_op = IocpOp::Accept(iocp_accept);
+    let iocp_op = IocpOp::Accept {
+        data: iocp_accept,
+        entry: OverlappedEntry::new(0),
+    };
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -78,7 +81,7 @@ fn test_iocp_accept() {
             Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
                 match iocp_op {
-                    IocpOp::Accept(op) => {
+                    IocpOp::Accept { data: op, .. } => {
                         assert!(op.remote_addr.is_some(), "Remote addr should be populated");
                         unsafe {
                             if let Some(fd) = op.fd.raw() {
@@ -238,7 +241,7 @@ fn test_iocp_recv_with_buffer_pool() {
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
 
-                if let IocpOp::Recv(mut op) = iocp_op {
+                if let IocpOp::Recv { data: mut op, .. } = iocp_op {
                     op.buf.set_len(bytes_read);
                     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
                 } else {
