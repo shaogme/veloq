@@ -167,3 +167,30 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, socklen_t) {
         }
     }
 }
+
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (libc::sockaddr_storage, socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(a) => {
+            let sin_ptr = &mut storage as *mut _ as *mut sockaddr_in;
+            unsafe {
+                (*sin_ptr).sin_family = libc::AF_INET as _;
+                (*sin_ptr).sin_port = a.port().to_be();
+                (*sin_ptr).sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+                mem::size_of::<sockaddr_in>() as socklen_t
+            }
+        }
+        SocketAddr::V6(a) => {
+            let sin6_ptr = &mut storage as *mut _ as *mut sockaddr_in6;
+            unsafe {
+                (*sin6_ptr).sin6_family = libc::AF_INET6 as _;
+                (*sin6_ptr).sin6_port = a.port().to_be();
+                (*sin6_ptr).sin6_addr.s6_addr = a.ip().octets();
+                (*sin6_ptr).sin6_flowinfo = a.flowinfo();
+                (*sin6_ptr).sin6_scope_id = a.scope_id();
+                mem::size_of::<sockaddr_in6>() as socklen_t
+            }
+        }
+    };
+    (storage, len)
+}

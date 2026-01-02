@@ -50,12 +50,10 @@ impl UdpSocket {
         buf: FixedBuf,
         target: SocketAddr,
     ) -> (io::Result<usize>, FixedBuf) {
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
         let op = SendTo {
             fd: IoFd::Raw(self.fd),
             buf,
-            addr: raw_addr.into_boxed_slice(),
-            addr_len: raw_addr_len as u32,
+            addr: target,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back): (io::Result<usize>, SendTo) = future.await;
@@ -63,24 +61,17 @@ impl UdpSocket {
     }
 
     pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
-        let addr_buf_size = 128usize;
-        let addr = vec![0u8; addr_buf_size].into_boxed_slice();
-        let addr_len = addr_buf_size as u32;
-
         let op = RecvFrom {
             fd: IoFd::Raw(self.fd),
             buf,
-            addr,
-            addr_len,
+            addr: None,
         };
         let future = Op::new(op, self.driver.clone());
         let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
 
         match res {
             Ok(n) => {
-                let len = op_back.addr_len as usize;
-                let addr = crate::io::socket::to_socket_addr(&op_back.addr[..len])
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                let addr = op_back.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
                 (Ok((n, addr)), op_back.buf)
             }
             Err(e) => (Err(e), op_back.buf),

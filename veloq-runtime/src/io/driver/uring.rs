@@ -217,8 +217,26 @@ impl UringDriver {
     /// Get a submission queue entry to fill.
     fn push_entry(&mut self, entry: squeue::Entry) {
         let mut sq = self.ring.submission();
-        // unsafe because we must ensure the entry is valid. Use io-uring guarantee.
-        let _ = unsafe { sq.push(&entry) };
+        
+        // Attempt to push the entry
+        if unsafe { sq.push(&entry) }.is_err() {
+            // SQ is full. We must submit current entries to clear space.
+            drop(sq); // Drop mutable borrow to call submit
+            if let Err(e) = self.ring.submit() {
+                // If submit fails, we have a serious problem. 
+                // Panic is appropriate here as we can't recover easily and maintaining consistency is hard.
+                panic!("io_uring submit failed during push recovery: {}", e);
+            }
+            
+            // Retry push
+            let mut sq = self.ring.submission();
+            if unsafe { sq.push(&entry) }.is_err() {
+                // If it still fails, it essentially means the kernel isn't consuming SQEs fast enough 
+                // or we are trying to push more than the ring size at once without processing completions.
+                // For a robust runtime, we might want to wait/park, but for now panicking prevents hidden deadlocks.
+                panic!("io_uring submission queue is full and cannot be cleared");
+            }
+        }
     }
 
     /// Register buffers with the kernel invocation of io_uring.
@@ -258,14 +276,20 @@ impl Driver for UringDriver {
         self.ops.insert(OpEntry::new(None, ()))
     }
 
-    fn submit(&mut self, user_data: usize, mut op: Self::Op) {
-        // 1. Create SQE
-        let sqe = op.make_sqe().user_data(user_data as u64);
-
-        // 2. Store resources
+    fn submit(&mut self, user_data: usize, op: Self::Op) {
+        // 1. Store resources (Move to Stable Memory first)
         if let Some(entry) = self.ops.get_mut(user_data) {
             entry.resources = Some(op);
         }
+
+        // 2. Generate SQE using the Op in its final memory location
+        // This ensures that any pointers to 'self' passed to the kernel (e.g. msghdr, iovec)
+        // refer to the stable address in the slab, not a temporary stack address.
+        let sqe = {
+            let entry = self.ops.get_mut(user_data).expect("invalid user_data");
+            let op = entry.resources.as_mut().expect("resources missing");
+            op.make_sqe().user_data(user_data as u64)
+        };
 
         // 3. Push to ring
         self.push_entry(sqe);

@@ -106,10 +106,10 @@ impl TcpStream {
         };
         let fd = socket.into_raw() as RawHandle;
 
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(addr);
+        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
         let op = Connect {
             fd: IoFd::Raw(fd),
-            addr: raw_addr.into_boxed_slice(),
+            addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
 

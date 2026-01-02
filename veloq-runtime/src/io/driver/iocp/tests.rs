@@ -116,12 +116,12 @@ fn test_iocp_connect() {
     let client_handle = client.into_raw() as RawHandle;
 
     // Create Connect Op manually as it doesn't have into_op
-    use crate::io::socket::socket_addr_trans;
-    let (addr_buf, addr_len) = socket_addr_trans(addr);
+    use crate::io::socket::socket_addr_to_storage;
+    let (addr_storage, addr_len) = socket_addr_to_storage(addr);
 
     let connect_op = Connect {
         fd: crate::io::op::IoFd::Raw(client_handle),
-        addr: addr_buf.into_boxed_slice(),
+        addr: addr_storage,
         addr_len: addr_len as u32,
     };
 

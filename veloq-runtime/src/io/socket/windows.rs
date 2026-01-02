@@ -189,3 +189,32 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
         }
     }
 }
+
+pub use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
+
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
+    let mut storage: SOCKADDR_STORAGE = unsafe { mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(a) => {
+            let sin_ptr = &mut storage as *mut _ as *mut SOCKADDR_IN;
+            unsafe {
+                (*sin_ptr).sin_family = AF_INET;
+                (*sin_ptr).sin_port = a.port().to_be();
+                (*sin_ptr).sin_addr.S_un.S_addr = u32::from_ne_bytes(a.ip().octets());
+                mem::size_of::<SOCKADDR_IN>() as i32
+            }
+        }
+        SocketAddr::V6(a) => {
+            let sin6_ptr = &mut storage as *mut _ as *mut SOCKADDR_IN6;
+            unsafe {
+                (*sin6_ptr).sin6_family = AF_INET6;
+                (*sin6_ptr).sin6_port = a.port().to_be();
+                (*sin6_ptr).sin6_addr = mem::transmute(a.ip().octets());
+                (*sin6_ptr).sin6_flowinfo = a.flowinfo();
+                (*sin6_ptr).Anonymous.sin6_scope_id = a.scope_id();
+                mem::size_of::<SOCKADDR_IN6>() as i32
+            }
+        }
+    };
+    (storage, len)
+}

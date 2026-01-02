@@ -15,6 +15,7 @@ use std::{
 
 use crate::io::buffer::FixedBuf;
 use crate::io::driver::{Driver, PlatformDriver};
+use crate::io::socket::SockAddrStorage;
 use std::cell::RefCell;
 use std::rc::Weak;
 
@@ -203,7 +204,7 @@ pub struct Send {
 pub struct Connect {
     pub fd: IoFd,
     /// Raw address bytes (sockaddr representation).
-    pub addr: Box<[u8]>,
+    pub addr: SockAddrStorage,
     pub addr_len: u32,
 }
 
@@ -246,7 +247,7 @@ pub struct Wakeup {
 pub struct Accept {
     pub fd: IoFd,
     /// Buffer for storing the remote address.
-    pub addr: Box<[u8]>,
+    pub addr: SockAddrStorage,
     /// Length of the address buffer.
     pub addr_len: u32,
     /// Parsed remote address (populated after completion).
@@ -260,19 +261,16 @@ pub struct Accept {
 pub struct SendTo {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    /// Target address bytes.
-    pub addr: Box<[u8]>,
-    pub addr_len: u32,
+    /// Target address.
+    pub addr: std::net::SocketAddr,
 }
 
 /// Receive data and source address (UDP).
 pub struct RecvFrom {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    /// Buffer for storing the source address.
-    pub addr: Box<[u8]>,
-    /// Length of the address (input: buffer size, output: actual size).
-    pub addr_len: u32,
+    /// Source address (populated after completion).
+    pub addr: Option<std::net::SocketAddr>,
 }
 
 // ============================================================================
@@ -304,20 +302,15 @@ impl OpLifecycle for Accept {
 
     #[allow(unused_variables)]
     fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self {
-        // Buffer size for sockaddr_storage + extra for AcceptEx on Windows
-        #[cfg(unix)]
-        let buf_size = 128; // sizeof(sockaddr_storage) is typically 128
-        #[cfg(windows)]
-        let buf_size = 288; // (sizeof(sockaddr_storage) + 16) * 2 for AcceptEx
-
-        let addr_buf = vec![0u8; buf_size].into_boxed_slice();
-        let addr_len = buf_size as u32;
+        // Use stack/inline storage
+        let addr: SockAddrStorage = unsafe { std::mem::zeroed() };
+        let addr_len = std::mem::size_of::<SockAddrStorage>() as u32;
 
         #[cfg(unix)]
         {
             Self {
                 fd: IoFd::Raw(fd),
-                addr: addr_buf,
+                addr,
                 addr_len,
                 remote_addr: None,
             }
@@ -326,7 +319,7 @@ impl OpLifecycle for Accept {
         {
             Self {
                 fd: IoFd::Raw(fd),
-                addr: addr_buf,
+                addr,
                 addr_len,
                 remote_addr: None,
                 accept_socket: pre,
@@ -342,7 +335,13 @@ impl OpLifecycle for Accept {
             let addr = if let Some(a) = self.remote_addr {
                 a
             } else {
-                to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                unsafe {
+                    let s = std::slice::from_raw_parts(
+                        &self.addr as *const _ as *const u8,
+                        self.addr_len as usize,
+                    );
+                    to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                }
             };
             Ok((fd, addr))
         }
@@ -353,7 +352,13 @@ impl OpLifecycle for Accept {
             let addr = if let Some(a) = self.remote_addr {
                 a
             } else {
-                to_socket_addr(&self.addr).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                unsafe {
+                    let s = std::slice::from_raw_parts(
+                        &self.addr as *const _ as *const u8,
+                        self.addr_len as usize,
+                    );
+                    to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                }
             };
             // On Windows, the accept_socket was pre-allocated and is the new connection
             Ok((self.accept_socket, addr))

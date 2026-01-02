@@ -12,6 +12,7 @@ use crate::io::op::{
     Accept, Close, Connect, Fsync, IntoPlatformOp, IoFd, Open, RawHandle, ReadFixed, Recv,
     RecvFrom, Send as OpSend, SendTo, Timeout, Wakeup, WriteFixed,
 };
+use crate::io::socket::SockAddrStorage;
 use std::io;
 use std::net::SocketAddr;
 use windows_sys::Win32::Networking::WinSock::WSABUF;
@@ -24,10 +25,13 @@ use windows_sys::Win32::Networking::WinSock::WSABUF;
 /// Stores the pre-created accept socket required by AcceptEx.
 pub struct IocpAccept {
     pub fd: IoFd,
-    pub addr: Box<[u8]>,
+    pub addr: SockAddrStorage,
     pub addr_len: u32,
     /// Pre-created socket for the accepted connection (Windows-specific).
     pub accept_socket: Option<RawHandle>,
+    /// Buffer for AcceptEx to store local and remote addresses.
+    /// Must be at least 2 * (sizeof(SOCKADDR_STORAGE) + 16).
+    pub accept_buffer: [u8; 288],
     pub remote_addr: Option<SocketAddr>,
 }
 
@@ -39,6 +43,7 @@ impl From<Accept> for IocpAccept {
             addr: accept.addr,
             addr_len: accept.addr_len,
             accept_socket: Some(accept.accept_socket),
+            accept_buffer: [0; 288],
             remote_addr: accept.remote_addr,
         }
     }
@@ -53,9 +58,10 @@ impl From<IocpAccept> for Accept {
             // The socket ownership is transferred to the resulting Accept struct.
 
             let fd = iocp_accept.fd; // Copy
-            let addr = std::ptr::read(&iocp_accept.addr);
+            let addr = iocp_accept.addr; // Copy struct
             let addr_len = iocp_accept.addr_len; // Copy
             let remote_addr = iocp_accept.remote_addr; // Copy
+            // accept_buffer is dropped as it is not needed in Accept
 
             // We take the socket.
             // Note: iocp_accept.accept_socket is Option<RawHandle>.
@@ -92,16 +98,16 @@ impl Drop for IocpAccept {
 pub struct IocpSendTo {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    pub addr: Box<[u8]>,
+    pub addr: SockAddrStorage,
     pub addr_len: u32,
     pub wsabuf: WSABUF,
 }
 
 impl IocpSendTo {
     pub fn new(fd: RawHandle, buf: FixedBuf, target: SocketAddr) -> Self {
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
-        let addr = raw_addr.into_boxed_slice();
-        let addr_len = raw_addr_len as u32;
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(target);
+        // Addr len for windows might be i32, convert to u32 for storage in struct if needed or keep i32
+        // IocpSendTo struct defines addr_len as u32. socket_addr_to_storage returns (SockAddrStorage, i32) on windows.
 
         let wsabuf = WSABUF {
             len: buf.len() as u32,
@@ -112,7 +118,7 @@ impl IocpSendTo {
             fd: IoFd::Raw(fd),
             buf,
             addr,
-            addr_len,
+            addr_len: addr_len as u32,
             wsabuf,
         }
     }
@@ -120,6 +126,8 @@ impl IocpSendTo {
 
 impl From<SendTo> for IocpSendTo {
     fn from(send_to: SendTo) -> Self {
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(send_to.addr);
+
         let wsabuf = WSABUF {
             len: send_to.buf.len() as u32,
             buf: send_to.buf.as_slice().as_ptr() as *mut u8,
@@ -128,8 +136,8 @@ impl From<SendTo> for IocpSendTo {
         Self {
             fd: send_to.fd,
             buf: send_to.buf,
-            addr: send_to.addr,
-            addr_len: send_to.addr_len,
+            addr,
+            addr_len: addr_len as u32,
             wsabuf,
         }
     }
@@ -137,11 +145,19 @@ impl From<SendTo> for IocpSendTo {
 
 impl From<IocpSendTo> for SendTo {
     fn from(iocp_send_to: IocpSendTo) -> Self {
+        let addr = unsafe {
+            let s = std::slice::from_raw_parts(
+                &iocp_send_to.addr as *const _ as *const u8,
+                iocp_send_to.addr_len as usize,
+            );
+            crate::io::socket::to_socket_addr(s)
+                .expect("Failed to convert storage back to SocketAddr")
+        };
+
         Self {
             fd: iocp_send_to.fd,
             buf: iocp_send_to.buf,
-            addr: iocp_send_to.addr,
-            addr_len: iocp_send_to.addr_len,
+            addr,
         }
     }
 }
@@ -151,7 +167,7 @@ impl From<IocpSendTo> for SendTo {
 pub struct IocpRecvFrom {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    pub addr: Box<[u8]>,
+    pub addr: SockAddrStorage,
     pub addr_len: i32,
     pub flags: u32,
     pub wsabuf: WSABUF,
@@ -159,10 +175,9 @@ pub struct IocpRecvFrom {
 
 impl IocpRecvFrom {
     pub fn new(fd: RawHandle, mut buf: FixedBuf) -> Self {
-        let addr_buf_size = 128usize;
-        let addr = vec![0u8; addr_buf_size].into_boxed_slice();
+        let addr: SockAddrStorage = unsafe { std::mem::zeroed() };
+        let addr_len = std::mem::size_of::<SockAddrStorage>() as i32;
 
-        let addr_len = addr_buf_size as i32;
         let wsabuf = WSABUF {
             len: buf.capacity() as u32,
             buf: buf.as_mut_ptr(),
@@ -186,6 +201,9 @@ impl IocpRecvFrom {
 
 impl From<RecvFrom> for IocpRecvFrom {
     fn from(recv_from: RecvFrom) -> Self {
+        let addr: SockAddrStorage = unsafe { std::mem::zeroed() };
+        let addr_len = std::mem::size_of::<SockAddrStorage>() as i32;
+
         let mut buf = recv_from.buf;
         let wsabuf = WSABUF {
             len: buf.capacity() as u32,
@@ -195,8 +213,8 @@ impl From<RecvFrom> for IocpRecvFrom {
         Self {
             fd: recv_from.fd,
             buf,
-            addr: recv_from.addr,
-            addr_len: recv_from.addr_len as i32,
+            addr,
+            addr_len,
             flags: 0u32,
             wsabuf,
         }
@@ -205,11 +223,17 @@ impl From<RecvFrom> for IocpRecvFrom {
 
 impl From<IocpRecvFrom> for RecvFrom {
     fn from(iocp_recv_from: IocpRecvFrom) -> Self {
+        // Convert buffer to SocketAddr
+        let len = iocp_recv_from.addr_len as usize;
+        let addr = unsafe {
+            let s = std::slice::from_raw_parts(&iocp_recv_from.addr as *const _ as *const u8, len);
+            crate::io::socket::to_socket_addr(s).ok()
+        };
+
         Self {
             fd: iocp_recv_from.fd,
             buf: iocp_recv_from.buf,
-            addr: iocp_recv_from.addr,
-            addr_len: iocp_recv_from.addr_len as u32,
+            addr,
         }
     }
 }

@@ -230,7 +230,7 @@ impl IocpSubmit for IocpAccept {
 
         // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
         const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-        let buf_len = self.addr.len();
+        let buf_len = self.accept_buffer.len();
         if buf_len < 2 * MIN_ADDR_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -250,7 +250,7 @@ impl IocpSubmit for IocpAccept {
             (ext.accept_ex)(
                 handle as SOCKET,
                 accept_socket as SOCKET,
-                self.addr.as_mut_ptr() as *mut _,
+                self.accept_buffer.as_mut_ptr() as *mut _,
                 0,            // dwReceiveDataLength
                 split as u32, // dwLocalAddressLength
                 split as u32, // dwRemoteAddressLength
@@ -303,7 +303,7 @@ impl IocpSubmit for IocpAccept {
 
         unsafe {
             (ext.get_accept_ex_sockaddrs)(
-                self.addr.as_ptr() as *const _,
+                self.accept_buffer.as_ptr() as *const _,
                 0,
                 split as u32,
                 split as u32,
@@ -381,11 +381,7 @@ impl IocpSubmit for Connect {
         }
 
         if need_bind {
-            let family = if self.addr.len() >= 2 {
-                u16::from_ne_bytes([self.addr[0], self.addr[1]])
-            } else {
-                AF_INET as u16
-            };
+            let family = self.addr.ss_family; // Fixed: Use available field
 
             let mut bind_addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
             bind_addr.sin_family = AF_INET;
@@ -412,7 +408,7 @@ impl IocpSubmit for Connect {
         let ret = unsafe {
             (ext.connect_ex)(
                 handle as SOCKET,
-                self.addr.as_ptr() as *const SOCKADDR,
+                &self.addr as *const _ as *const SOCKADDR, // Fixed: Cast
                 self.addr_len as i32,
                 std::ptr::null(), // Send buffer
                 0,                // Send data length
@@ -466,7 +462,7 @@ impl_wsa_op!(
             1,
             bytes,
             0,
-            op.addr.as_ptr() as *const SOCKADDR,
+            &op.addr as *const _ as *const SOCKADDR, // Fixed: Cast
             op.addr_len as i32,
             overlapped as *mut _,
             None,
@@ -487,7 +483,7 @@ impl_wsa_op!(
             1,
             bytes,
             &mut op.flags,
-            op.addr.as_mut_ptr() as *mut SOCKADDR,
+            &mut op.addr as *mut _ as *mut SOCKADDR, // Fixed: Cast
             &mut op.addr_len,
             overlapped as *mut _,
             None,

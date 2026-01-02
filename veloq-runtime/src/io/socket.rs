@@ -5,7 +5,11 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::{Socket, socket_addr_trans, to_socket_addr};
+pub use libc::sockaddr_storage as SockAddrStorage;
+#[cfg(unix)]
+pub use unix::{Socket, socket_addr_to_storage, to_socket_addr};
 
 #[cfg(windows)]
-pub use windows::{Socket, socket_addr_trans, to_socket_addr};
+pub use windows::{
+    SOCKADDR_STORAGE as SockAddrStorage, Socket, socket_addr_to_storage, to_socket_addr,
+};

@@ -22,17 +22,22 @@ use std::net::SocketAddr;
 /// Stores Linux-specific fields like libc sockaddr buffers.
 pub struct UringAccept {
     pub fd: IoFd,
-    pub addr: Box<[u8]>,
-    pub addr_len: u32,
+    pub addr: libc::sockaddr_storage,
+    pub addr_len: libc::socklen_t,
     pub remote_addr: Option<SocketAddr>,
 }
 
 impl From<Accept> for UringAccept {
     fn from(accept: Accept) -> Self {
+        // We typically don't have the addr yet for Accept, it's an output buffer.
+        // But the generic Accept struct has `addr: Box<[u8]>`?
+        // Let's check the generic Accept struct definition if needed. 
+        // Based on previous view, generic Accept has `addr: Box<[u8]>`.
+        // We will ignore the Box from generic Accept and create our own storage.
         Self {
             fd: accept.fd,
-            addr: accept.addr,
-            addr_len: accept.addr_len,
+            addr: unsafe { std::mem::zeroed() },
+            addr_len: std::mem::size_of::<libc::sockaddr_storage>() as _,
             remote_addr: accept.remote_addr,
         }
     }
@@ -54,70 +59,60 @@ impl From<UringAccept> for Accept {
 pub struct UringSendTo {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    pub addr: Box<[u8]>,
-    pub addr_len: u32,
-    pub msghdr: Box<libc::msghdr>,
-    pub iovec: Box<libc::iovec>,
+    pub addr: libc::sockaddr_storage,
+    pub addr_len: libc::socklen_t,
+    pub msghdr: libc::msghdr,
+    pub iovec: [libc::iovec; 1],
 }
 
 impl UringSendTo {
     pub fn new(fd: RawHandle, buf: FixedBuf, target: SocketAddr) -> Self {
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_trans(target);
-        let addr = raw_addr.into_boxed_slice();
-        let addr_len = raw_addr_len as u32;
-
-        let mut iovec = Box::new(libc::iovec {
-            iov_base: buf.as_slice().as_ptr() as *mut _,
-            iov_len: buf.len(),
-        });
-        let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        msghdr.msg_name = addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = addr_len;
-        msghdr.msg_iov = iovec.as_mut() as *mut _;
-        msghdr.msg_iovlen = 1;
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(target);
 
         Self {
             fd: IoFd::Raw(fd),
             buf,
             addr,
             addr_len,
-            msghdr,
-            iovec,
+            msghdr: unsafe { std::mem::zeroed() },
+            iovec: [unsafe { std::mem::zeroed() }],
         }
     }
 }
 
 impl From<SendTo> for UringSendTo {
     fn from(send_to: SendTo) -> Self {
-        // Reconstruct msghdr from existing data
-        let mut iovec = Box::new(libc::iovec {
-            iov_base: send_to.buf.as_slice().as_ptr() as *mut _,
-            iov_len: send_to.buf.len(),
-        });
-        let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        msghdr.msg_name = send_to.addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = send_to.addr_len;
-        msghdr.msg_iov = iovec.as_mut() as *mut _;
-        msghdr.msg_iovlen = 1;
-
+        // Use helper to convert SocketAddr to storage without allocation
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(send_to.addr);
+        
         Self {
             fd: send_to.fd,
             buf: send_to.buf,
-            addr: send_to.addr,
-            addr_len: send_to.addr_len,
-            msghdr,
-            iovec,
+            addr,
+            addr_len,
+            msghdr: unsafe { std::mem::zeroed() },
+            iovec: [unsafe { std::mem::zeroed() }],
         }
     }
 }
 
 impl From<UringSendTo> for SendTo {
     fn from(uring_send_to: UringSendTo) -> Self {
+        // Convert storage back to SocketAddr
+        // We can assume valid address if it came from us, but to be safe/correct:
+        let addr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &uring_send_to.addr as *const _ as *const u8,
+                uring_send_to.addr_len as usize,
+            )
+        };
+        let addr = crate::io::socket::to_socket_addr(addr_bytes)
+            .expect("Failed to convert storage back to SocketAddr");
+
         Self {
             fd: uring_send_to.fd,
             buf: uring_send_to.buf,
-            addr: uring_send_to.addr,
-            addr_len: uring_send_to.addr_len,
+            addr,
         }
     }
 }
@@ -127,35 +122,21 @@ impl From<UringSendTo> for SendTo {
 pub struct UringRecvFrom {
     pub fd: IoFd,
     pub buf: FixedBuf,
-    pub addr: Box<[u8]>,
-    pub addr_len: u32,
-    pub msghdr: Box<libc::msghdr>,
-    pub iovec: Box<libc::iovec>,
+    pub addr: libc::sockaddr_storage,
+    pub addr_len: libc::socklen_t,
+    pub msghdr: libc::msghdr,
+    pub iovec: [libc::iovec; 1],
 }
 
 impl UringRecvFrom {
-    pub fn new(fd: RawHandle, mut buf: FixedBuf) -> Self {
-        let addr_buf_size = std::mem::size_of::<libc::sockaddr_storage>();
-        let addr = vec![0u8; addr_buf_size].into_boxed_slice();
-        let addr_len = addr_buf_size as u32;
-
-        let mut iovec = Box::new(libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
-            iov_len: buf.capacity(),
-        });
-        let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        msghdr.msg_name = addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = addr_len;
-        msghdr.msg_iov = iovec.as_mut() as *mut _;
-        msghdr.msg_iovlen = 1;
-
+    pub fn new(fd: RawHandle, buf: FixedBuf) -> Self {
         Self {
             fd: IoFd::Raw(fd),
             buf,
-            addr,
-            addr_len,
-            msghdr,
-            iovec,
+            addr: unsafe { std::mem::zeroed() },
+            addr_len: std::mem::size_of::<libc::sockaddr_storage>() as _,
+            msghdr: unsafe { std::mem::zeroed() },
+            iovec: [unsafe { std::mem::zeroed() }],
         }
     }
 
@@ -166,35 +147,36 @@ impl UringRecvFrom {
 
 impl From<RecvFrom> for UringRecvFrom {
     fn from(recv_from: RecvFrom) -> Self {
-        let mut buf = recv_from.buf;
-        let mut iovec = Box::new(libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
-            iov_len: buf.capacity(),
-        });
-        let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        msghdr.msg_name = recv_from.addr.as_ptr() as *mut _;
-        msghdr.msg_namelen = recv_from.addr_len;
-        msghdr.msg_iov = iovec.as_mut() as *mut _;
-        msghdr.msg_iovlen = 1;
-
         Self {
             fd: recv_from.fd,
-            buf,
-            addr: recv_from.addr,
-            addr_len: recv_from.addr_len,
-            msghdr,
-            iovec,
+            buf: recv_from.buf,
+            addr: unsafe { std::mem::zeroed() },
+            addr_len: std::mem::size_of::<libc::sockaddr_storage>() as _,
+            msghdr: unsafe { std::mem::zeroed() },
+            iovec: [unsafe { std::mem::zeroed() }],
         }
     }
 }
 
 impl From<UringRecvFrom> for RecvFrom {
     fn from(uring_recv_from: UringRecvFrom) -> Self {
+        // Try to parse the address from storage
+        // The kernel updates msghdr.msg_namelen with the actual address length
+        let len = uring_recv_from.msghdr.msg_namelen as usize;
+        let addr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &uring_recv_from.addr as *const _ as *const u8,
+                len,
+            )
+        };
+        // It's possible the recv didn't get an address (e.g. connected socket), 
+        // or partial read? But usually RecvFrom expects addr.
+        let addr = crate::io::socket::to_socket_addr(addr_bytes).ok();
+
         Self {
             fd: uring_recv_from.fd,
             buf: uring_recv_from.buf,
-            addr: uring_recv_from.addr,
-            addr_len: uring_recv_from.addr_len,
+            addr,
         }
     }
 }
@@ -228,14 +210,14 @@ impl From<UringTimeout> for Timeout {
 /// Uses eventfd read buffer.
 pub struct UringWakeup {
     pub fd: IoFd,
-    pub buf: Box<[u8; 8]>,
+    pub buf: [u8; 8],
 }
 
 impl UringWakeup {
     pub fn new(fd: RawHandle) -> Self {
         Self {
             fd: IoFd::Raw(fd),
-            buf: Box::new([0u8; 8]),
+            buf: [0u8; 8],
         }
     }
 }
@@ -244,7 +226,7 @@ impl From<Wakeup> for UringWakeup {
     fn from(wakeup: Wakeup) -> Self {
         Self {
             fd: wakeup.fd,
-            buf: Box::new([0u8; 8]),
+            buf: [0u8; 8],
         }
     }
 }

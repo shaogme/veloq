@@ -120,13 +120,13 @@ impl UringSubmit for Connect {
         match self.fd {
             IoFd::Raw(fd) => opcode::Connect::new(
                 types::Fd(fd as i32),
-                self.addr.as_ptr() as *const _,
+                &self.addr as *const _ as *const _,
                 self.addr_len,
             )
             .build(),
             IoFd::Fixed(idx) => opcode::Connect::new(
                 types::Fixed(idx),
-                self.addr.as_ptr() as *const _,
+                &self.addr as *const _ as *const _,
                 self.addr_len,
             )
             .build(),
@@ -169,13 +169,13 @@ impl UringSubmit for UringAccept {
         match self.fd {
             IoFd::Raw(fd) => opcode::Accept::new(
                 types::Fd(fd as i32),
-                self.addr.as_mut_ptr() as *mut _,
+                &mut self.addr as *mut _ as *mut _,
                 &mut self.addr_len as *mut _,
             )
             .build(),
             IoFd::Fixed(idx) => opcode::Accept::new(
                 types::Fixed(idx),
-                self.addr.as_mut_ptr() as *mut _,
+                &mut self.addr as *mut _ as *mut _,
                 &mut self.addr_len as *mut _,
             )
             .build(),
@@ -185,7 +185,14 @@ impl UringSubmit for UringAccept {
     fn on_complete(&mut self, result: i32) -> io::Result<usize> {
         if result >= 0 {
             // Try fallback parsing to populate remote_addr early
-            if let Ok(addr) = crate::io::socket::to_socket_addr(&self.addr) {
+            // Cast sockaddr_storage to &[u8] for the helper
+            let addr_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &self.addr as *const _ as *const u8,
+                    self.addr_len as usize,
+                )
+            };
+            if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
                 self.remote_addr = Some(addr);
             }
             Ok(result as usize)
@@ -197,12 +204,23 @@ impl UringSubmit for UringAccept {
 
 impl UringSubmit for UringSendTo {
     fn make_sqe(&mut self) -> squeue::Entry {
+        // Initialize internal pointers
+        self.iovec[0].iov_base = self.buf.as_slice().as_ptr() as *mut _;
+        self.iovec[0].iov_len = self.buf.len();
+
+        self.msghdr.msg_name = &mut self.addr as *mut _ as *mut libc::c_void;
+        self.msghdr.msg_namelen = self.addr_len;
+        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
+        self.msghdr.msg_iovlen = 1;
+        self.msghdr.msg_control = std::ptr::null_mut();
+        self.msghdr.msg_controllen = 0;
+
         match self.fd {
             IoFd::Raw(fd) => {
-                opcode::SendMsg::new(types::Fd(fd as i32), &*self.msghdr as *const _).build()
+                opcode::SendMsg::new(types::Fd(fd as i32), &self.msghdr as *const _).build()
             }
             IoFd::Fixed(idx) => {
-                opcode::SendMsg::new(types::Fixed(idx), &*self.msghdr as *const _).build()
+                opcode::SendMsg::new(types::Fixed(idx), &self.msghdr as *const _).build()
             }
         }
     }
@@ -210,12 +228,23 @@ impl UringSubmit for UringSendTo {
 
 impl UringSubmit for UringRecvFrom {
     fn make_sqe(&mut self) -> squeue::Entry {
+        // Initialize internal pointers
+        self.iovec[0].iov_base = self.buf.as_mut_ptr() as *mut _;
+        self.iovec[0].iov_len = self.buf.capacity();
+
+        self.msghdr.msg_name = &mut self.addr as *mut _ as *mut libc::c_void;
+        self.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
+        self.msghdr.msg_iovlen = 1;
+        self.msghdr.msg_control = std::ptr::null_mut();
+        self.msghdr.msg_controllen = 0;
+
         match self.fd {
             IoFd::Raw(fd) => {
-                opcode::RecvMsg::new(types::Fd(fd as i32), &mut *self.msghdr as *mut _).build()
+                opcode::RecvMsg::new(types::Fd(fd as i32), &mut self.msghdr as *mut _).build()
             }
             IoFd::Fixed(idx) => {
-                opcode::RecvMsg::new(types::Fixed(idx), &mut *self.msghdr as *mut _).build()
+                opcode::RecvMsg::new(types::Fixed(idx), &mut self.msghdr as *mut _).build()
             }
         }
     }
