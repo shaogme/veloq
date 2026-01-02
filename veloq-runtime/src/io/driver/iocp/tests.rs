@@ -1,5 +1,6 @@
 use super::*;
-use crate::io::op::{Accept, Connect, IoOp, IoResources, OpLifecycle, Timeout};
+use crate::io::buffer::{BufferPool, BufferSize};
+use crate::io::op::{Accept, Connect, IoOp, IoResources, OpLifecycle, Recv, Timeout};
 use crate::io::socket::Socket;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
@@ -25,13 +26,14 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let driver = IocpDriver::new(1024);
+    let driver = IocpDriver::new(&crate::config::Config::default());
     assert!(driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver = IocpDriver::new(128).expect("Driver creation failed");
+    let mut driver =
+        IocpDriver::new(&crate::config::Config::default()).expect("Driver creation failed");
 
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -93,7 +95,7 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver = IocpDriver::new(128).unwrap();
+    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -141,7 +143,7 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_timeout() {
-    let mut driver = IocpDriver::new(128).unwrap();
+    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
 
     let timeout_op = Timeout {
         duration: std::time::Duration::from_millis(100),
@@ -179,4 +181,70 @@ fn test_iocp_timeout() {
             }
         }
     }
+}
+
+#[test]
+fn test_iocp_recv_with_buffer_pool() {
+    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
+    let pool = BufferPool::new();
+
+    // Setup connection
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client_thread = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        use std::io::Write;
+        stream.write_all(b"Hello Buffer").unwrap();
+    });
+
+    let (stream, _) = listener.accept().unwrap();
+    let stream_handle = stream.into_raw_socket() as HANDLE;
+
+    // Alloc buffer
+    let buf = pool
+        .alloc(BufferSize::Size4K)
+        .expect("Failed to alloc buffer");
+
+    // Create Recv Op
+    let recv_op = Recv {
+        fd: crate::io::op::IoFd::Raw(stream_handle),
+        buf,
+    };
+
+    let resources = recv_op.into_resource();
+    let user_data = driver.reserve_op();
+    driver.submit_op_resources(user_data, resources);
+
+    // Poll
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("Recv timed out");
+        }
+        driver.process_completions();
+
+        match driver.poll_op(user_data, &mut cx) {
+            Poll::Ready((res, resources)) => {
+                assert!(res.is_ok(), "Recv failed: {:?}", res.err());
+                let bytes_read = res.unwrap();
+                assert_eq!(bytes_read, 12);
+
+                if let IoResources::Recv(mut op) = resources {
+                    op.buf.set_len(bytes_read);
+                    assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
+                } else {
+                    panic!("Wrong resource type");
+                }
+
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle) };
+                break;
+            }
+            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    client_thread.join().unwrap();
 }

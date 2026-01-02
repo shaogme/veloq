@@ -75,7 +75,7 @@ fn test_nested_spawn_local() {
 /// Test global spawn works from within the Runtime (injecting into workers).
 #[test]
 fn test_runtime_global_spawn() {
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Spawn 1 worker that stays alive
@@ -111,7 +111,7 @@ fn test_runtime_global_spawn() {
 /// Test global spawn works from INSIDE a worker.
 #[test]
 fn test_spawn_from_worker() {
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
     let (tx, rx) = std::sync::mpsc::channel();
 
     runtime.spawn_worker(move || async move {
@@ -132,7 +132,7 @@ fn test_spawn_from_worker() {
 /// Test using both spawn_local and spawn in a worker.
 #[test]
 fn test_mixed_spawn_in_worker() {
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
     let (tx, rx) = std::sync::mpsc::channel();
 
     runtime.spawn_worker(move || async move {
@@ -165,7 +165,7 @@ fn test_mixed_spawn_in_worker() {
 #[test]
 fn test_multi_worker_throughput() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
     let counter = Arc::new(AtomicUsize::new(0));
     
     // Spawn 2 workers that process tasks until done

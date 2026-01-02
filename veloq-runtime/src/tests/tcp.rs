@@ -391,7 +391,7 @@ fn test_tcp_ipv6() {
 #[test]
 fn test_multithread_tcp_connections() {
     let connection_count = Arc::new(AtomicUsize::new(0));
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
 
     const NUM_WORKERS: usize = 3;
 
@@ -443,7 +443,7 @@ fn test_multithread_tcp_echo() {
 
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let (addr_tx, addr_rx) = mpsc::channel();
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new(crate::config::Config::default());
 
         // Worker 1: Echo server
         runtime.spawn_worker(move || async move {
@@ -542,7 +542,7 @@ fn test_multithread_concurrent_clients() {
     // Wrap receiver in Arc<Mutex> so it can be shared across threads
     let addr_rx = Arc::new(Mutex::new(addr_rx));
     let connection_count = Arc::new(AtomicUsize::new(0));
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new(crate::config::Config::default());
 
     const NUM_CLIENTS: usize = 3;
 

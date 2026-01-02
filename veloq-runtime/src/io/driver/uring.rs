@@ -54,20 +54,30 @@ pub struct UringDriver {
 }
 
 impl UringDriver {
-    pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::builder()
+    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
+        let entries = config.uring.entries;
+        let mut builder = IoUring::builder();
+
+        builder
             .setup_coop_taskrun() // Reduce IPIs
             .setup_single_issuer() // Optimized for single-threaded submission
-            .setup_defer_taskrun() // Defer work until enter
-            .build(entries)
-            .or_else(|e| {
-                // Fallback for older kernels if flags are unsupported (EINVAL)
-                if e.raw_os_error() == Some(libc::EINVAL) {
-                    IoUring::new(entries)
-                } else {
-                    Err(e)
-                }
-            })?;
+            .setup_defer_taskrun(); // Defer work until enter
+
+        if config.uring.mode == crate::config::IoMode::Polling {
+            builder.setup_sqpoll(config.uring.sqpoll_idle_ms);
+        }
+
+        let ring = builder.build(entries).or_else(|e| {
+            // Fallback for older kernels if flags are unsupported (EINVAL)
+            if e.raw_os_error() == Some(libc::EINVAL) {
+                // If the optimized build failed, try a basic one.
+                // Note: This might degrade from Polling to Interrupt if Polling was requested but unsupported.
+                // A production system might want to log a warning here.
+                IoUring::new(entries)
+            } else {
+                Err(e)
+            }
+        })?;
 
         let ops = OpRegistry::with_capacity(entries as usize);
 
@@ -104,7 +114,13 @@ impl UringDriver {
     }
 
     pub fn submit(&mut self) -> io::Result<()> {
-        self.ring.submit()?;
+        if self.ring.params().is_setup_sqpoll() {
+            if self.ring.submission().need_wakeup() {
+                self.ring.submit()?;
+            }
+        } else {
+            self.ring.submit()?;
+        }
         Ok(())
     }
 

@@ -101,7 +101,7 @@ impl LocalExecutor {
 
     /// Create a new local executor for testing (no global injection).
     pub fn new() -> Self {
-        Self::create_internal(None, None, None, None, None)
+        Self::create_internal(None, None, None, None, None, crate::config::Config::default())
     }
 
     /// Create a new local executor with global injection support.
@@ -110,6 +110,7 @@ impl LocalExecutor {
         injected_load: Arc<AtomicUsize>,
         local_load: Arc<AtomicUsize>,
         spawner: Spawner,
+        config: crate::config::Config,
     ) -> Self {
         Self::create_internal(
             None,
@@ -117,6 +118,7 @@ impl LocalExecutor {
             Some(injected_load),
             Some(local_load),
             Some(spawner),
+            config,
         )
     }
 
@@ -134,6 +136,7 @@ impl LocalExecutor {
             Some(injected_load),
             Some(local_load),
             Some(spawner),
+            crate::config::Config::default(),
         )
     }
 
@@ -143,10 +146,11 @@ impl LocalExecutor {
         injected_load: Option<Arc<AtomicUsize>>,
         local_load: Option<Arc<AtomicUsize>>,
         spawner: Option<Spawner>,
+        config: crate::config::Config,
     ) -> Self {
-        // Initialize Driver with 1024 entries if not provided
+        // Initialize Driver with config if not provided
         let driver = Rc::new(RefCell::new(driver.unwrap_or_else(|| {
-            PlatformDriver::new(1024).expect("Failed to create driver")
+            PlatformDriver::new(&config).expect("Failed to create driver")
         })));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let buffer_pool = Rc::new(BufferPool::new());
@@ -305,14 +309,16 @@ impl LocalExecutor {
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
     workers: Arc<Mutex<Vec<WorkerHandle>>>,
+    config: Arc<crate::config::Config>,
 }
 
 impl Runtime {
     /// Create a new Runtime.
-    pub fn new() -> Self {
+    pub fn new(config: crate::config::Config) -> Self {
         Self {
             handles: Vec::new(),
             workers: Arc::new(Mutex::new(Vec::new())),
+            config: Arc::new(config),
         }
     }
 
@@ -345,12 +351,15 @@ impl Runtime {
         let injected_load_clone = injected_load.clone();
         let local_load_clone = local_load.clone();
 
+        let config = self.config.clone();
+
         let handle = std::thread::spawn(move || {
             let executor = LocalExecutor::with_injector(
                 injector_clone,
                 injected_load_clone,
                 local_load_clone,
                 spawner,
+                (*config).clone(),
             );
 
             // Send waker back to main thread

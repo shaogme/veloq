@@ -323,7 +323,7 @@ fn test_udp_ipv6() {
 fn test_multithread_udp() {
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let message_count = Arc::new(AtomicUsize::new(0));
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new(crate::config::Config::default());
 
         const NUM_WORKERS: usize = 3;
 
@@ -397,7 +397,7 @@ fn test_multithread_udp_echo() {
 
     for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
         let (addr_tx, addr_rx) = mpsc::channel();
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new(crate::config::Config::default());
 
         // Worker 1: Echo server
         runtime.spawn_worker(move || async move {
@@ -495,7 +495,7 @@ fn test_multithread_concurrent_udp_clients() {
         let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
         let addr_rx = Arc::new(Mutex::new(addr_rx));
         let message_count = Arc::new(AtomicUsize::new(0));
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new(crate::config::Config::default());
 
         const NUM_CLIENTS: usize = 3;
 

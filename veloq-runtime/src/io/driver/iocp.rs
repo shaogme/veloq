@@ -80,7 +80,7 @@ impl Drop for IocpWaker {
 }
 
 impl IocpDriver {
-    pub fn new(entries: u32) -> io::Result<Self> {
+    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
         // Create a new completion port.
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
@@ -91,6 +91,12 @@ impl IocpDriver {
 
         // Load extensions
         let extensions = Extensions::new()?;
+
+        // Use a default capacity if not specified in config (since I need to add it)
+        // For now, I'll assume we update Config to have entries or use a default constant/config val.
+        // Actually, the previous code used `entries` passed in.
+        // I will add `entries` to IocpConfig.
+        let entries = config.iocp.entries;
 
         Ok(Self {
             port,
