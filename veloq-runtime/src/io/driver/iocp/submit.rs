@@ -203,13 +203,10 @@ impl IocpSubmit for Connect {
                 &mut name as *mut _ as *mut SOCKADDR,
                 &mut namelen,
             )
-        } != 0
+        } == 0
         {
-            return Err(io::Error::last_os_error());
-        } else {
             // Check if it's wildcard (port 0)
             let family = name.ss_family;
-
             if family == AF_INET as u16 {
                 let addr_in = unsafe { &*(&name as *const _ as *const SOCKADDR_IN) };
                 if addr_in.sin_port != 0 {
