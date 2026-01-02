@@ -45,6 +45,7 @@ pub struct Config {
     pub uring: UringConfig,
     pub iocp: IocpConfig,
     pub worker_threads: Option<usize>,
+    pub direct_io: bool,
 }
 
 impl Config {

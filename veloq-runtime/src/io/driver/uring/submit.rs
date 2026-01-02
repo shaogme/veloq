@@ -3,7 +3,10 @@
 //! This module implements the `UringSubmit` trait for all operation types,
 //! providing the logic to generate SQEs and handle completions.
 
-use crate::io::op::{Accept, Close, Connect, Fsync, IoFd, ReadFixed, Recv, Send, WriteFixed};
+use crate::io::op::{
+    Accept, Close, Connect, Fallocate, Fsync, IoFd, ReadFixed, Recv, Send, SyncFileRange,
+    WriteFixed,
+};
 use io_uring::{opcode, squeue, types};
 use std::io;
 
@@ -196,9 +199,41 @@ impl UringSubmit for Accept {
     }
 }
 
-// ============================================================================
-// UringOp Enum Dispatch
-// ============================================================================
+impl UringSubmit for SyncFileRange {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        match self.fd {
+            IoFd::Raw(fd) => opcode::SyncFileRange::new(
+                types::Fd(fd as i32),
+                self.nbytes as u32,
+            )
+            .offset(self.offset)
+            .flags(self.flags)
+            .build(),
+            IoFd::Fixed(idx) => opcode::SyncFileRange::new(
+                types::Fixed(idx),
+                self.nbytes as u32,
+            )
+            .offset(self.offset)
+            .flags(self.flags)
+            .build(),
+        }
+    }
+}
+
+impl UringSubmit for Fallocate {
+    fn make_sqe(&mut self) -> squeue::Entry {
+        match self.fd {
+            IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd as i32), self.len as u64)
+                .offset(self.offset)
+                .mode(self.mode)
+                .build(),
+            IoFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx), self.len as u64)
+                .offset(self.offset)
+                .mode(self.mode)
+                .build(),
+        }
+    }
+}
 
 impl UringSubmit for UringOp {
     fn make_sqe(&mut self) -> squeue::Entry {
@@ -210,6 +245,8 @@ impl UringSubmit for UringOp {
             UringOp::Connect(op, _) => op.make_sqe(),
             UringOp::Close(op, _) => op.make_sqe(),
             UringOp::Fsync(op, _) => op.make_sqe(),
+            UringOp::SyncFileRange(op, _) => op.make_sqe(),
+            UringOp::Fallocate(op, _) => op.make_sqe(),
             UringOp::Accept(op, _) => op.make_sqe(),
             
             UringOp::SendTo(op, extras) => {
@@ -294,6 +331,8 @@ impl UringSubmit for UringOp {
             UringOp::Connect(op, _) => op.on_complete(result),
             UringOp::Close(op, _) => op.on_complete(result),
             UringOp::Fsync(op, _) => op.on_complete(result),
+            UringOp::SyncFileRange(op, _) => op.on_complete(result),
+            UringOp::Fallocate(op, _) => op.on_complete(result),
             UringOp::Accept(op, _) => op.on_complete(result),
             
             // Ops with custom logic if needed, otherwise default

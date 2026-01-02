@@ -380,7 +380,7 @@ impl<T> Wheel<T> {
     ///
     /// 从当前链表中解绑一个条目。
     /// 需要条目数据（以读取 prev/next/level/slot）。
-    fn unlink_internal(&mut self, key: DefaultKey, entry: &WheelEntry<T>) {
+    fn unlink_internal(&mut self, _key: DefaultKey, entry: &WheelEntry<T>) {
         let prev = entry.prev;
         let next = entry.next;
         let level = entry.level;
@@ -399,7 +399,7 @@ impl<T> Wheel<T> {
             // Sanity check: The slot should point to this key.
             // 健全性检查：槽位应指向此 Key。
             #[cfg(debug_assertions)]
-            if self.levels[level].slots[slot] != Some(key) {
+            if self.levels[level].slots[slot] != Some(_key) {
                 panic!("Wheel linked list corruption: head mismatch");
             }
             self.levels[level].slots[slot] = next;

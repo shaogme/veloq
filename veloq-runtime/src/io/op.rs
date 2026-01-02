@@ -279,6 +279,22 @@ pub struct RecvFrom {
     pub addr: Option<std::net::SocketAddr>,
 }
 
+/// Sync file range.
+pub struct SyncFileRange {
+    pub fd: IoFd,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub flags: u32,
+}
+
+/// Pre-allocate file space.
+pub struct Fallocate {
+    pub fd: IoFd,
+    pub mode: i32,
+    pub offset: u64,
+    pub len: u64,
+}
+
 // ============================================================================
 // OpLifecycle Implementations
 // ============================================================================
@@ -395,6 +411,8 @@ pub trait OpAbi: 'static + std::marker::Send + Sized {
     type Open: Unpin;
     type Close: Unpin;
     type Fsync: Unpin;
+    type SyncFileRange: Unpin;
+    type Fallocate: Unpin;
     type Wakeup: Unpin;
     type Timeout: Unpin;
 }
@@ -413,6 +431,8 @@ pub enum Operation<P: OpAbi> {
     Open(Open, P::Open),
     Close(Close, P::Close),
     Fsync(Fsync, P::Fsync),
+    SyncFileRange(SyncFileRange, P::SyncFileRange),
+    Fallocate(Fallocate, P::Fallocate),
     Wakeup(Wakeup, P::Wakeup),
     Timeout(Timeout, P::Timeout),
 }
@@ -431,6 +451,8 @@ impl<P: OpAbi> Operation<P> {
             Self::SendTo(op, _) => Some(op.fd),
             Self::Close(op, _) => Some(op.fd),
             Self::Fsync(op, _) => Some(op.fd),
+            Self::SyncFileRange(op, _) => Some(op.fd),
+            Self::Fallocate(op, _) => Some(op.fd),
             Self::Open(_, _) | Self::Wakeup(_, _) | Self::Timeout(_, _) => None,
         }
     }

@@ -1,6 +1,6 @@
 use super::open_options::OpenOptions; // Use generic OpenOptions
 use crate::io::buffer::FixedBuf;
-use crate::io::op::{Fsync, IoFd, Op, ReadFixed, WriteFixed};
+use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
 use std::io;
 use std::path::Path;
 
@@ -62,6 +62,40 @@ impl File {
         let op = Fsync {
             fd: self.fd,
             datasync: true,
+        };
+        let driver = crate::runtime::current_driver();
+        let (res, _) = Op::new(op, driver).await;
+        res.map(|_| ())
+    }
+
+    /// Sync a file range.
+    ///
+    /// On Windows, this falls back to `FlushFileBuffers` which syncs the entire file, ignoring the range.
+    pub async fn sync_range(&self, offset: u64, nbytes: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+        #[cfg(not(unix))]
+        let flags = 0;
+
+        let op = SyncFileRange {
+            fd: self.fd,
+            offset,
+            nbytes,
+            flags: flags as u32,
+        };
+        let driver = crate::runtime::current_driver();
+        let (res, _) = Op::new(op, driver).await;
+        res.map(|_| ())
+    }
+
+    pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        let op = Fallocate {
+            fd: self.fd,
+            mode: 0, // Default mode
+            offset,
+            len,
         };
         let driver = crate::runtime::current_driver();
         let (res, _) = Op::new(op, driver).await;

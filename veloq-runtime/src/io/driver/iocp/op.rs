@@ -9,8 +9,8 @@
 use crate::io::driver::PlatformOp;
 use crate::io::driver::iocp::IocpDriver;
 use crate::io::op::{
-    Accept, Close, Connect, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed, Recv,
-    RecvFrom, Send as OpSend, SendTo, Timeout, Wakeup, WriteFixed,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed,
+    Recv, RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use crate::io::socket::SockAddrStorage;
 use std::io;
@@ -91,6 +91,8 @@ impl OpAbi for IocpAbi {
     type Connect = IocpState;
     type Close = IocpState;
     type Fsync = IocpState;
+    type SyncFileRange = OverlappedEntry;
+    type Fallocate = OverlappedEntry;
 
     type Accept = IocpAcceptExtras;
     type SendTo = IocpSendToExtras;
@@ -126,6 +128,8 @@ impl IocpOp {
             Self::Open(_, extras) => Some(&mut extras.entry),
             Self::Close(_, entry) => Some(entry),
             Self::Fsync(_, entry) => Some(entry),
+            Self::SyncFileRange(_, entry) => Some(entry),
+            Self::Fallocate(_, entry) => Some(entry),
             Self::Wakeup(_, extras) => Some(&mut extras.entry),
             Self::Timeout(_, _) => None,
         }
@@ -161,6 +165,33 @@ impl_into_iocp_op_simple!(Recv);
 impl_into_iocp_op_simple!(Connect);
 impl_into_iocp_op_simple!(Close);
 impl_into_iocp_op_simple!(Fsync);
+
+// Manual implementation for SyncFileRange (empty/stub for now)
+impl IntoPlatformOp<IocpDriver> for SyncFileRange {
+    fn into_platform_op(self) -> IocpOp {
+        IocpOp::SyncFileRange(self, OverlappedEntry::new(0))
+    }
+
+    fn from_platform_op(op: IocpOp) -> Self {
+        match op {
+            IocpOp::SyncFileRange(val, _) => val,
+            _ => panic!("Driver returned mismatched Op type: expected SyncFileRange"),
+        }
+    }
+}
+
+impl IntoPlatformOp<IocpDriver> for Fallocate {
+    fn into_platform_op(self) -> IocpOp {
+        IocpOp::Fallocate(self, OverlappedEntry::new(0))
+    }
+
+    fn from_platform_op(op: IocpOp) -> Self {
+        match op {
+            IocpOp::Fallocate(val, _) => val,
+            _ => panic!("Driver returned mismatched Op type: expected Fallocate"),
+        }
+    }
+}
 
 // Manual implementations
 

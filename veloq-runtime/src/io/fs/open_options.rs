@@ -10,6 +10,7 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     mode: u32,
+    custom_flags: i32,
 }
 
 impl OpenOptions {
@@ -22,6 +23,7 @@ impl OpenOptions {
             create: false,
             create_new: false,
             mode: 0o666,
+            custom_flags: 0,
         }
     }
 
@@ -57,6 +59,11 @@ impl OpenOptions {
 
     pub fn mode(&mut self, mode: u32) -> &mut Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn custom_flags(&mut self, flags: i32) -> &mut Self {
+        self.custom_flags = flags;
         self
     }
 
@@ -105,6 +112,7 @@ impl OpenOptions {
         if self.truncate {
             flags |= libc::O_TRUNC;
         }
+        flags |= self.custom_flags;
 
         Ok(Open {
             path: path_c.into_bytes(),

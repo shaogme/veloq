@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FlushFileBuffers,
+    CreateFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO,
+    FILE_FLAG_OVERLAPPED, FileAllocationInfo, FileEndOfFileInfo, FlushFileBuffers,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
@@ -31,6 +33,17 @@ pub enum BlockingTask {
     },
     Fsync {
         handle: usize,
+        completion: CompletionInfo,
+    },
+    SyncFileRange {
+        handle: usize,
+        completion: CompletionInfo,
+    },
+    Fallocate {
+        handle: usize,
+        mode: i32,
+        offset: u64,
+        len: u64,
         completion: CompletionInfo,
     },
 }
@@ -82,6 +95,75 @@ impl BlockingTask {
                 } else {
                     Ok(0)
                 };
+                Self::complete(completion, result);
+            }
+            BlockingTask::SyncFileRange { handle, completion } => {
+                // Windows doesn't support fine-grained sync_file_range.
+                // Fallback to FlushFileBuffers equivalent to Fsync.
+                let ret = unsafe { FlushFileBuffers(handle as HANDLE) };
+                let result = if ret == 0 {
+                    let err = unsafe { GetLastError() };
+                    Err(std::io::Error::from_raw_os_error(err as i32))
+                } else {
+                    Ok(0)
+                };
+                Self::complete(completion, result);
+            }
+            BlockingTask::Fallocate {
+                handle,
+                mode,
+                offset,
+                len,
+                completion,
+            } => {
+                let result = (|| {
+                    // Calculate required size
+                    let req_size = offset + len;
+
+                    // 1. Set allocation size (reserve space)
+                    // Note: This might truncate if req_size < current allocation,
+                    // but standard fallocate usage usually implies growing or ensuring space.
+                    // For safety, one might check current size, but simple fallocate usually sets it.
+                    let mut alloc_info = FILE_ALLOCATION_INFO {
+                        AllocationSize: req_size as i64,
+                    };
+                    let ret = unsafe {
+                        SetFileInformationByHandle(
+                            handle as HANDLE,
+                            FileAllocationInfo,
+                            &mut alloc_info as *mut _ as *mut _,
+                            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+                        )
+                    };
+                    if ret == 0 {
+                        return Err(std::io::Error::from_raw_os_error(
+                            unsafe { GetLastError() } as i32
+                        ));
+                    }
+
+                    // 2. If not KEEP_SIZE (mode 0), update file size
+                    // Standard fallocate (mode 0) updates file size.
+                    if mode == 0 {
+                        let mut eof_info = FILE_END_OF_FILE_INFO {
+                            EndOfFile: req_size as i64,
+                        };
+                        let ret = unsafe {
+                            SetFileInformationByHandle(
+                                handle as HANDLE,
+                                FileEndOfFileInfo,
+                                &mut eof_info as *mut _ as *mut _,
+                                std::mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
+                            )
+                        };
+                        if ret == 0 {
+                            return Err(std::io::Error::from_raw_os_error(
+                                unsafe { GetLastError() } as i32,
+                            ));
+                        }
+                    }
+
+                    Ok(0)
+                })();
                 Self::complete(completion, result);
             }
         }

@@ -465,6 +465,45 @@ impl IocpSubmit for IocpOp {
                 Ok(SubmissionResult::Offload(task))
             }
 
+            IocpOp::SyncFileRange(op, _entry) => {
+                let handle = resolve_fd(op.fd, registered_files)?;
+                let handle_val = handle as usize;
+
+                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
+                let user_data = entry.user_data;
+                let completion = CompletionInfo {
+                    port: port as usize,
+                    user_data,
+                    overlapped: overlapped as usize,
+                };
+                let task = BlockingTask::SyncFileRange {
+                    handle: handle_val,
+                    completion,
+                };
+                Ok(SubmissionResult::Offload(task))
+            }
+
+            IocpOp::Fallocate(op, _entry) => {
+                let handle = resolve_fd(op.fd, registered_files)?;
+                let handle_val = handle as usize;
+
+                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
+                let user_data = entry.user_data;
+                let completion = CompletionInfo {
+                    port: port as usize,
+                    user_data,
+                    overlapped: overlapped as usize,
+                };
+                let task = BlockingTask::Fallocate {
+                    handle: handle_val,
+                    mode: op.mode,
+                    offset: op.offset,
+                    len: op.len,
+                    completion,
+                };
+                Ok(SubmissionResult::Offload(task))
+            }
+
             IocpOp::Wakeup(_, _) => Ok(SubmissionResult::PostToQueue),
             IocpOp::Timeout(_, _) => Ok(SubmissionResult::Pending),
         }
@@ -479,6 +518,8 @@ impl IocpSubmit for IocpOp {
             IocpOp::Connect(op, _) => op.on_complete(result, ext),
             IocpOp::Close(_, _) => Ok(result),
             IocpOp::Fsync(_, _) => Ok(result),
+            IocpOp::SyncFileRange(_, _) => Ok(result),
+            IocpOp::Fallocate(_, _) => Ok(result),
             IocpOp::Wakeup(_, _) => Ok(result),
             IocpOp::Timeout(_, _) => Ok(result),
 

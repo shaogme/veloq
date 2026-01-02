@@ -9,8 +9,8 @@
 use crate::io::driver::PlatformOp;
 use crate::io::driver::uring::UringDriver;
 use crate::io::op::{
-    Accept, Close, Connect, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed, Recv,
-    RecvFrom, Send as OpSend, SendTo, Timeout, Wakeup, WriteFixed,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed,
+    Recv, RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use std::ffi::CString;
 use std::net::SocketAddr;
@@ -88,6 +88,8 @@ impl OpAbi for UringAbi {
     type Connect = ();
     type Close = ();
     type Fsync = ();
+    type SyncFileRange = ();
+    type Fallocate = ();
     type SendTo = UringSendToExtras;
     type RecvFrom = UringRecvFromExtras;
     type Open = UringOpenExtras;
@@ -126,8 +128,9 @@ impl_into_uring_op_direct!(ReadFixed);
 impl_into_uring_op_direct!(WriteFixed);
 impl_into_uring_op_direct!(Recv);
 impl_into_uring_op_direct!(Connect);
-impl_into_uring_op_direct!(Close);
-impl_into_uring_op_direct!(Fsync);
+impl_into_uring_op_direct!(Close);impl_into_uring_op_direct!(Fsync);
+impl_into_uring_op_direct!(SyncFileRange);
+impl_into_uring_op_direct!(Fallocate);
 impl_into_uring_op_direct!(Accept);
 
 // Manual implementations for ops with extras
