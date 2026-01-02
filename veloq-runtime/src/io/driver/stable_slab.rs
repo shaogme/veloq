@@ -10,10 +10,10 @@ enum Slot<T> {
 }
 
 pub struct StableSlab<T> {
-    // We use Vec<Slot<T>> as a page.
-    // Once created and filled, the heap buffer of this Vec behaves like a fixed Box<[Slot<T>]>.
-    // We strictly never push/pop from these Vecs after initialization to guarantee pointer stability.
-    pages: Vec<Vec<Slot<T>>>,
+    // We use Vec<Box<[Slot<T>; PAGE_SIZE]>> as a page list.
+    // Each page is a fixed-size array on the heap (via Box).
+    // This reduces the metadata in the outer Vec to just a pointer per page and guarantees fixed size.
+    pages: Vec<Box<[Slot<T>; PAGE_SIZE]>>,
     free_head: usize,
     len: usize,
 }
@@ -81,10 +81,11 @@ impl<T> StableSlab<T> {
     pub fn get(&self, key: usize) -> Option<&T> {
         let (page_idx, slot_idx) = Self::unpack_key(key);
         if let Some(page) = self.pages.get(page_idx) {
-            if let Some(slot) = page.get(slot_idx) {
-                if let Slot::Occupied(val) = slot {
-                    return Some(val);
-                }
+            // SAFETY: slot_idx is masked by PAGE_MASK (1023), so it is < PAGE_SIZE (1024).
+            // All pages in self.pages are guaranteed to have length == PAGE_SIZE.
+            let slot = unsafe { page.get_unchecked(slot_idx) };
+            if let Slot::Occupied(val) = slot {
+                return Some(val);
             }
         }
         None
@@ -92,11 +93,13 @@ impl<T> StableSlab<T> {
 
     pub fn get_mut(&mut self, key: usize) -> Option<&mut T> {
         let (page_idx, slot_idx) = Self::unpack_key(key);
+        // We use get_mut on pages here, which is a Vec<Vec<Slot<T>>>.
         if let Some(page) = self.pages.get_mut(page_idx) {
-            if let Some(slot) = page.get_mut(slot_idx) {
-                if let Slot::Occupied(val) = slot {
-                    return Some(val);
-                }
+            // SAFETY: slot_idx is masked by PAGE_MASK < PAGE_SIZE.
+            // All pages are initialized to PAGE_SIZE.
+            let slot = unsafe { page.get_unchecked_mut(slot_idx) };
+            if let Slot::Occupied(val) = slot {
+                return Some(val);
             }
         }
         None
@@ -129,19 +132,27 @@ impl<T> StableSlab<T> {
     fn add_page(&mut self) {
         let page_idx = self.pages.len();
         let start_idx = page_idx * PAGE_SIZE;
-        let mut page = Vec::with_capacity(PAGE_SIZE);
+
+        // Use Box::new_uninit_slice to allocate uninitialized memory directly.
+        // This avoids the overhead of Vec::with_capacity and push checks.
+        let mut page = Box::new_uninit_slice(PAGE_SIZE);
 
         let old_head = self.free_head;
-        for i in 0..PAGE_SIZE {
-            let next = if i == PAGE_SIZE - 1 {
-                old_head
-            } else {
-                start_idx + i + 1
-            };
-            page.push(Slot::Vacant(next));
+        for i in 0..PAGE_SIZE - 1 {
+            page[i].write(Slot::Vacant(start_idx + i + 1));
         }
+        page[PAGE_SIZE - 1].write(Slot::Vacant(old_head));
 
-        self.pages.push(page);
+        // SAFETY: All elements in the slice have been initialized.
+        let page = unsafe { page.assume_init() };
+
+        // Convert Box<[T]> -> Box<[T; PAGE_SIZE]>
+        let boxed_page = page
+            .try_into()
+            .ok()
+            .expect("Page size mismatch during allocation");
+
+        self.pages.push(boxed_page);
         self.free_head = start_idx;
     }
 
@@ -185,7 +196,6 @@ impl<T> StableSlab<T> {
             })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
