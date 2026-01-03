@@ -2,7 +2,6 @@ pub mod buffer;
 pub mod driver;
 pub mod op;
 pub(crate) mod socket;
-pub mod traits;
 
 use crate::io::buffer::{BufPool, FixedBuf};
 use std::future::Future;
