@@ -8,11 +8,11 @@ use crate::io::driver::RemoteWaker;
 use std::sync::Arc;
 
 pub mod op;
-mod submit;
+pub mod submit;
 
-use crate::io::driver::uring::op::{UringOp, UringWakeupExtras};
-use crate::io::driver::uring::submit::UringSubmit;
+use crate::io::driver::uring::op::UringOp;
 use crate::io::buffer::BufPool;
+use crate::io::op::IntoPlatformOp;
 
 struct UringWaker(RawFd);
 
@@ -107,8 +107,8 @@ impl<P: BufPool> UringDriver<P> {
 
         let fd = self.waker_fd as usize;
         let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
-        let extras = UringWakeupExtras { buf: [0u8; 8] };
-        let uring_op = UringOp::Wakeup(op, extras);
+        // Use into_platform_op to convert to UringOp
+        let uring_op = op.into_platform_op();
 
         let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
         self.waker_token = Some(user_data);
@@ -116,7 +116,7 @@ impl<P: BufPool> UringDriver<P> {
         // Generate and push SQE
         if let Some(entry) = self.ops.get_mut(user_data) {
             if let Some(ref mut resources) = entry.resources {
-                let sqe = resources.make_sqe().user_data(user_data as u64);
+                let sqe = unsafe { (resources.vtable.make_sqe)(resources).user_data(user_data as u64) };
                 self.push_entry(sqe);
             }
         }
@@ -183,7 +183,7 @@ impl<P: BufPool> UringDriver<P> {
 
                     // Call on_complete on the resources
                     let res = if let Some(ref mut resources) = op.resources {
-                        resources.on_complete(cqe.result())
+                        unsafe { (resources.vtable.on_complete)(resources, cqe.result()) }
                     } else {
                         // No resources, just convert result
                         if cqe.result() >= 0 {
@@ -291,7 +291,7 @@ impl<P: BufPool> Driver for UringDriver<P> {
         let sqe = {
             let entry = self.ops.get_mut(user_data).expect("invalid user_data");
             let op = entry.resources.as_mut().expect("resources missing");
-            op.make_sqe().user_data(user_data as u64)
+            unsafe { (op.vtable.make_sqe)(op).user_data(user_data as u64) }
         };
 
         // 3. Push to ring
@@ -299,29 +299,29 @@ impl<P: BufPool> Driver for UringDriver<P> {
     }
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
-        match op {
-            UringOp::Close(_, _) => {
-                let sqe = op.make_sqe().user_data(BACKGROUND_USER_DATA);
+        // Verify it is a Close op by checking the vtable function pointer
+        if op.vtable.make_sqe as usize == submit::make_sqe_close::<P> as usize {
+             let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
 
-                // Try to push
-                // Optimization: direct access to ring submission to handle full queue
+            // Try to push
+            // Optimization: direct access to ring submission to handle full queue
+            let mut sq = self.ring.submission();
+            if unsafe { sq.push(&sqe) }.is_err() {
+                // Queue is full. Try to submit existing to clear space.
+                drop(sq); // mutable borrow end
+                self.ring.submit()?;
+
                 let mut sq = self.ring.submission();
                 if unsafe { sq.push(&sqe) }.is_err() {
-                    // Queue is full. Try to submit existing to clear space.
-                    drop(sq); // mutable borrow end
-                    self.ring.submit()?;
-
-                    let mut sq = self.ring.submission();
-                    if unsafe { sq.push(&sqe) }.is_err() {
-                        return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
-                    }
+                    return Err(io::Error::new(io::ErrorKind::Other, "sq full"));
                 }
-                Ok(())
             }
-            _ => Err(io::Error::new(
+            Ok(())
+        } else {
+             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "background op only supports Close",
-            )),
+            ))
         }
     }
 

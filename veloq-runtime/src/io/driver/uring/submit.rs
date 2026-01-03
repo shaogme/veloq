@@ -1,415 +1,466 @@
-//! io_uring Operation Submission Implementations
+//! io_uring Operation Submission Implementations (Static Functions)
 //!
-//! This module implements the `UringSubmit` trait for all operation types,
-//! providing the logic to generate SQEs and handle completions.
-
-use crate::io::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IoFd, ReadFixed, Recv, Send, SyncFileRange,
-    WriteFixed,
-};
-use io_uring::{opcode, squeue, types};
-use std::io;
-
-use super::op::UringOp;
-
-/// io_uring operation submission trait.
-/// Each operation type implements this to generate SQEs and handle completion events.
-pub(crate) trait UringSubmit {
-    /// Generate a Submission Queue Entry (SQE) for this operation.
-    fn make_sqe(&mut self) -> squeue::Entry;
-
-    /// Handle completion event, converting kernel result to io::Result.
-    fn on_complete(&mut self, result: i32) -> io::Result<usize> {
-        if result >= 0 {
-            Ok(result as usize)
-        } else {
-            Err(io::Error::from_raw_os_error(-result))
-        }
-    }
-}
-
-// ============================================================================
-// Direct Operations (Cross-Platform Structs)
-// ============================================================================
+//! This module implements the logic for submitting operations and handling completions,
+//! exposed as static functions for VTable construction.
 
 use crate::io::buffer::{BufPool, NO_REGISTRATION_INDEX};
+use crate::io::driver::uring::op::UringOp;
+use crate::io::op::IoFd;
+use io_uring::{opcode, squeue, types};
+use std::io;
+use std::mem::ManuallyDrop;
 
-impl<P: BufPool> UringSubmit for ReadFixed<P> {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        let buf_index = self.buf.buf_index();
-        if buf_index == NO_REGISTRATION_INDEX {
-            match self.fd {
-                IoFd::Raw(fd) => opcode::Read::new(
-                    types::Fd(fd as i32),
-                    self.buf.as_mut_ptr(),
-                    self.buf.capacity() as u32,
-                )
-                .offset(self.offset)
-                .build(),
-                IoFd::Fixed(idx) => opcode::Read::new(
-                    types::Fixed(idx),
-                    self.buf.as_mut_ptr(),
-                    self.buf.capacity() as u32,
-                )
-                .offset(self.offset)
-                .build(),
-            }
-        } else {
-            match self.fd {
-                IoFd::Raw(fd) => opcode::ReadFixed::new(
-                    types::Fd(fd as i32),
-                    self.buf.as_mut_ptr(),
-                    self.buf.capacity() as u32,
-                    buf_index,
-                )
-                .offset(self.offset)
-                .build(),
-                IoFd::Fixed(idx) => opcode::ReadFixed::new(
-                    types::Fixed(idx),
-                    self.buf.as_mut_ptr(),
-                    self.buf.capacity() as u32,
-                    buf_index,
-                )
-                .offset(self.offset)
-                .build(),
+// ============================================================================
+// Macros
+// ============================================================================
+
+macro_rules! impl_lifecycle {
+    ($drop_fn:ident, $variant:ident) => {
+        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut UringOp<P>) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
             }
         }
-    }
+    };
 }
 
-impl<P: BufPool> UringSubmit for WriteFixed<P> {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        let buf_index = self.buf.buf_index();
-        if buf_index == NO_REGISTRATION_INDEX {
-            match self.fd {
-                IoFd::Raw(fd) => opcode::Write::new(
-                    types::Fd(fd as i32),
-                    self.buf.as_slice().as_ptr(),
-                    self.buf.len() as u32,
-                )
-                .offset(self.offset)
-                .build(),
-                IoFd::Fixed(idx) => opcode::Write::new(
-                    types::Fixed(idx),
-                    self.buf.as_slice().as_ptr(),
-                    self.buf.len() as u32,
-                )
-                .offset(self.offset)
-                .build(),
-            }
-        } else {
-            match self.fd {
-                IoFd::Raw(fd) => opcode::WriteFixed::new(
-                    types::Fd(fd as i32),
-                    self.buf.as_slice().as_ptr(),
-                    self.buf.len() as u32,
-                    buf_index,
-                )
-                .offset(self.offset)
-                .build(),
-                IoFd::Fixed(idx) => opcode::WriteFixed::new(
-                    types::Fixed(idx),
-                    self.buf.as_slice().as_ptr(),
-                    self.buf.len() as u32,
-                    buf_index,
-                )
-                .offset(self.offset)
-                .build(),
+macro_rules! impl_default_completion {
+    ($fn_name:ident) => {
+        pub(crate) unsafe fn $fn_name<P: BufPool>(
+            _op: &mut UringOp<P>,
+            result: i32,
+        ) -> io::Result<usize> {
+            if result >= 0 {
+                Ok(result as usize)
+            } else {
+                Err(io::Error::from_raw_os_error(-result))
             }
         }
-    }
+    };
 }
 
-impl<P: BufPool> UringSubmit for Recv<P> {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Recv::new(
+// ============================================================================
+// ReadFixed
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_read_fixed<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let read_op = unsafe { &mut *op.payload.read };
+    let buf_index = read_op.buf.buf_index();
+    
+    if buf_index == NO_REGISTRATION_INDEX {
+        match read_op.fd {
+            IoFd::Raw(fd) => opcode::Read::new(
                 types::Fd(fd as i32),
-                self.buf.as_mut_ptr(),
-                self.buf.capacity() as u32,
+                read_op.buf.as_mut_ptr(),
+                read_op.buf.capacity() as u32,
             )
+            .offset(read_op.offset)
             .build(),
-            IoFd::Fixed(idx) => opcode::Recv::new(
+            IoFd::Fixed(idx) => opcode::Read::new(
                 types::Fixed(idx),
-                self.buf.as_mut_ptr(),
-                self.buf.capacity() as u32,
+                read_op.buf.as_mut_ptr(),
+                read_op.buf.capacity() as u32,
             )
+            .offset(read_op.offset)
             .build(),
         }
-    }
-}
-
-impl<P: BufPool> UringSubmit for Send<P> {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Send::new(
+    } else {
+        match read_op.fd {
+            IoFd::Raw(fd) => opcode::ReadFixed::new(
                 types::Fd(fd as i32),
-                self.buf.as_slice().as_ptr(),
-                self.buf.len() as u32,
+                read_op.buf.as_mut_ptr(),
+                read_op.buf.capacity() as u32,
+                buf_index,
             )
+            .offset(read_op.offset)
             .build(),
-            IoFd::Fixed(idx) => opcode::Send::new(
+            IoFd::Fixed(idx) => opcode::ReadFixed::new(
                 types::Fixed(idx),
-                self.buf.as_slice().as_ptr(),
-                self.buf.len() as u32,
+                read_op.buf.as_mut_ptr(),
+                read_op.buf.capacity() as u32,
+                buf_index,
             )
+            .offset(read_op.offset)
             .build(),
         }
     }
 }
 
-impl UringSubmit for Connect {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Connect::new(
+impl_default_completion!(on_complete_read_fixed);
+impl_lifecycle!(drop_read_fixed, read);
+
+// ============================================================================
+// WriteFixed
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_write_fixed<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let write_op = unsafe { &mut *op.payload.write };
+    let buf_index = write_op.buf.buf_index();
+
+    if buf_index == NO_REGISTRATION_INDEX {
+        match write_op.fd {
+            IoFd::Raw(fd) => opcode::Write::new(
                 types::Fd(fd as i32),
-                &self.addr as *const _ as *const _,
-                self.addr_len,
+                write_op.buf.as_slice().as_ptr(),
+                write_op.buf.len() as u32,
             )
+            .offset(write_op.offset)
             .build(),
-            IoFd::Fixed(idx) => opcode::Connect::new(
+            IoFd::Fixed(idx) => opcode::Write::new(
                 types::Fixed(idx),
-                &self.addr as *const _ as *const _,
-                self.addr_len,
+                write_op.buf.as_slice().as_ptr(),
+                write_op.buf.len() as u32,
             )
+            .offset(write_op.offset)
+            .build(),
+        }
+    } else {
+        match write_op.fd {
+            IoFd::Raw(fd) => opcode::WriteFixed::new(
+                types::Fd(fd as i32),
+                write_op.buf.as_slice().as_ptr(),
+                write_op.buf.len() as u32,
+                buf_index,
+            )
+            .offset(write_op.offset)
+            .build(),
+            IoFd::Fixed(idx) => opcode::WriteFixed::new(
+                types::Fixed(idx),
+                write_op.buf.as_slice().as_ptr(),
+                write_op.buf.len() as u32,
+                buf_index,
+            )
+            .offset(write_op.offset)
             .build(),
         }
     }
 }
 
-impl UringSubmit for Close {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd as i32)).build(),
-            IoFd::Fixed(idx) => opcode::Close::new(types::Fixed(idx)).build(),
-        }
+impl_default_completion!(on_complete_write_fixed);
+impl_lifecycle!(drop_write_fixed, write);
+
+// ============================================================================
+// Recv
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_recv<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let recv_op = unsafe { &mut *op.payload.recv };
+    match recv_op.fd {
+        IoFd::Raw(fd) => opcode::Recv::new(
+            types::Fd(fd as i32),
+            recv_op.buf.as_mut_ptr(),
+            recv_op.buf.capacity() as u32,
+        )
+        .build(),
+        IoFd::Fixed(idx) => opcode::Recv::new(
+            types::Fixed(idx),
+            recv_op.buf.as_mut_ptr(),
+            recv_op.buf.capacity() as u32,
+        )
+        .build(),
     }
 }
 
-impl UringSubmit for Fsync {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        let flags = if self.datasync {
-            io_uring::types::FsyncFlags::DATASYNC
-        } else {
-            io_uring::types::FsyncFlags::empty()
+impl_default_completion!(on_complete_recv);
+impl_lifecycle!(drop_recv, recv);
+
+// ============================================================================
+// Send
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_send<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let send_op = unsafe { &mut *op.payload.send };
+    match send_op.fd {
+        IoFd::Raw(fd) => opcode::Send::new(
+            types::Fd(fd as i32),
+            send_op.buf.as_slice().as_ptr(),
+            send_op.buf.len() as u32,
+        )
+        .build(),
+        IoFd::Fixed(idx) => opcode::Send::new(
+            types::Fixed(idx),
+            send_op.buf.as_slice().as_ptr(),
+            send_op.buf.len() as u32,
+        )
+        .build(),
+    }
+}
+
+impl_default_completion!(on_complete_send);
+impl_lifecycle!(drop_send, send);
+
+// ============================================================================
+// Connect
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_connect<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let connect_op = unsafe { &mut *op.payload.connect };
+    match connect_op.fd {
+        IoFd::Raw(fd) => opcode::Connect::new(
+            types::Fd(fd as i32),
+            &connect_op.addr as *const _ as *const _,
+            connect_op.addr_len,
+        )
+        .build(),
+        IoFd::Fixed(idx) => opcode::Connect::new(
+            types::Fixed(idx),
+            &connect_op.addr as *const _ as *const _,
+            connect_op.addr_len,
+        )
+        .build(),
+    }
+}
+
+impl_default_completion!(on_complete_connect);
+impl_lifecycle!(drop_connect, connect);
+
+// ============================================================================
+// Accept
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_accept<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let accept_op = unsafe { &mut *op.payload.accept };
+    match accept_op.fd {
+        IoFd::Raw(fd) => opcode::Accept::new(
+            types::Fd(fd as i32),
+            &mut accept_op.addr as *mut _ as *mut _,
+            &mut accept_op.addr_len as *mut _,
+        )
+        .build(),
+        IoFd::Fixed(idx) => opcode::Accept::new(
+            types::Fixed(idx),
+            &mut accept_op.addr as *mut _ as *mut _,
+            &mut accept_op.addr_len as *mut _,
+        )
+        .build(),
+    }
+}
+
+pub(crate) unsafe fn on_complete_accept<P: BufPool>(
+    op: &mut UringOp<P>,
+    result: i32,
+) -> io::Result<usize> {
+    if result >= 0 {
+        let accept_op = unsafe { &mut *op.payload.accept };
+        // Try fallback parsing to populate remote_addr early
+        let addr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &accept_op.addr as *const _ as *const u8,
+                accept_op.addr_len as usize,
+            )
         };
-
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd as i32))
-                .flags(flags)
-                .build(),
-            IoFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx)).flags(flags).build(),
+        if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
+            accept_op.remote_addr = Some(addr);
         }
+        Ok(result as usize)
+    } else {
+        Err(io::Error::from_raw_os_error(-result))
     }
 }
 
-impl UringSubmit for Accept {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Accept::new(
-                types::Fd(fd as i32),
-                &mut self.addr as *mut _ as *mut _,
-                &mut self.addr_len as *mut _,
-            )
+impl_lifecycle!(drop_accept, accept);
+
+// ============================================================================
+// SendTo
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_send_to<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let payload = unsafe { &mut *op.payload.send_to };
+
+    // Initialize internal pointers
+    payload.iovec[0].iov_base = payload.op.buf.as_slice().as_ptr() as *mut _;
+    payload.iovec[0].iov_len = payload.op.buf.len();
+
+    payload.msghdr.msg_name = &mut payload.msg_name as *mut _ as *mut libc::c_void;
+    payload.msghdr.msg_namelen = payload.msg_namelen;
+    payload.msghdr.msg_iov = payload.iovec.as_mut_ptr();
+    payload.msghdr.msg_iovlen = 1;
+    // msg_control already zeroed
+
+    match payload.op.fd {
+        IoFd::Raw(fd) => opcode::SendMsg::new(types::Fd(fd as i32), &payload.msghdr as *const _)
             .build(),
-            IoFd::Fixed(idx) => opcode::Accept::new(
-                types::Fixed(idx),
-                &mut self.addr as *mut _ as *mut _,
-                &mut self.addr_len as *mut _,
-            )
+        IoFd::Fixed(idx) => {
+            opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build()
+        }
+    }
+}
+
+impl_default_completion!(on_complete_send_to);
+impl_lifecycle!(drop_send_to, send_to);
+
+// ============================================================================
+// RecvFrom
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_recv_from<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let payload = unsafe { &mut *op.payload.recv_from };
+
+    // Initialize internal pointers
+    payload.iovec[0].iov_base = payload.op.buf.as_mut_ptr() as *mut _;
+    payload.iovec[0].iov_len = payload.op.buf.capacity();
+
+    payload.msghdr.msg_name = &mut payload.msg_name as *mut _ as *mut libc::c_void;
+    payload.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+    payload.msghdr.msg_iov = payload.iovec.as_mut_ptr();
+    payload.msghdr.msg_iovlen = 1;
+
+    match payload.op.fd {
+        IoFd::Raw(fd) => opcode::RecvMsg::new(types::Fd(fd as i32), &mut payload.msghdr as *mut _)
             .build(),
-        }
-    }
-
-    fn on_complete(&mut self, result: i32) -> io::Result<usize> {
-        if result >= 0 {
-            // Try fallback parsing to populate remote_addr early
-            // Cast sockaddr_storage to &[u8] for the helper
-            let addr_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &self.addr as *const _ as *const u8,
-                    self.addr_len as usize,
-                )
-            };
-            if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
-                self.remote_addr = Some(addr);
-            }
-            Ok(result as usize)
-        } else {
-            Err(io::Error::from_raw_os_error(-result))
+        IoFd::Fixed(idx) => {
+            opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build()
         }
     }
 }
 
-impl UringSubmit for SyncFileRange {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd as i32), self.nbytes as u32)
-                .offset(self.offset)
-                .flags(self.flags)
-                .build(),
-            IoFd::Fixed(idx) => opcode::SyncFileRange::new(types::Fixed(idx), self.nbytes as u32)
-                .offset(self.offset)
-                .flags(self.flags)
-                .build(),
+pub(crate) unsafe fn on_complete_recv_from<P: BufPool>(
+    op: &mut UringOp<P>,
+    result: i32,
+) -> io::Result<usize> {
+    if result >= 0 {
+        let payload = unsafe { &mut *op.payload.recv_from };
+        let len = payload.msghdr.msg_namelen as usize;
+        let addr_bytes = unsafe {
+            std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len)
+        };
+        if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
+            payload.op.addr = Some(addr);
         }
+        Ok(result as usize)
+    } else {
+        Err(io::Error::from_raw_os_error(-result))
     }
 }
 
-impl UringSubmit for Fallocate {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self.fd {
-            IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd as i32), self.len as u64)
-                .offset(self.offset)
-                .mode(self.mode)
-                .build(),
-            IoFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx), self.len as u64)
-                .offset(self.offset)
-                .mode(self.mode)
-                .build(),
-        }
+impl_lifecycle!(drop_recv_from, recv_from);
+
+// ============================================================================
+// Close
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_close<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let close_op = unsafe { &mut *op.payload.close };
+    match close_op.fd {
+        IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd as i32)).build(),
+        IoFd::Fixed(idx) => opcode::Close::new(types::Fixed(idx)).build(),
     }
 }
 
-impl<P: BufPool> UringSubmit for UringOp<P> {
-    fn make_sqe(&mut self) -> squeue::Entry {
-        match self {
-            UringOp::ReadFixed(op, _) => op.make_sqe(),
-            UringOp::WriteFixed(op, _) => op.make_sqe(),
-            UringOp::Recv(op, _) => op.make_sqe(),
-            UringOp::Send(op, _) => op.make_sqe(),
-            UringOp::Connect(op, _) => op.make_sqe(),
-            UringOp::Close(op, _) => op.make_sqe(),
-            UringOp::Fsync(op, _) => op.make_sqe(),
-            UringOp::SyncFileRange(op, _) => op.make_sqe(),
-            UringOp::Fallocate(op, _) => op.make_sqe(),
-            UringOp::Accept(op, _) => op.make_sqe(),
+impl_default_completion!(on_complete_close);
+impl_lifecycle!(drop_close, close);
 
-            UringOp::SendTo(op, extras) => {
-                // Initialize internal pointers
-                extras.iovec[0].iov_base = op.buf.as_slice().as_ptr() as *mut _;
-                extras.iovec[0].iov_len = op.buf.len();
+// ============================================================================
+// Fsync
+// ============================================================================
 
-                extras.msghdr.msg_name = &mut extras.addr as *mut _ as *mut libc::c_void;
-                extras.msghdr.msg_namelen = extras.addr_len;
-                extras.msghdr.msg_iov = extras.iovec.as_mut_ptr();
-                extras.msghdr.msg_iovlen = 1;
-                // extras.msghdr.msg_control = std::ptr::null_mut(); // already zeroed in new()
-                // extras.msghdr.msg_controllen = 0;
+pub(crate) unsafe fn make_sqe_fsync<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let fsync_op = unsafe { &mut *op.payload.fsync };
+    let flags = if fsync_op.datasync {
+        io_uring::types::FsyncFlags::DATASYNC
+    } else {
+        io_uring::types::FsyncFlags::empty()
+    };
 
-                match op.fd {
-                    IoFd::Raw(fd) => {
-                        opcode::SendMsg::new(types::Fd(fd as i32), &extras.msghdr as *const _)
-                            .build()
-                    }
-                    IoFd::Fixed(idx) => {
-                        opcode::SendMsg::new(types::Fixed(idx), &extras.msghdr as *const _).build()
-                    }
-                }
-            }
-
-            UringOp::RecvFrom(op, extras) => {
-                // Initialize internal pointers
-                extras.iovec[0].iov_base = op.buf.as_mut_ptr() as *mut _;
-                extras.iovec[0].iov_len = op.buf.capacity();
-
-                extras.msghdr.msg_name = &mut extras.addr as *mut _ as *mut libc::c_void;
-                extras.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
-                extras.msghdr.msg_iov = extras.iovec.as_mut_ptr();
-                extras.msghdr.msg_iovlen = 1;
-                // extras.msghdr.msg_control = std::ptr::null_mut();
-                // extras.msghdr.msg_controllen = 0;
-
-                match op.fd {
-                    IoFd::Raw(fd) => {
-                        opcode::RecvMsg::new(types::Fd(fd as i32), &mut extras.msghdr as *mut _)
-                            .build()
-                    }
-                    IoFd::Fixed(idx) => {
-                        opcode::RecvMsg::new(types::Fixed(idx), &mut extras.msghdr as *mut _)
-                            .build()
-                    }
-                }
-            }
-
-            UringOp::Open(op, _extras) => {
-                let path_ptr = op.path.as_slice().as_ptr() as *const _;
-                // OpenAt: dir_fd, path, flags, mode
-                // We use AT_FDCWD for dir_fd to support absolute and relative paths from CWD.
-                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
-                    .flags(op.flags)
-                    .mode(op.mode)
-                    .build()
-            }
-
-            UringOp::Timeout(op, extras) => {
-                extras.ts[0] = op.duration.as_secs() as i64;
-                extras.ts[1] = op.duration.subsec_nanos() as i64;
-                let ts_ptr = extras.ts.as_ptr() as *const types::Timespec;
-                opcode::Timeout::new(ts_ptr).build()
-            }
-
-            UringOp::Wakeup(op, extras) => {
-                match op.fd {
-                    IoFd::Raw(fd) => {
-                        // We need a buffer to read into.
-                        opcode::Read::new(types::Fd(fd as i32), extras.buf.as_mut_ptr(), 8).build()
-                    }
-                    _ => panic!("Wakeup only supports raw fd"),
-                }
-            }
-        }
-    }
-
-    fn on_complete(&mut self, result: i32) -> io::Result<usize> {
-        match self {
-            UringOp::ReadFixed(op, _) => op.on_complete(result),
-            UringOp::WriteFixed(op, _) => op.on_complete(result),
-            UringOp::Recv(op, _) => op.on_complete(result),
-            UringOp::Send(op, _) => op.on_complete(result),
-            UringOp::Connect(op, _) => op.on_complete(result),
-            UringOp::Close(op, _) => op.on_complete(result),
-            UringOp::Fsync(op, _) => op.on_complete(result),
-            UringOp::SyncFileRange(op, _) => op.on_complete(result),
-            UringOp::Fallocate(op, _) => op.on_complete(result),
-            UringOp::Accept(op, _) => op.on_complete(result),
-
-            // Ops with custom logic if needed, otherwise default
-            UringOp::SendTo(_, _) => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::from_raw_os_error(-result))
-                }
-            }
-            UringOp::RecvFrom(_, _) => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::from_raw_os_error(-result))
-                }
-            }
-            UringOp::Open(_, _) => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::from_raw_os_error(-result))
-                }
-            }
-            UringOp::Wakeup(_, _) => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::from_raw_os_error(-result))
-                }
-            }
-            UringOp::Timeout(_, _) => {
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::from_raw_os_error(-result))
-                }
-            }
-        }
+    match fsync_op.fd {
+        IoFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd as i32))
+            .flags(flags)
+            .build(),
+        IoFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx)).flags(flags).build(),
     }
 }
+
+impl_default_completion!(on_complete_fsync);
+impl_lifecycle!(drop_fsync, fsync);
+
+// ============================================================================
+// SyncFileRange
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_sync_range<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let sync_op = unsafe { &mut *op.payload.sync_range };
+    match sync_op.fd {
+        IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd as i32), sync_op.nbytes as u32)
+            .offset(sync_op.offset)
+            .flags(sync_op.flags)
+            .build(),
+        IoFd::Fixed(idx) => opcode::SyncFileRange::new(types::Fixed(idx), sync_op.nbytes as u32)
+            .offset(sync_op.offset)
+            .flags(sync_op.flags)
+            .build(),
+    }
+}
+
+impl_default_completion!(on_complete_sync_range);
+impl_lifecycle!(drop_sync_range, sync_range);
+
+// ============================================================================
+// Fallocate
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_fallocate<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let fallocate_op = unsafe { &mut *op.payload.fallocate };
+    match fallocate_op.fd {
+        IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd as i32), fallocate_op.len as u64)
+            .offset(fallocate_op.offset)
+            .mode(fallocate_op.mode)
+            .build(),
+        IoFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len as u64)
+            .offset(fallocate_op.offset)
+            .mode(fallocate_op.mode)
+            .build(),
+    }
+}
+
+impl_default_completion!(on_complete_fallocate);
+impl_lifecycle!(drop_fallocate, fallocate);
+
+// ============================================================================
+// Open
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_open<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let payload = unsafe { &mut *op.payload.open };
+    let path_ptr = payload.op.path.as_slice().as_ptr() as *const _;
+    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+        .flags(payload.op.flags)
+        .mode(payload.op.mode)
+        .build()
+}
+
+impl_default_completion!(on_complete_open);
+impl_lifecycle!(drop_open, open);
+
+// ============================================================================
+// Timeout
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_timeout<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let payload = unsafe { &mut *op.payload.timeout };
+    
+    payload.ts[0] = payload.op.duration.as_secs() as i64;
+    payload.ts[1] = payload.op.duration.subsec_nanos() as i64;
+    let ts_ptr = payload.ts.as_ptr() as *const types::Timespec;
+    
+    opcode::Timeout::new(ts_ptr).build()
+}
+
+impl_default_completion!(on_complete_timeout);
+impl_lifecycle!(drop_timeout, timeout);
+
+// ============================================================================
+// Wakeup
+// ============================================================================
+
+pub(crate) unsafe fn make_sqe_wakeup<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+    let payload = unsafe { &mut *op.payload.wakeup };
+    match payload.op.fd {
+        IoFd::Raw(fd) => {
+            opcode::Read::new(types::Fd(fd as i32), payload.buf.as_mut_ptr(), 8).build()
+        }
+        _ => panic!("Wakeup only supports raw fd"),
+    }
+}
+
+impl_default_completion!(on_complete_wakeup);
+impl_lifecycle!(drop_wakeup, wakeup);

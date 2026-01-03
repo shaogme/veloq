@@ -9,17 +9,17 @@ use crate::io::driver::op_registry::{OpEntry, OpRegistry};
 use crate::io::driver::{Driver, RemoteWaker};
 use blocking::ThreadPool;
 use ext::Extensions;
-use op::IocpOp;
+use op::{IocpOp, OverlappedEntry};
 use std::io;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use submit::{IocpSubmit, SubmissionResult};
+use submit::SubmissionResult;
 
 const WAKEUP_USER_DATA: usize = usize::MAX;
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
@@ -28,10 +28,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
-use op::OverlappedEntry;
-
 pub enum PlatformData {
     Timer(TaskId),
+    Background,
     None,
 }
 
@@ -164,48 +163,34 @@ impl<P: BufPool> IocpDriver<P> {
                 return Ok(());
             }
 
+            // Check if background
+            if let PlatformData::Background = self.ops[user_data].platform_data {
+                // Background op finished. Just remove it.
+                self.ops.remove(user_data);
+                return Ok(());
+            }
+
             let op = &mut self.ops[user_data];
             let mut result_is_ready = false;
 
             if op.result.is_none() {
-                // If op.resources is Some(op), we have the op.
-                // We should access 'entry' from op.resources.
-
                 if let Some(iocp_op) = op.resources.as_mut() {
-                    if let Some(entry) = iocp_op.entry_mut() {
-                        if let Some(res) = entry.blocking_result.take() {
-                            op.result = Some(res);
-                            result_is_ready = true;
-                        }
-                    }
-                }
-
-                if !result_is_ready {
-                    // Standard IOCP completion
-                    let result = if res == 0 {
-                        let err = unsafe { GetLastError() };
-                        if err == ERROR_HANDLE_EOF {
-                            Ok(bytes_transferred as usize)
-                        } else {
-                            Err(io::Error::from_raw_os_error(err as i32))
-                        }
+                    // Check for blocking result first
+                    if let Some(entry) = iocp_op.header.blocking_result.take() {
+                        op.result = Some(entry);
+                        result_is_ready = true;
                     } else {
-                        Ok(bytes_transferred as usize)
-                    };
-
-                    if result.is_ok() {
-                        // Apply post-processing (Accept/Connect fixups)
-                        let bytes = result.unwrap();
-                        let final_res = op
-                            .resources
-                            .as_mut()
-                            .unwrap()
-                            .on_complete(bytes, &self.extensions);
-                        op.result = Some(final_res);
-                    } else {
+                        // Normal IO completion
+                        let mut result = Ok(bytes_transferred as usize);
+                        // Use VTable on_complete if available
+                        if let Some(on_comp) = iocp_op.vtable.on_complete {
+                            result = unsafe {
+                                (on_comp)(iocp_op, bytes_transferred as usize, &self.extensions)
+                            };
+                        }
                         op.result = Some(result);
+                        result_is_ready = true;
                     }
-                    result_is_ready = true;
                 }
             }
 
@@ -231,83 +216,91 @@ impl<P: BufPool> Driver for IocpDriver<P> {
     }
 
     fn submit(&mut self, user_data: usize, op: Self::Op) {
-        if let IocpOp::Timeout(t, _) = &op {
-            // Handle timeout
-            let id = self.wheel.insert(user_data, t.duration);
-            if let Some(op_entry) = self.ops.get_mut(user_data) {
-                op_entry.resources = Some(op);
-                op_entry.platform_data = PlatformData::Timer(id);
-            }
-            return;
-        }
+        if let Some(op_entry) = self.ops.get_mut(user_data) {
+            // Important: we must pin the op in resources first, then get pointers
+            op_entry.resources = Some(op);
+            let op_ref = op_entry.resources.as_mut().unwrap();
 
-        // 1. Move Op into Registry to pin it immediately
-        let op_entry = self
-            .ops
-            .get_mut(user_data)
-            .expect("Invalid user_data reserved");
-        op_entry.resources = Some(op);
+            op_ref.header.user_data = user_data;
+            let port = self.port;
+            let overlapped = &mut op_ref.header.inner as *mut OVERLAPPED;
+            let ext = &self.extensions;
+            let files = &self.registered_files;
 
-        // 2. Access the stabilized Op and its OverlappedEntry
-        // Split borrows manually to satisfy borrow checker
-        let port = self.port;
-        let extensions = &self.extensions;
-        let registered_files = &self.registered_files;
+            let result = unsafe { (op_ref.vtable.submit)(op_ref, port, overlapped, ext, files) };
 
-        // We get the stable reference now.
-        let op_ref = self
-            .ops
-            .get_mut(user_data)
-            .unwrap()
-            .resources
-            .as_mut()
-            .unwrap();
-
-        // Initialize stable Overlapped within the pinned op
-        if let Some(entry) = op_ref.entry_mut() {
-            entry.user_data = user_data;
-            entry.inner = unsafe { std::mem::zeroed() };
-            entry.blocking_result = None;
-        }
-
-        // Get pointer to the pinned OVERLAPPED
-        let overlapped_ptr = op_ref
-            .entry_mut()
-            .map(|e| &mut e.inner as *mut OVERLAPPED)
-            .unwrap_or(std::ptr::null_mut());
-
-        // 3. Submit to kernel/pool
-        let submission_result =
-            unsafe { op_ref.submit(port, overlapped_ptr, extensions, registered_files) };
-
-        match submission_result {
-            Ok(SubmissionResult::Pending) => {
-                // Op is pinned and pending.
-            }
-            Ok(SubmissionResult::PostToQueue) => unsafe {
-                PostQueuedCompletionStatus(port, 0, 0, overlapped_ptr);
-            },
-            Ok(SubmissionResult::Offload(task)) => {
-                // We perform the spawn. self.pool execute might fail.
-                let spawn_result = self.pool.execute(task);
-
-                if spawn_result.is_err() {
-                    // Pool overloaded or error
-                    if let Some(op_entry) = self.ops.get_mut(user_data) {
+            match result {
+                Ok(SubmissionResult::Pending) => {
+                    // Op submitted successfully
+                }
+                Ok(SubmissionResult::PostToQueue) => {
+                    // E.g. Wakeup. Post immediately.
+                    let _ = unsafe {
+                        PostQueuedCompletionStatus(self.port, 0, user_data, std::ptr::null_mut())
+                    };
+                }
+                Ok(SubmissionResult::Offload(task)) => {
+                    if let Err(_) = self.pool.execute(task) {
                         op_entry.result = Some(Err(io::Error::new(
                             io::ErrorKind::Other,
-                            "blocking pool overloaded",
+                            "Thread pool overloaded",
                         )));
+                        if let Some(waker) = op_entry.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+                Ok(SubmissionResult::Timer(duration)) => {
+                    let timeout = self.wheel.insert(user_data, duration);
+                    op_entry.platform_data = PlatformData::Timer(timeout);
+                }
+                Err(e) => {
+                    op_entry.result = Some(Err(e));
+                    if let Some(waker) = op_entry.waker.take() {
+                        waker.wake();
                     }
                 }
             }
-            Err(e) => {
-                // Submission failed immediately
-                if let Some(op_entry) = self.ops.get_mut(user_data) {
-                    op_entry.result = Some(Err(e));
+        }
+    }
+
+    fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
+        let user_data = self.reserve_op();
+        if let Some(op_entry) = self.ops.get_mut(user_data) {
+            op_entry.platform_data = PlatformData::Background;
+            op_entry.resources = Some(op);
+            let op_ref = op_entry.resources.as_mut().unwrap();
+            op_ref.header.user_data = user_data;
+
+            let port = self.port;
+            let overlapped = &mut op_ref.header.inner as *mut OVERLAPPED;
+            let ext = &self.extensions;
+            let files = &self.registered_files;
+
+            let result = unsafe { (op_ref.vtable.submit)(op_ref, port, overlapped, ext, files) };
+
+            match result {
+                Ok(SubmissionResult::Offload(task)) => {
+                    if let Err(_) = self.pool.execute(task) {
+                        // Failed to submit background task
+                        self.ops.remove(user_data);
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Thread pool overloaded",
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    // Expected Offload for Close, but if other types are used, this is fine too.
+                    // If it is Pending, it will complete properly and be cleaned up.
+                }
+                Err(e) => {
+                    self.ops.remove(user_data);
+                    return Err(e);
                 }
             }
         }
+        Ok(())
     }
 
     fn poll_op(
@@ -340,19 +333,20 @@ impl<P: BufPool> Driver for IocpDriver<P> {
             match &mut op.platform_data {
                 PlatformData::Timer(id) => {
                     self.wheel.cancel(*id);
-                    // Timer removal logic?
+                }
+                PlatformData::Background => {
+                    // Should not happen for cancel_op usually, but same logic
                 }
                 PlatformData::None => {
                     // Try to CancelIoEx if resources exist
                     if let Some(res) = &mut op.resources {
                         if let Some(fd) = res.get_fd() {
                             if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
-                                if let Some(entry) = res.entry_mut() {
-                                    unsafe {
-                                        use windows_sys::Win32::System::IO::CancelIoEx;
-                                        let _ =
-                                            CancelIoEx(handle, &entry.inner as *const _ as *mut _);
-                                    }
+                                // Direct access to header
+                                let entry = &mut res.header;
+                                unsafe {
+                                    use windows_sys::Win32::System::IO::CancelIoEx;
+                                    let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
                                 }
                             }
                         }
@@ -364,10 +358,8 @@ impl<P: BufPool> Driver for IocpDriver<P> {
         let should_remove = if let Some(op) = self.ops.get_mut(user_data) {
             match op.platform_data {
                 PlatformData::Timer(_) => true,
-                PlatformData::None => {
+                _ => {
                     // For IO ops, we can remove if the result is already available
-                    // (either completed or failed submission).
-                    // If result is None, we must wait for the completion packet.
                     op.result.is_some()
                 }
             }
@@ -417,35 +409,6 @@ impl<P: BufPool> Driver for IocpDriver<P> {
         Ok(())
     }
 
-    fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
-        match op {
-            IocpOp::Close(data, _) => {
-                if let Some(fd) = data.fd.raw() {
-                    let fd_val = fd as usize;
-                    // Fire-and-forget close. No completion info (passed set to 0).
-                    let task = blocking::BlockingTask::Close {
-                        handle: fd_val,
-                        completion: blocking::CompletionInfo {
-                            port: 0,
-                            user_data: 0,
-                            overlapped: 0,
-                        },
-                    };
-                    self.pool.execute(task).map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "blocking pool overloaded")
-                    })?;
-                    Ok(())
-                } else {
-                    Ok(())
-                }
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "unsupported background op",
-            )),
-        }
-    }
-
     fn wake(&mut self) -> io::Result<()> {
         let res = unsafe {
             PostQueuedCompletionStatus(self.port, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
@@ -479,12 +442,6 @@ impl<P: BufPool> Driver for IocpDriver<P> {
 
 impl<P: BufPool> Drop for IocpDriver<P> {
     fn drop(&mut self) {
-        // ... (existing logic)
-        // I will rely on the replace_file_content to keep the body if I matched correctly
-        // But I'm replacing lines 38-478.
-        // Wait, the Drop logic is long. I should include it.
-        // I'll copy the drop logic from my read in Step 38.
-
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
             if op.resources.is_some() && op.result.is_none() {
@@ -492,12 +449,11 @@ impl<P: BufPool> Drop for IocpDriver<P> {
                     if let Some(res) = op.resources.as_mut() {
                         if let Some(fd) = res.get_fd() {
                             if let Ok(handle) = submit::resolve_fd(fd, &self.registered_files) {
-                                if let Some(entry) = res.entry_mut() {
-                                    unsafe {
-                                        use windows_sys::Win32::System::IO::CancelIoEx;
-                                        let _ =
-                                            CancelIoEx(handle, &entry.inner as *const _ as *mut _);
-                                    }
+                                // Direct access to header
+                                let entry = &mut res.header;
+                                unsafe {
+                                    use windows_sys::Win32::System::IO::CancelIoEx;
+                                    let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
                                 }
                             }
                         }

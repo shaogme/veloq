@@ -4,7 +4,6 @@ use crate::io::buffer::hybrid::BufferSize;
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, RawHandle, Recv, Timeout};
 use crate::io::socket::Socket;
-use op::{IocpAcceptExtras, IocpOp, IocpTimeoutExtras, OverlappedEntry};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -51,13 +50,7 @@ fn test_iocp_accept() {
     let mut accept_op = Accept::into_op(listener_handle, acceptor_handle);
     accept_op.accept_socket = acceptor_handle;
 
-    // Create extras manually to match what we need
-    let extras = IocpAcceptExtras {
-        entry: OverlappedEntry::new(0),
-        accept_buffer: [0; 288],
-    };
-
-    let iocp_op = IocpOp::Accept(accept_op, extras);
+    let iocp_op = accept_op.into_platform_op();
 
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
@@ -83,20 +76,16 @@ fn test_iocp_accept() {
         match driver.poll_op(user_data, &mut cx) {
             Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-                match iocp_op {
-                    IocpOp::Accept(op, _) => {
-                        assert!(op.remote_addr.is_some(), "Remote addr should be populated");
-                        unsafe {
-                            if let Some(fd) = op.fd.raw() {
-                                windows_sys::Win32::Foundation::CloseHandle(fd as _);
-                            }
-                            let s = op.accept_socket;
-                            windows_sys::Win32::Foundation::CloseHandle(s as _);
-                        }
-                        break;
+                let op = Accept::from_platform_op(iocp_op);
+                assert!(op.remote_addr.is_some(), "Remote addr should be populated");
+                unsafe {
+                    if let Some(fd) = op.fd.raw() {
+                        windows_sys::Win32::Foundation::CloseHandle(fd as _);
                     }
-                    _ => panic!("Wrong resource type returned"),
+                    let s = op.accept_socket;
+                    windows_sys::Win32::Foundation::CloseHandle(s as _);
                 }
+                break;
             }
             Poll::Pending => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -128,7 +117,6 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    // Connect implements IntoPlatformOp, which uses IocpOp::Connect(Connect, IocpState)
     let iocp_op = connect_op.into_platform_op();
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
@@ -163,7 +151,7 @@ fn test_iocp_timeout() {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let iocp_op = IocpOp::Timeout(timeout_op.into(), IocpTimeoutExtras);
+    let iocp_op = timeout_op.into_platform_op();
     let user_data = driver.reserve_op();
     driver.submit(user_data, iocp_op);
 
@@ -247,12 +235,9 @@ fn test_iocp_recv_with_buffer_pool() {
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
 
-                if let IocpOp::Recv(mut op, _) = iocp_op {
-                    op.buf.set_len(bytes_read);
-                    assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
-                } else {
-                    panic!("Wrong resource type");
-                }
+                let mut op = Recv::from_platform_op(iocp_op);
+                op.buf.set_len(bytes_read);
+                assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle as _) };
                 break;

@@ -1,12 +1,17 @@
-//! IOCP Operation Submission Implementations
+//! IOCP Operation Submission Logic (Static Functions)
 //!
-//! This module implements the `IocpSubmit` trait for all operation types,
-//! providing the logic to submit operations and handle completions.
+//! This module implements the logic for submitting operations, handling completions,
+//! and accessing FDs, exposed as static functions for VTable construction.
 
 use crate::io::buffer::BufPool;
-use crate::io::op::{Connect, IoFd, ReadFixed, Recv, Send as OpSend, WriteFixed};
+use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
+use crate::io::driver::iocp::ext::Extensions;
+use crate::io::driver::iocp::op::IocpOp;
+use crate::io::op::IoFd;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
@@ -16,41 +21,113 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
-use super::blocking::{BlockingTask, CompletionInfo};
-use super::ext::Extensions;
-use super::op::{IocpOp, OverlappedEntry};
-
 // ============================================================================
-// Submission Result Types
+// Macros
 // ============================================================================
 
-pub enum SubmissionResult {
-    /// Operation is pending, will complete via IOCP.
-    Pending,
-    /// Post to completion queue immediately (e.g., wakeup).
-    PostToQueue,
-    /// Offload to thread pool for synchronous execution.
-    Offload(BlockingTask),
+macro_rules! impl_lifecycle {
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, direct_fd) => {
+        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(op: &IocpOp<P>) -> Option<IoFd> {
+            unsafe { Some(op.payload.$variant.fd) }
+        }
+    };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
+        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(op: &IocpOp<P>) -> Option<IoFd> {
+            unsafe { Some(op.payload.$variant.op.fd) }
+        }
+    };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
+        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(_op: &IocpOp<P>) -> Option<IoFd> {
+            None
+        }
+    };
+}
+
+macro_rules! impl_blocking_offload {
+    ($fn_name:ident, $variant:ident, $task_variant:ident) => {
+        pub(crate) unsafe fn $fn_name<P: BufPool>(
+            op: &mut IocpOp<P>,
+            port: HANDLE,
+            overlapped: *mut OVERLAPPED,
+            _ext: &Extensions,
+            registered_files: &[Option<HANDLE>],
+        ) -> io::Result<SubmissionResult> {
+            let payload = unsafe { &*op.payload.$variant };
+            let handle = resolve_fd(payload.fd, registered_files)?;
+
+            let entry = &op.header;
+            let user_data = entry.user_data;
+
+            let completion = CompletionInfo {
+                port: port as usize,
+                user_data,
+                overlapped: overlapped as usize,
+            };
+
+            let task = BlockingTask::$task_variant {
+                handle: handle as usize,
+                completion,
+            };
+            Ok(SubmissionResult::Offload(task))
+        }
+    };
+    ($fn_name:ident, $variant:ident, $task_variant:ident, $payload_name:ident, { $($field:ident : $val:expr),* }) => {
+        pub(crate) unsafe fn $fn_name<P: BufPool>(
+            op: &mut IocpOp<P>,
+            port: HANDLE,
+            overlapped: *mut OVERLAPPED,
+            _ext: &Extensions,
+            registered_files: &[Option<HANDLE>],
+        ) -> io::Result<SubmissionResult> {
+            let $payload_name = unsafe { &*op.payload.$variant };
+            let handle = resolve_fd($payload_name.fd, registered_files)?;
+
+            let entry = &op.header;
+            let user_data = entry.user_data;
+
+            let completion = CompletionInfo {
+                port: port as usize,
+                user_data,
+                overlapped: overlapped as usize,
+            };
+
+            let task = BlockingTask::$task_variant {
+                handle: handle as usize,
+                completion,
+                $($field: $val),*
+            };
+            Ok(SubmissionResult::Offload(task))
+        }
+    };
 }
 
 // ============================================================================
-// IocpSubmit Trait
+// Submission Result
 // ============================================================================
 
-pub(crate) trait IocpSubmit {
-    /// Submit the operation to IOCP.
-    unsafe fn submit(
-        &mut self,
-        port: HANDLE,
-        overlapped: *mut OVERLAPPED,
-        ext: &Extensions,
-        registered_files: &[Option<HANDLE>],
-    ) -> io::Result<SubmissionResult>;
-
-    /// Handle completion event.
-    fn on_complete(&mut self, result: usize, _ext: &Extensions) -> io::Result<usize> {
-        Ok(result)
-    }
+pub enum SubmissionResult {
+    Pending,
+    PostToQueue,
+    Offload(BlockingTask),
+    Timer(Duration),
 }
 
 // ============================================================================
@@ -74,205 +151,273 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 }
 
 // ============================================================================
-// Macro for File Operations
+// ReadFixed
 // ============================================================================
 
-macro_rules! impl_file_op_generic {
-    ($Op:ident, $init_fn:expr, $api_fn:expr) => {
-        impl<P: BufPool> IocpSubmit for $Op<P> {
-            unsafe fn submit(
-                &mut self,
-                port: HANDLE,
-                overlapped: *mut OVERLAPPED,
-                _ext: &Extensions,
-                registered_files: &[Option<HANDLE>],
-            ) -> io::Result<SubmissionResult> {
-                let entry_ext = unsafe { &mut *overlapped };
-                $init_fn(&*self, entry_ext);
+pub(crate) unsafe fn submit_read_fixed<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let read_op = unsafe { &mut *op.payload.read };
+    let entry = &mut op.header;
 
-                let handle = resolve_fd(self.fd, registered_files)?;
-                unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
+    entry.inner.Anonymous.Anonymous.Offset = read_op.offset as u32;
+    entry.inner.Anonymous.Anonymous.OffsetHigh = (read_op.offset >> 32) as u32;
 
-                let mut bytes = 0;
-                let ret = $api_fn(&mut *self, handle, &mut bytes, overlapped);
+    let handle = resolve_fd(read_op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
 
-                if ret == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err != ERROR_IO_PENDING {
-                        return Err(io::Error::from_raw_os_error(err as i32));
-                    }
-                }
-                Ok(SubmissionResult::Pending)
-            }
-        }
+    let mut bytes = 0;
+    let ret = unsafe {
+        ReadFile(
+            handle,
+            read_op.buf.as_mut_ptr() as *mut _,
+            read_op.buf.capacity() as u32,
+            &mut bytes,
+            overlapped,
+        )
     };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
 }
 
+impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
+
 // ============================================================================
-// Direct Operations (Cross-Platform Structs)
+// WriteFixed
 // ============================================================================
 
-impl_file_op_generic!(
-    ReadFixed,
-    |op: &ReadFixed<P>, entry: &mut OVERLAPPED| {
-        entry.Anonymous.Anonymous.Offset = op.offset as u32;
-        entry.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
-    },
-    |op: &mut ReadFixed<P>, handle, bytes, overlapped| unsafe {
-        ReadFile(
-            handle,
-            op.buf.as_mut_ptr() as *mut _,
-            op.buf.capacity() as u32,
-            bytes,
-            overlapped,
-        )
+pub(crate) unsafe fn submit_write_fixed<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let write_op = unsafe { &mut *op.payload.write };
+    let entry = &mut op.header;
+
+    entry.inner.Anonymous.Anonymous.Offset = write_op.offset as u32;
+    entry.inner.Anonymous.Anonymous.OffsetHigh = (write_op.offset >> 32) as u32;
+
+    let handle = resolve_fd(write_op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
     }
-);
 
-impl_file_op_generic!(
-    WriteFixed,
-    |op: &WriteFixed<P>, entry: &mut OVERLAPPED| {
-        entry.Anonymous.Anonymous.Offset = op.offset as u32;
-        entry.Anonymous.Anonymous.OffsetHigh = (op.offset >> 32) as u32;
-    },
-    |op: &mut WriteFixed<P>, handle, bytes, overlapped| unsafe {
+    let mut bytes = 0;
+    let ret = unsafe {
         WriteFile(
             handle,
-            op.buf.as_slice().as_ptr() as *const _,
-            op.buf.len() as u32,
-            bytes,
+            write_op.buf.as_slice().as_ptr() as *const _,
+            write_op.buf.len() as u32,
+            &mut bytes,
             overlapped,
         )
-    }
-);
+    };
 
-impl_file_op_generic!(
-    Recv,
-    |_op: &Recv<P>, entry: &mut OVERLAPPED| {
-        entry.Anonymous.Anonymous.Offset = 0;
-        entry.Anonymous.Anonymous.OffsetHigh = 0;
-    },
-    |op: &mut Recv<P>, handle, bytes, overlapped| unsafe {
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
+
+// ============================================================================
+// Recv
+// ============================================================================
+
+pub(crate) unsafe fn submit_recv<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let recv_op = unsafe { &mut *op.payload.recv };
+    op.header.inner.Anonymous.Anonymous.Offset = 0;
+    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let handle = resolve_fd(recv_op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
+
+    let mut bytes = 0;
+    let ret = unsafe {
         ReadFile(
             handle,
-            op.buf.as_mut_ptr() as *mut _,
-            op.buf.capacity() as u32,
-            bytes,
+            recv_op.buf.as_mut_ptr() as *mut _,
+            recv_op.buf.capacity() as u32,
+            &mut bytes,
             overlapped,
         )
-    }
-);
+    };
 
-impl_file_op_generic!(
-    OpSend,
-    |_op: &OpSend<P>, entry: &mut OVERLAPPED| {
-        entry.Anonymous.Anonymous.Offset = 0;
-        entry.Anonymous.Anonymous.OffsetHigh = 0;
-    },
-    |op: &mut OpSend<P>, handle, bytes, overlapped| unsafe {
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
+
+// ============================================================================
+// Send (OpSend)
+// ============================================================================
+
+pub(crate) unsafe fn submit_send<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let send_op = unsafe { &mut *op.payload.send };
+    op.header.inner.Anonymous.Anonymous.Offset = 0;
+    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let handle = resolve_fd(send_op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
+
+    let mut bytes = 0;
+    let ret = unsafe {
         WriteFile(
             handle,
-            op.buf.as_slice().as_ptr() as *const _,
-            op.buf.len() as u32,
-            bytes,
+            send_op.buf.as_slice().as_ptr() as *const _,
+            send_op.buf.len() as u32,
+            &mut bytes,
             overlapped,
         )
+    };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
     }
-);
+    Ok(SubmissionResult::Pending)
+}
 
-impl IocpSubmit for Connect {
-    unsafe fn submit(
-        &mut self,
-        port: HANDLE,
-        overlapped: *mut OVERLAPPED,
-        ext: &Extensions,
-        registered_files: &[Option<HANDLE>],
-    ) -> io::Result<SubmissionResult> {
-        let handle = resolve_fd(self.fd, registered_files)?;
+impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
-        unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
+// ============================================================================
+// Connect
+// ============================================================================
 
-        // ConnectEx requires the socket to be bound.
-        // We check if it is already bound using getsockname.
-        let mut need_bind = true;
-        let mut name: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
-        let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+pub(crate) unsafe fn submit_connect<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let connect_op = unsafe { &mut *op.payload.connect };
+    let handle = resolve_fd(connect_op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
 
-        if unsafe {
-            getsockname(
-                handle as SOCKET,
-                &mut name as *mut _ as *mut SOCKADDR,
-                &mut namelen,
-            )
-        } == 0
-        {
-            // Check if it's wildcard (port 0)
-            let family = name.ss_family;
-            if family == AF_INET as u16 {
-                let addr_in = unsafe { &*(&name as *const _ as *const SOCKADDR_IN) };
-                if addr_in.sin_port != 0 {
-                    need_bind = false;
-                }
-            } else if family == AF_INET6 as u16 {
-                let addr_in6 = unsafe { &*(&name as *const _ as *const SOCKADDR_IN6) };
-                if addr_in6.sin6_port != 0 {
-                    need_bind = false;
-                }
+    let mut need_bind = true;
+    let mut name: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+
+    let ret = unsafe {
+        getsockname(
+            handle as SOCKET,
+            &mut name as *mut _ as *mut SOCKADDR,
+            &mut namelen,
+        )
+    };
+
+    if ret == 0 {
+        let family = name.ss_family;
+        if family == AF_INET as u16 {
+            let addr_in = unsafe { &*(&name as *const _ as *const SOCKADDR_IN) };
+            if addr_in.sin_port != 0 {
+                need_bind = false;
+            }
+        } else if family == AF_INET6 as u16 {
+            let addr_in6 = unsafe { &*(&name as *const _ as *const SOCKADDR_IN6) };
+            if addr_in6.sin6_port != 0 {
+                need_bind = false;
             }
         }
+    }
 
-        if need_bind {
-            let family = self.addr.ss_family; // Fixed: Use available field
+    if need_bind {
+        let family = connect_op.addr.ss_family;
+        let mut bind_addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        bind_addr.sin_family = AF_INET;
+        let mut bind_addr6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+        bind_addr6.sin6_family = AF_INET6;
 
-            let mut bind_addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
-            bind_addr.sin_family = AF_INET;
-
-            let mut bind_addr6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
-            bind_addr6.sin6_family = AF_INET6;
-
-            let (ptr, len) = if family == AF_INET as u16 {
-                (
-                    &bind_addr as *const _ as *const SOCKADDR,
-                    std::mem::size_of::<SOCKADDR_IN>() as i32,
-                )
-            } else {
-                (
-                    &bind_addr6 as *const _ as *const SOCKADDR,
-                    std::mem::size_of::<SOCKADDR_IN6>() as i32,
-                )
-            };
-
-            let _ = unsafe { bind(handle as SOCKET, ptr, len) };
-        }
-
-        let mut bytes_sent = 0;
-        let ret = unsafe {
-            (ext.connect_ex)(
-                handle as SOCKET,
-                &self.addr as *const _ as *const SOCKADDR, // Fixed: Cast
-                self.addr_len as i32,
-                std::ptr::null(), // Send buffer
-                0,                // Send data length
-                &mut bytes_sent,
-                overlapped,
+        let (ptr, len) = if family == AF_INET as u16 {
+            (
+                &bind_addr as *const _ as *const SOCKADDR,
+                std::mem::size_of::<SOCKADDR_IN>() as i32,
+            )
+        } else {
+            (
+                &bind_addr6 as *const _ as *const SOCKADDR,
+                std::mem::size_of::<SOCKADDR_IN6>() as i32,
             )
         };
-
-        if ret == 0 {
-            let err = unsafe { GetLastError() };
-            if err != ERROR_IO_PENDING {
-                return Err(io::Error::from_raw_os_error(err as i32));
-            }
+        unsafe {
+            bind(handle as SOCKET, ptr, len);
         }
-        Ok(SubmissionResult::Pending)
     }
 
-    fn on_complete(&mut self, result: usize, _ext: &Extensions) -> io::Result<usize> {
-        let fd = self
-            .fd
-            .raw()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid socket fd"))?;
+    let mut bytes_sent = 0;
+    let ret = unsafe {
+        (ext.connect_ex)(
+            handle as SOCKET,
+            &connect_op.addr as *const _ as *const SOCKADDR,
+            connect_op.addr_len as i32,
+            std::ptr::null(),
+            0,
+            &mut bytes_sent,
+            overlapped,
+        )
+    };
 
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+pub(crate) unsafe fn on_complete_connect<P: BufPool>(
+    op: &mut IocpOp<P>,
+    result: usize,
+    _ext: &Extensions,
+) -> io::Result<usize> {
+    let connect_op = unsafe { &*op.payload.connect };
+    if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(
                 fd as SOCKET,
@@ -282,314 +427,313 @@ impl IocpSubmit for Connect {
                 0,
             )
         };
-
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(result)
     }
+    Ok(result)
 }
 
+impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
+
 // ============================================================================
-// IocpOp Enum Dispatch
+// Accept
 // ============================================================================
 
-impl<P: BufPool> IocpSubmit for IocpOp<P> {
-    unsafe fn submit(
-        &mut self,
-        port: HANDLE,
-        overlapped: *mut OVERLAPPED,
-        ext: &Extensions,
-        registered_files: &[Option<HANDLE>],
-    ) -> io::Result<SubmissionResult> {
-        match self {
-            IocpOp::ReadFixed(op, _) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IocpOp::WriteFixed(op, _) => unsafe {
-                op.submit(port, overlapped, ext, registered_files)
-            },
-            IocpOp::Recv(op, _) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IocpOp::Send(op, _) => unsafe { op.submit(port, overlapped, ext, registered_files) },
-            IocpOp::Connect(op, _) => unsafe { op.submit(port, overlapped, ext, registered_files) },
+pub(crate) unsafe fn submit_accept<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &mut *op.payload.accept };
+    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    let accept_socket = payload.op.accept_socket as HANDLE;
 
-            IocpOp::Accept(op, extras) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-
-                // Use the pre-created socket from generic op
-                let accept_socket = op.accept_socket as HANDLE;
-
-                unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
-
-                // AcceptEx requires: LocalAddr + 16, RemoteAddr + 16.
-                const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-                let split = MIN_ADDR_LEN;
-                let mut bytes_received = 0;
-
-                let ret = unsafe {
-                    (ext.accept_ex)(
-                        handle as SOCKET,
-                        accept_socket as SOCKET,
-                        extras.accept_buffer.as_mut_ptr() as *mut _,
-                        0,            // dwReceiveDataLength
-                        split as u32, // dwLocalAddressLength
-                        split as u32, // dwRemoteAddressLength
-                        &mut bytes_received,
-                        overlapped,
-                    )
-                };
-
-                if ret == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err != ERROR_IO_PENDING {
-                        return Err(io::Error::from_raw_os_error(err as i32));
-                    }
-                }
-                Ok(SubmissionResult::Pending)
-            }
-
-            IocpOp::SendTo(op, extras) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
-
-                // Update WSABUF in extras from Op buf
-                extras.wsabuf.len = op.buf.len() as u32;
-                extras.wsabuf.buf = op.buf.as_slice().as_ptr() as *mut u8;
-
-                let mut bytes = 0;
-                let ret = unsafe {
-                    WSASendTo(
-                        handle as SOCKET,
-                        &extras.wsabuf,
-                        1,
-                        &mut bytes,
-                        0,
-                        &extras.addr as *const _ as *const SOCKADDR,
-                        extras.addr_len, // i32
-                        overlapped as *mut _,
-                        None,
-                    )
-                };
-                if ret == SOCKET_ERROR {
-                    let err = unsafe { WSAGetLastError() };
-                    if err != ERROR_IO_PENDING as i32 {
-                        return Err(io::Error::from_raw_os_error(err));
-                    }
-                }
-                Ok(SubmissionResult::Pending)
-            }
-
-            IocpOp::RecvFrom(op, extras) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
-
-                extras.wsabuf.len = op.buf.capacity() as u32;
-                extras.wsabuf.buf = op.buf.as_mut_ptr();
-
-                let mut bytes = 0;
-                let ret = unsafe {
-                    WSARecvFrom(
-                        handle as SOCKET,
-                        &extras.wsabuf,
-                        1,
-                        &mut bytes,
-                        &mut extras.flags,
-                        &mut extras.addr as *mut _ as *mut SOCKADDR,
-                        &mut extras.addr_len,
-                        overlapped as *mut _,
-                        None,
-                    )
-                };
-                if ret == SOCKET_ERROR {
-                    let err = unsafe { WSAGetLastError() };
-                    if err != ERROR_IO_PENDING as i32 {
-                        return Err(io::Error::from_raw_os_error(err));
-                    }
-                }
-                Ok(SubmissionResult::Pending)
-            }
-
-            IocpOp::Open(op, _extras) => {
-                let path_ptr = op.path.as_slice().as_ptr() as usize;
-                let flags = op.flags;
-                let mode = op.mode;
-
-                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
-                let user_data = entry.user_data;
-                let completion = CompletionInfo {
-                    port: port as usize,
-                    user_data,
-                    overlapped: overlapped as usize,
-                };
-                let task = BlockingTask::Open {
-                    path_ptr,
-                    flags,
-                    mode,
-                    completion,
-                };
-                Ok(SubmissionResult::Offload(task))
-            }
-
-            IocpOp::Close(op, _entry) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                let handle_val = handle as usize;
-
-                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
-                let user_data = entry.user_data;
-                let completion = CompletionInfo {
-                    port: port as usize,
-                    user_data,
-                    overlapped: overlapped as usize,
-                };
-                let task = BlockingTask::Close {
-                    handle: handle_val,
-                    completion,
-                };
-                Ok(SubmissionResult::Offload(task))
-            }
-
-            IocpOp::Fsync(op, _entry) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                let handle_val = handle as usize;
-
-                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
-                let user_data = entry.user_data;
-                let completion = CompletionInfo {
-                    port: port as usize,
-                    user_data,
-                    overlapped: overlapped as usize,
-                };
-                let task = BlockingTask::Fsync {
-                    handle: handle_val,
-                    completion,
-                };
-                Ok(SubmissionResult::Offload(task))
-            }
-
-            IocpOp::SyncFileRange(op, _entry) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                let handle_val = handle as usize;
-
-                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
-                let user_data = entry.user_data;
-                let completion = CompletionInfo {
-                    port: port as usize,
-                    user_data,
-                    overlapped: overlapped as usize,
-                };
-                let task = BlockingTask::SyncFileRange {
-                    handle: handle_val,
-                    completion,
-                };
-                Ok(SubmissionResult::Offload(task))
-            }
-
-            IocpOp::Fallocate(op, _entry) => {
-                let handle = resolve_fd(op.fd, registered_files)?;
-                let handle_val = handle as usize;
-
-                let entry = unsafe { &*(overlapped as *mut OverlappedEntry) };
-                let user_data = entry.user_data;
-                let completion = CompletionInfo {
-                    port: port as usize,
-                    user_data,
-                    overlapped: overlapped as usize,
-                };
-                let task = BlockingTask::Fallocate {
-                    handle: handle_val,
-                    mode: op.mode,
-                    offset: op.offset,
-                    len: op.len,
-                    completion,
-                };
-                Ok(SubmissionResult::Offload(task))
-            }
-
-            IocpOp::Wakeup(_, _) => Ok(SubmissionResult::PostToQueue),
-            IocpOp::Timeout(_, _) => Ok(SubmissionResult::Pending),
-        }
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
     }
 
-    fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
-        match self {
-            IocpOp::ReadFixed(op, _) => op.on_complete(result, ext),
-            IocpOp::WriteFixed(op, _) => op.on_complete(result, ext),
-            IocpOp::Recv(op, _) => op.on_complete(result, ext),
-            IocpOp::Send(op, _) => op.on_complete(result, ext),
-            IocpOp::Connect(op, _) => op.on_complete(result, ext),
-            IocpOp::Close(_, _) => Ok(result),
-            IocpOp::Fsync(_, _) => Ok(result),
-            IocpOp::SyncFileRange(_, _) => Ok(result),
-            IocpOp::Fallocate(_, _) => Ok(result),
-            IocpOp::Wakeup(_, _) => Ok(result),
-            IocpOp::Timeout(_, _) => Ok(result),
+    const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
+    let split = MIN_ADDR_LEN;
+    let mut bytes_received = 0;
 
-            IocpOp::Accept(op, extras) => {
-                let accept_socket = op.accept_socket as SOCKET;
-                let listen_handle = op.fd.raw().ok_or(io::Error::from_raw_os_error(0))? as SOCKET;
+    let ret = unsafe {
+        (ext.accept_ex)(
+            handle as SOCKET,
+            accept_socket as SOCKET,
+            payload.accept_buffer.as_mut_ptr() as *mut _,
+            0,
+            split as u32,
+            split as u32,
+            &mut bytes_received,
+            overlapped,
+        )
+    };
 
-                let ret = unsafe {
-                    setsockopt(
-                        accept_socket,
-                        SOL_SOCKET,
-                        SO_UPDATE_ACCEPT_CONTEXT,
-                        &listen_handle as *const _ as *const _,
-                        std::mem::size_of_val(&listen_handle) as i32,
-                    )
-                };
-                if ret != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-                let split = MIN_ADDR_LEN;
-
-                let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-                let mut local_len: i32 = 0;
-                let mut remote_len: i32 = 0;
-
-                unsafe {
-                    (ext.get_accept_ex_sockaddrs)(
-                        extras.accept_buffer.as_ptr() as *const _,
-                        0,
-                        split as u32,
-                        split as u32,
-                        &mut local_sockaddr,
-                        &mut local_len,
-                        &mut remote_sockaddr,
-                        &mut remote_len,
-                    );
-                }
-
-                if !remote_sockaddr.is_null() && remote_len > 0 {
-                    unsafe {
-                        let family = (*remote_sockaddr).sa_family;
-                        if family == AF_INET as u16 {
-                            let addr_in = &*(remote_sockaddr as *const SOCKADDR_IN);
-                            let ip = Ipv4Addr::from(addr_in.sin_addr.S_un.S_addr.to_ne_bytes());
-                            let port = u16::from_be(addr_in.sin_port);
-                            op.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-                        } else if family == AF_INET6 as u16 {
-                            let addr_in6 = &*(remote_sockaddr as *const SOCKADDR_IN6);
-                            let ip = Ipv6Addr::from(addr_in6.sin6_addr.u.Byte);
-                            let port = u16::from_be(addr_in6.sin6_port);
-                            let flowinfo = addr_in6.sin6_flowinfo;
-                            let scope_id = addr_in6.Anonymous.sin6_scope_id;
-                            op.remote_addr = Some(SocketAddr::V6(SocketAddrV6::new(
-                                ip, port, flowinfo, scope_id,
-                            )));
-                        }
-                    }
-                }
-                Ok(result)
-            }
-
-            IocpOp::SendTo(_, _) => Ok(result),
-
-            IocpOp::RecvFrom(_, _) => Ok(result),
-
-            IocpOp::Open(_, _) => Ok(result),
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
         }
     }
+    Ok(SubmissionResult::Pending)
 }
+
+pub(crate) unsafe fn on_complete_accept<P: BufPool>(
+    op: &mut IocpOp<P>,
+    result: usize,
+    ext: &Extensions,
+) -> io::Result<usize> {
+    let payload = unsafe { &mut *op.payload.accept };
+    let accept_socket = payload.op.accept_socket as SOCKET;
+    let listen_handle = payload.op.fd.raw().ok_or(io::Error::from_raw_os_error(0))? as SOCKET;
+
+    let ret = unsafe {
+        setsockopt(
+            accept_socket,
+            SOL_SOCKET,
+            SO_UPDATE_ACCEPT_CONTEXT,
+            &listen_handle as *const _ as *const _,
+            std::mem::size_of_val(&listen_handle) as i32,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
+    let split = MIN_ADDR_LEN;
+
+    let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
+    let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
+    let mut local_len: i32 = 0;
+    let mut remote_len: i32 = 0;
+
+    unsafe {
+        (ext.get_accept_ex_sockaddrs)(
+            payload.accept_buffer.as_ptr() as *const _,
+            0,
+            split as u32,
+            split as u32,
+            &mut local_sockaddr,
+            &mut local_len,
+            &mut remote_sockaddr,
+            &mut remote_len,
+        );
+    }
+
+    if !remote_sockaddr.is_null() && remote_len > 0 {
+        let family = unsafe { (*remote_sockaddr).sa_family };
+        if family == AF_INET as u16 {
+            let addr_in = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN) };
+            let ip = Ipv4Addr::from(unsafe { addr_in.sin_addr.S_un.S_addr.to_ne_bytes() });
+            let port = u16::from_be(addr_in.sin_port);
+            payload.op.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        } else if family == AF_INET6 as u16 {
+            let addr_in6 = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN6) };
+            let ip = Ipv6Addr::from(unsafe { addr_in6.sin6_addr.u.Byte });
+            let port = u16::from_be(addr_in6.sin6_port);
+            let flowinfo = addr_in6.sin6_flowinfo;
+            let scope_id = unsafe { addr_in6.Anonymous.sin6_scope_id };
+            payload.op.remote_addr = Some(SocketAddr::V6(SocketAddrV6::new(
+                ip, port, flowinfo, scope_id,
+            )));
+        }
+    }
+    Ok(result)
+}
+
+impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
+
+// ============================================================================
+// SendTo
+// ============================================================================
+
+pub(crate) unsafe fn submit_send_to<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &mut *op.payload.send_to };
+    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
+
+    payload.wsabuf.len = payload.op.buf.len() as u32;
+    payload.wsabuf.buf = payload.op.buf.as_slice().as_ptr() as *mut u8;
+
+    let mut bytes = 0;
+    let ret = unsafe {
+        WSASendTo(
+            handle as SOCKET,
+            &payload.wsabuf,
+            1,
+            &mut bytes,
+            0,
+            &payload.addr as *const _ as *const SOCKADDR,
+            payload.addr_len,
+            overlapped,
+            None,
+        )
+    };
+
+    if ret == SOCKET_ERROR {
+        let err = unsafe { WSAGetLastError() };
+        if err != ERROR_IO_PENDING as i32 {
+            return Err(io::Error::from_raw_os_error(err));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
+
+// ============================================================================
+// RecvFrom
+// ============================================================================
+
+pub(crate) unsafe fn submit_recv_from<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &mut *op.payload.recv_from };
+    let handle = resolve_fd(payload.op.fd, registered_files)?;
+    unsafe {
+        CreateIoCompletionPort(handle, port, 0, 0);
+    }
+
+    payload.wsabuf.len = payload.op.buf.capacity() as u32;
+    payload.wsabuf.buf = payload.op.buf.as_mut_ptr();
+
+    let mut bytes = 0;
+    let ret = unsafe {
+        WSARecvFrom(
+            handle as SOCKET,
+            &payload.wsabuf,
+            1,
+            &mut bytes,
+            &mut payload.flags,
+            &mut payload.addr as *mut _ as *mut SOCKADDR,
+            &mut payload.addr_len,
+            overlapped,
+            None,
+        )
+    };
+
+    if ret == SOCKET_ERROR {
+        let err = unsafe { WSAGetLastError() };
+        if err != ERROR_IO_PENDING as i32 {
+            return Err(io::Error::from_raw_os_error(err));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+
+// ============================================================================
+// Open
+// ============================================================================
+
+pub(crate) unsafe fn submit_open<P: BufPool>(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    _registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let payload = unsafe { &*op.payload.open };
+    let path_ptr = payload.op.path.as_slice().as_ptr() as usize;
+
+    let entry = &op.header;
+    let user_data = entry.user_data;
+
+    let completion = CompletionInfo {
+        port: port as usize,
+        user_data,
+        overlapped: overlapped as usize,
+    };
+
+    let task = BlockingTask::Open {
+        path_ptr,
+        flags: payload.op.flags,
+        mode: payload.op.mode,
+        completion,
+    };
+    Ok(SubmissionResult::Offload(task))
+}
+
+impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
+
+// ============================================================================
+// Close
+// ============================================================================
+
+impl_blocking_offload!(submit_close, close, Close);
+impl_lifecycle!(drop_close, get_fd_close, close, direct_fd);
+
+// ============================================================================
+// Fsync
+// ============================================================================
+
+impl_blocking_offload!(submit_fsync, fsync, Fsync);
+impl_lifecycle!(drop_fsync, get_fd_fsync, fsync, direct_fd);
+
+// ============================================================================
+// SyncFileRange
+// ============================================================================
+
+impl_blocking_offload!(submit_sync_range, sync_range, SyncFileRange);
+impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
+
+// ============================================================================
+// Fallocate
+// ============================================================================
+
+impl_blocking_offload!(submit_fallocate, fallocate, Fallocate, payload, {
+    mode: payload.mode,
+    offset: payload.offset,
+    len: payload.len
+});
+impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
+
+// ============================================================================
+// Wakeup
+// ============================================================================
+
+pub(crate) unsafe fn submit_wakeup<P: BufPool>(
+    _op: &mut IocpOp<P>,
+    _port: HANDLE,
+    _overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    _registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    Ok(SubmissionResult::PostToQueue)
+}
+
+impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);
+
+// ============================================================================
+// Timeout
+// ============================================================================
+
+pub(crate) unsafe fn submit_timeout<P: BufPool>(
+    op: &mut IocpOp<P>,
+    _port: HANDLE,
+    _overlapped: *mut OVERLAPPED,
+    _ext: &Extensions,
+    _registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult> {
+    let duration = unsafe { op.payload.timeout.duration };
+    Ok(SubmissionResult::Timer(duration))
+}
+
+impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);

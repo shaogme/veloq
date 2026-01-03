@@ -1,21 +1,25 @@
 //! IOCP Platform-Specific Operation Definitions
 //!
 //! This module defines:
-//! - `IocpAbi`: The platform-specific ABI for Windows IOCP
-//! - `IocpOp` type alias: The unified operation enum specialized for IOCP
-//! - Platform-specific "extra" structures
-//! - `IntoPlatformOp` implementations
+//! - `IocpOp`: The Type-Erased operation struct using Unions and VTables
+//! - `OpVTable`: The virtual table for dynamic dispatch without enums
+//! - `IntoPlatformOp` implementations using blind casting
 
 use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformOp;
 use crate::io::driver::iocp::IocpDriver;
+use crate::io::driver::iocp::ext::Extensions;
+use crate::io::driver::iocp::submit::{self, SubmissionResult};
 use crate::io::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpAbi, Open, Operation, ReadFixed,
-    Recv, RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
+    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use crate::io::socket::SockAddrStorage;
 use std::io;
+use std::mem::ManuallyDrop;
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::WSABUF;
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
 // OverlappedEntry Definition
@@ -23,7 +27,7 @@ use windows_sys::Win32::Networking::WinSock::WSABUF;
 
 #[repr(C)]
 pub struct OverlappedEntry {
-    pub inner: windows_sys::Win32::System::IO::OVERLAPPED,
+    pub inner: OVERLAPPED,
     pub user_data: usize,
     pub blocking_result: Option<io::Result<usize>>,
 }
@@ -39,311 +43,399 @@ impl OverlappedEntry {
 }
 
 // ============================================================================
-// Platform-Specific Extra State Structures
+// VTable Definition
 // ============================================================================
 
-/// Common state for simple overlapped operations.
-pub type IocpState = OverlappedEntry;
+pub type SubmitFn<P> = unsafe fn(
+    op: &mut IocpOp<P>,
+    port: HANDLE,
+    overlapped: *mut OVERLAPPED,
+    ext: &Extensions,
+    registered_files: &[Option<HANDLE>],
+) -> io::Result<SubmissionResult>;
 
-pub struct IocpAcceptExtras {
-    pub entry: OverlappedEntry,
-    /// Buffer for AcceptEx to store local and remote addresses.
-    /// Must be at least 2 * (sizeof(SOCKADDR_STORAGE) + 16).
+pub type OnCompleteFn<P> =
+    unsafe fn(op: &mut IocpOp<P>, result: usize, ext: &Extensions) -> io::Result<usize>;
+
+pub type DropFn<P> = unsafe fn(op: &mut IocpOp<P>);
+
+pub type GetFdFn<P> = unsafe fn(op: &IocpOp<P>) -> Option<IoFd>;
+
+pub struct OpVTable<P: BufPool> {
+    pub submit: SubmitFn<P>,
+    pub on_complete: Option<OnCompleteFn<P>>,
+    pub drop: DropFn<P>,
+    pub get_fd: GetFdFn<P>,
+}
+
+// ============================================================================
+// IocpOp Struct & Union (Type-Erased)
+// ============================================================================
+
+#[repr(C)]
+pub struct IocpOp<P: BufPool> {
+    /// Public header accessible directly by Driver
+    pub header: OverlappedEntry,
+
+    /// Virtual Table for dynamic dispatch
+    pub vtable: &'static OpVTable<P>,
+
+    /// Type-erased payload
+    pub payload: IocpOpPayload<P>,
+}
+
+impl<P: BufPool> PlatformOp for IocpOp<P> {}
+
+impl<P: BufPool> IocpOp<P> {
+    /// Helper to access the OverlappedEntry (header).
+    /// Kept for compatibility with existing Driver code.
+    pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
+        Some(&mut self.header)
+    }
+
+    pub fn get_fd(&self) -> Option<IoFd> {
+        unsafe { (self.vtable.get_fd)(self) }
+    }
+}
+
+impl<P: BufPool> Drop for IocpOp<P> {
+    fn drop(&mut self) {
+        unsafe { (self.vtable.drop)(self) };
+    }
+}
+
+// Ensure proper alignment
+#[repr(C)]
+pub union IocpOpPayload<P: BufPool> {
+    pub read: ManuallyDrop<ReadFixed<P>>,
+    pub write: ManuallyDrop<WriteFixed<P>>,
+    pub recv: ManuallyDrop<Recv<P>>,
+    pub send: ManuallyDrop<OpSend<P>>,
+    pub connect: ManuallyDrop<Connect>,
+    pub accept: ManuallyDrop<AcceptPayload>,
+    pub send_to: ManuallyDrop<SendToPayload<P>>,
+    pub recv_from: ManuallyDrop<RecvFromPayload<P>>,
+    pub open: ManuallyDrop<OpenPayload<P>>,
+    pub close: ManuallyDrop<Close>,
+    pub fsync: ManuallyDrop<Fsync>,
+    pub sync_range: ManuallyDrop<SyncFileRange>,
+    pub fallocate: ManuallyDrop<Fallocate>,
+    pub wakeup: ManuallyDrop<WakeupPayload>,
+    pub timeout: ManuallyDrop<Timeout>,
+}
+
+// ============================================================================
+// Payload Structures for Complex Ops
+// ============================================================================
+
+pub struct AcceptPayload {
+    pub op: Accept,
     pub accept_buffer: [u8; 288],
 }
 
-pub struct IocpSendToExtras {
-    pub entry: OverlappedEntry,
+pub struct SendToPayload<P: BufPool> {
+    pub op: SendTo<P>,
     pub wsabuf: WSABUF,
     pub addr: SockAddrStorage,
     pub addr_len: i32,
 }
 
-pub struct IocpRecvFromExtras {
-    pub entry: OverlappedEntry,
+pub struct RecvFromPayload<P: BufPool> {
+    pub op: RecvFrom<P>,
     pub wsabuf: WSABUF,
     pub flags: u32,
     pub addr: SockAddrStorage,
     pub addr_len: i32,
 }
 
-pub struct IocpOpenExtras {
-    pub entry: OverlappedEntry,
+pub struct OpenPayload<P: BufPool> {
+    pub op: Open<P>,
 }
 
-pub struct IocpWakeupExtras {
-    pub entry: OverlappedEntry,
-}
-
-pub struct IocpTimeoutExtras; // Timeout doesn't use overlapped in IocpSubmit impl currently (returns Pending immediately)
-
-// ============================================================================
-// IocpAbi Implementation
-// ============================================================================
-
-pub struct IocpAbi;
-
-impl OpAbi for IocpAbi {
-    type ReadFixed = IocpState;
-    type WriteFixed = IocpState;
-    type Recv = IocpState;
-    type Send = IocpState;
-    type Connect = IocpState;
-    type Close = IocpState;
-    type Fsync = IocpState;
-    type SyncFileRange = OverlappedEntry;
-    type Fallocate = OverlappedEntry;
-
-    type Accept = IocpAcceptExtras;
-    type SendTo = IocpSendToExtras;
-    type RecvFrom = IocpRecvFromExtras;
-    type Open = IocpOpenExtras;
-    type Wakeup = IocpWakeupExtras;
-    type Timeout = IocpTimeoutExtras; // Or () if we don't store state
-}
-
-pub type IocpOp<P> = Operation<IocpAbi, P>;
-
-// IocpOp needs to be Send
-unsafe impl Send for IocpAbi {}
-// Wait, OpAbi trait requires Send. And Operation<P> is Send if P is OpAbi (which implies Send).
-// But P::AssocTypes also need to be Send.
-// OverlappedEntry contains raw pointers (OVERLAPPED).
-// So we need unsafe impl Send for OverlappedEntry.
-unsafe impl Send for OverlappedEntry {}
-
-impl<P: BufPool> PlatformOp for IocpOp<P> {}
-
-impl<P: BufPool> IocpOp<P> {
-    pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
-        match self {
-            Self::ReadFixed(_, entry) => Some(entry),
-            Self::WriteFixed(_, entry) => Some(entry),
-            Self::Recv(_, entry) => Some(entry),
-            Self::Send(_, entry) => Some(entry),
-            Self::Accept(_, extras) => Some(&mut extras.entry),
-            Self::Connect(_, entry) => Some(entry),
-            Self::RecvFrom(_, extras) => Some(&mut extras.entry),
-            Self::SendTo(_, extras) => Some(&mut extras.entry),
-            Self::Open(_, extras) => Some(&mut extras.entry),
-            Self::Close(_, entry) => Some(entry),
-            Self::Fsync(_, entry) => Some(entry),
-            Self::SyncFileRange(_, entry) => Some(entry),
-            Self::Fallocate(_, entry) => Some(entry),
-            Self::Wakeup(_, extras) => Some(&mut extras.entry),
-            Self::Timeout(_, _) => None,
-        }
-    }
+pub struct WakeupPayload {
+    pub op: Wakeup,
 }
 
 // ============================================================================
 // IntoPlatformOp Implementations
 // ============================================================================
 
-macro_rules! impl_into_iocp_op_generic {
-    ($Type:ident) => {
+macro_rules! impl_into_iocp_op {
+    ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident) => {
         impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for $Type<P> {
             fn into_platform_op(self) -> IocpOp<P> {
-                IocpOp::$Type(self, OverlappedEntry::new(0))
+                struct VTableHolder<P: BufPool>(P);
+                impl<P: BufPool> VTableHolder<P> {
+                    const TABLE: OpVTable<P> = OpVTable {
+                        submit: submit::$Submit,
+                        on_complete: $Complete,
+                        drop: submit::$Drop,
+                        get_fd: submit::$GetFd,
+                    };
+                }
+
+                IocpOp {
+                    header: OverlappedEntry::new(0),
+                    vtable: &VTableHolder::<P>::TABLE,
+                    payload: IocpOpPayload {
+                        $Field: ManuallyDrop::new(self),
+                    },
+                }
             }
             fn from_platform_op(op: IocpOp<P>) -> Self {
-                match op {
-                    IocpOp::$Type(val, _) => val,
-                    _ => panic!(concat!(
-                        "Driver returned mismatched Op type: expected ",
-                        stringify!($Type)
-                    )),
-                }
+                let op = ManuallyDrop::new(op);
+                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)) }
             }
         }
     };
 }
 
 macro_rules! impl_into_iocp_op_simple {
-    ($Type:ident) => {
+    ($Type:ident, $Field:ident, $Submit:ident, $Complete:expr, $Drop:ident, $GetFd:ident) => {
         impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for $Type {
             fn into_platform_op(self) -> IocpOp<P> {
-                IocpOp::$Type(self, OverlappedEntry::new(0))
+                struct VTableHolder<P: BufPool>(P);
+                impl<P: BufPool> VTableHolder<P> {
+                    const TABLE: OpVTable<P> = OpVTable {
+                        submit: submit::$Submit,
+                        on_complete: $Complete,
+                        drop: submit::$Drop,
+                        get_fd: submit::$GetFd,
+                    };
+                }
+
+                IocpOp {
+                    header: OverlappedEntry::new(0),
+                    vtable: &VTableHolder::<P>::TABLE,
+                    payload: IocpOpPayload {
+                        $Field: ManuallyDrop::new(self),
+                    },
+                }
             }
             fn from_platform_op(op: IocpOp<P>) -> Self {
-                match op {
-                    IocpOp::$Type(val, _) => val,
-                    _ => panic!(concat!(
-                        "Driver returned mismatched Op type: expected ",
-                        stringify!($Type)
-                    )),
-                }
+                let op = ManuallyDrop::new(op);
+                unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.$Field)) }
             }
         }
     };
 }
 
-impl_into_iocp_op_generic!(ReadFixed);
-impl_into_iocp_op_generic!(WriteFixed);
-impl_into_iocp_op_generic!(Recv);
-impl_into_iocp_op_simple!(Connect);
-impl_into_iocp_op_simple!(Close);
-impl_into_iocp_op_simple!(Fsync);
+impl_into_iocp_op!(
+    ReadFixed,
+    read,
+    submit_read_fixed,
+    None,
+    drop_read_fixed,
+    get_fd_read_fixed
+);
+impl_into_iocp_op!(
+    WriteFixed,
+    write,
+    submit_write_fixed,
+    None,
+    drop_write_fixed,
+    get_fd_write_fixed
+);
+impl_into_iocp_op!(Recv, recv, submit_recv, None, drop_recv, get_fd_recv);
+impl_into_iocp_op!(OpSend, send, submit_send, None, drop_send, get_fd_send);
 
-// Manual implementation for SyncFileRange (empty/stub for now)
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SyncFileRange {
-    fn into_platform_op(self) -> IocpOp<P> {
-        IocpOp::SyncFileRange(self, OverlappedEntry::new(0))
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::SyncFileRange(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected SyncFileRange"),
-        }
-    }
-}
-
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Fallocate {
-    fn into_platform_op(self) -> IocpOp<P> {
-        IocpOp::Fallocate(self, OverlappedEntry::new(0))
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Fallocate(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Fallocate"),
-        }
-    }
-}
-
-// Manual implementations
+impl_into_iocp_op_simple!(
+    Connect,
+    connect,
+    submit_connect,
+    Some(submit::on_complete_connect),
+    drop_connect,
+    get_fd_connect
+);
+impl_into_iocp_op_simple!(Close, close, submit_close, None, drop_close, get_fd_close);
+impl_into_iocp_op_simple!(Fsync, fsync, submit_fsync, None, drop_fsync, get_fd_fsync);
+impl_into_iocp_op_simple!(
+    SyncFileRange,
+    sync_range,
+    submit_sync_range,
+    None,
+    drop_sync_range,
+    get_fd_sync_range
+);
+impl_into_iocp_op_simple!(
+    Fallocate,
+    fallocate,
+    submit_fallocate,
+    None,
+    drop_fallocate,
+    get_fd_fallocate
+);
+impl_into_iocp_op_simple!(
+    Timeout,
+    timeout,
+    submit_timeout,
+    None,
+    drop_timeout,
+    get_fd_timeout
+);
 
 impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Accept {
     fn into_platform_op(self) -> IocpOp<P> {
-        let extras = IocpAcceptExtras {
-            entry: OverlappedEntry::new(0),
+        struct VTableHolder<P: BufPool>(P);
+        impl<P: BufPool> VTableHolder<P> {
+            const TABLE: OpVTable<P> = OpVTable {
+                submit: submit::submit_accept,
+                on_complete: Some(submit::on_complete_accept),
+                drop: submit::drop_accept,
+                get_fd: submit::get_fd_accept,
+            };
+        }
+
+        let payload = AcceptPayload {
+            op: self,
             accept_buffer: [0; 288],
         };
-        IocpOp::Accept(self, extras)
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Accept(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Accept"),
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &VTableHolder::<P>::TABLE,
+            payload: IocpOpPayload {
+                accept: ManuallyDrop::new(payload),
+            },
         }
+    }
+    fn from_platform_op(op: IocpOp<P>) -> Self {
+        let op = ManuallyDrop::new(op);
+        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.accept)).op }
     }
 }
 
 impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for SendTo<P> {
     fn into_platform_op(self) -> IocpOp<P> {
-        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(self.addr); // Fix: use helper
+        struct VTableHolder<P: BufPool>(P);
+        impl<P: BufPool> VTableHolder<P> {
+            const TABLE: OpVTable<P> = OpVTable {
+                submit: submit::submit_send_to,
+                on_complete: None,
+                drop: submit::drop_send_to,
+                get_fd: submit::get_fd_send_to,
+            };
+        }
+
+        let (addr, addr_len) = crate::io::socket::socket_addr_to_storage(self.addr);
         let wsabuf = WSABUF {
             len: self.buf.len() as u32,
             buf: self.buf.as_slice().as_ptr() as *mut u8,
         };
-        let extras = IocpSendToExtras {
-            entry: OverlappedEntry::new(0),
+        let payload = SendToPayload {
+            op: self,
             wsabuf,
             addr,
             addr_len: addr_len as i32,
         };
-        IocpOp::SendTo(self, extras)
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::SendTo(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected SendTo"),
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &VTableHolder::<P>::TABLE,
+            payload: IocpOpPayload {
+                send_to: ManuallyDrop::new(payload),
+            },
         }
+    }
+    fn from_platform_op(op: IocpOp<P>) -> Self {
+        let op = ManuallyDrop::new(op);
+        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.send_to)).op }
     }
 }
 
 impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for RecvFrom<P> {
     fn into_platform_op(mut self) -> IocpOp<P> {
+        struct VTableHolder<P: BufPool>(P);
+        impl<P: BufPool> VTableHolder<P> {
+            const TABLE: OpVTable<P> = OpVTable {
+                submit: submit::submit_recv_from,
+                on_complete: None,
+                drop: submit::drop_recv_from,
+                get_fd: submit::get_fd_recv_from,
+            };
+        }
+
         let wsabuf = WSABUF {
             len: self.buf.capacity() as u32,
             buf: self.buf.as_mut_ptr(),
         };
-        let extras = IocpRecvFromExtras {
-            entry: OverlappedEntry::new(0),
+        let payload = RecvFromPayload {
+            op: self,
             wsabuf,
             flags: 0,
             addr: unsafe { std::mem::zeroed() },
             addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
         };
-        IocpOp::RecvFrom(self, extras)
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::RecvFrom(mut val, extras) => {
-                // Convert buffer to SocketAddr if needed
-                let len = extras.addr_len as usize;
-                let addr = unsafe {
-                    let s = std::slice::from_raw_parts(&extras.addr as *const _ as *const u8, len);
-                    crate::io::socket::to_socket_addr(s).ok()
-                };
-                val.addr = addr;
-                val
-            }
-            _ => panic!("Driver returned mismatched Op type: expected RecvFrom"),
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &VTableHolder::<P>::TABLE,
+            payload: IocpOpPayload {
+                recv_from: ManuallyDrop::new(payload),
+            },
         }
+    }
+    fn from_platform_op(op: IocpOp<P>) -> Self {
+        let op = ManuallyDrop::new(op);
+        let payload = unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.recv_from)) };
+        let mut val = payload.op;
+        let len = payload.addr_len as usize;
+        let addr = unsafe {
+            let s = std::slice::from_raw_parts(&payload.addr as *const _ as *const u8, len);
+            crate::io::socket::to_socket_addr(s).ok()
+        };
+        val.addr = addr;
+        val
     }
 }
 
 impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Open<P> {
     fn into_platform_op(self) -> IocpOp<P> {
-        let extras = IocpOpenExtras {
-            entry: OverlappedEntry::new(0),
-        };
-        IocpOp::Open(self, extras)
-    }
+        struct VTableHolder<P: BufPool>(P);
+        impl<P: BufPool> VTableHolder<P> {
+            const TABLE: OpVTable<P> = OpVTable {
+                submit: submit::submit_open,
+                on_complete: None,
+                drop: submit::drop_open,
+                get_fd: submit::get_fd_open,
+            };
+        }
 
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Open(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Open"),
+        let payload = OpenPayload { op: self };
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &VTableHolder::<P>::TABLE,
+            payload: IocpOpPayload {
+                open: ManuallyDrop::new(payload),
+            },
         }
     }
-}
-
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Timeout {
-    fn into_platform_op(self) -> IocpOp<P> {
-        IocpOp::Timeout(self, IocpTimeoutExtras)
-    }
-
     fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Timeout(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Timeout"),
-        }
+        let op = ManuallyDrop::new(op);
+        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.open)).op }
     }
 }
 
 impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for Wakeup {
     fn into_platform_op(self) -> IocpOp<P> {
-        IocpOp::Wakeup(
-            self,
-            IocpWakeupExtras {
-                entry: OverlappedEntry::new(0),
+        struct VTableHolder<P: BufPool>(P);
+        impl<P: BufPool> VTableHolder<P> {
+            const TABLE: OpVTable<P> = OpVTable {
+                submit: submit::submit_wakeup,
+                on_complete: None,
+                drop: submit::drop_wakeup,
+                get_fd: submit::get_fd_wakeup,
+            };
+        }
+
+        let payload = WakeupPayload { op: self };
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &VTableHolder::<P>::TABLE,
+            payload: IocpOpPayload {
+                wakeup: ManuallyDrop::new(payload),
             },
-        )
-    }
-
-    fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Wakeup(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Wakeup"),
         }
     }
-}
-
-impl<P: BufPool> IntoPlatformOp<IocpDriver<P>> for OpSend<P> {
-    fn into_platform_op(self) -> IocpOp<P> {
-        IocpOp::Send(self, OverlappedEntry::new(0))
-    }
-
     fn from_platform_op(op: IocpOp<P>) -> Self {
-        match op {
-            IocpOp::Send(val, _) => val,
-            _ => panic!("Driver returned mismatched Op type: expected Send"),
-        }
+        let op = ManuallyDrop::new(op);
+        unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.wakeup)).op }
     }
 }
