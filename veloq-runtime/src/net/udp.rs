@@ -47,30 +47,27 @@ impl<P: BufPool> UdpSocket<P> {
 
     pub async fn send_to(
         &self,
-        buf: FixedBuf<P>,
+        buf: FixedBuf,
         target: SocketAddr,
-    ) -> (io::Result<usize>, FixedBuf<P>) {
+    ) -> (io::Result<usize>, FixedBuf) {
         let op = SendTo {
             fd: IoFd::Raw(self.fd),
             buf,
             addr: target,
         };
         let future = Op::new(op, self.driver.clone());
-        let (res, op_back): (io::Result<usize>, SendTo<P>) = future.await;
+        let (res, op_back): (io::Result<usize>, SendTo) = future.await;
         (res, op_back.buf)
     }
 
-    pub async fn recv_from(
-        &self,
-        buf: FixedBuf<P>,
-    ) -> (io::Result<(usize, SocketAddr)>, FixedBuf<P>) {
+    pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
         let op = RecvFrom {
             fd: IoFd::Raw(self.fd),
             buf,
             addr: None,
         };
         let future = Op::new(op, self.driver.clone());
-        let (res, op_back): (io::Result<usize>, RecvFrom<P>) = future.await;
+        let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
 
         match res {
             Ok(n) => {
@@ -104,7 +101,7 @@ impl<P: BufPool> UdpSocket<P> {
         res.map(|_| ())
     }
 
-    pub async fn send(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Send {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -114,7 +111,7 @@ impl<P: BufPool> UdpSocket<P> {
         (res, op_back.buf)
     }
 
-    pub async fn recv(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Recv {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -128,17 +125,17 @@ impl<P: BufPool> UdpSocket<P> {
 impl<P: BufPool> crate::io::AsyncBufRead<P> for UdpSocket<P> {
     fn read(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.recv(buf)
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufWrite<P> for UdpSocket<P> {
+impl<P: BufPool> crate::io::AsyncBufWrite for UdpSocket<P> {
     fn write(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.send(buf)
     }
 

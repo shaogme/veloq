@@ -50,9 +50,10 @@ pub struct UringDriver<P: BufPool> {
     ring: IoUring,
     /// Store for in-flight operations.
     /// The key (usize) is used as the io_uring user_data.
-    ops: OpRegistry<UringOp<P>, ()>,
+    ops: OpRegistry<UringOp, ()>,
     waker_fd: RawFd,
     waker_token: Option<usize>,
+    _marker: std::marker::PhantomData<P>,
 }
 
 impl<P: BufPool> UringDriver<P> {
@@ -93,6 +94,7 @@ impl<P: BufPool> UringDriver<P> {
             ops,
             waker_fd,
             waker_token: None,
+            _marker: std::marker::PhantomData,
         };
 
         driver.submit_waker();
@@ -108,7 +110,7 @@ impl<P: BufPool> UringDriver<P> {
         let fd = self.waker_fd as usize;
         let op = crate::io::op::Wakeup { fd: crate::io::op::IoFd::Raw(fd) };
         // Use into_platform_op to convert to UringOp
-        let uring_op = op.into_platform_op();
+        let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver<P>>>::into_platform_op(op);
 
         let user_data = self.ops.insert(OpEntry::new(Some(uring_op), ()));
         self.waker_token = Some(user_data);
@@ -272,7 +274,7 @@ impl<P: BufPool> UringDriver<P> {
 use crate::io::driver::Driver;
 
 impl<P: BufPool> Driver for UringDriver<P> {
-    type Op = UringOp<P>;
+    type Op = UringOp;
     type Pool = P;
 
     fn reserve_op(&mut self) -> usize {
@@ -300,7 +302,7 @@ impl<P: BufPool> Driver for UringDriver<P> {
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
         // Verify it is a Close op by checking the vtable function pointer
-        if op.vtable.make_sqe as usize == submit::make_sqe_close::<P> as usize {
+        if op.vtable.make_sqe as usize == submit::make_sqe_close as usize {
              let sqe = unsafe { (op.vtable.make_sqe)(&mut op).user_data(BACKGROUND_USER_DATA) };
 
             // Try to push
@@ -350,16 +352,8 @@ impl<P: BufPool> Driver for UringDriver<P> {
     }
 
     fn register_buffer_pool(&mut self, pool: &Self::Pool) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let iovecs = pool.get_registration_buffers();
-            self.register_buffers(iovecs)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = pool;
-            Ok(())
-        }
+        let iovecs = pool.get_registration_buffers();
+        self.register_buffers(iovecs)
     }
 
     fn register_files(

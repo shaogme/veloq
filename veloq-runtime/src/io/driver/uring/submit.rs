@@ -3,7 +3,7 @@
 //! This module implements the logic for submitting operations and handling completions,
 //! exposed as static functions for VTable construction.
 
-use crate::io::buffer::{BufPool, NO_REGISTRATION_INDEX};
+use crate::io::buffer::NO_REGISTRATION_INDEX;
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IoFd;
 use io_uring::{opcode, squeue, types};
@@ -15,19 +15,45 @@ use std::mem::ManuallyDrop;
 // ============================================================================
 
 macro_rules! impl_lifecycle {
-    ($drop_fn:ident, $variant:ident) => {
-        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut UringOp<P>) {
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, direct_fd) => {
+        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
+            unsafe { Some(op.payload.$variant.fd) }
+        }
+    };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
+        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
+            unsafe { Some(op.payload.$variant.op.fd) }
+        }
+    };
+    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
+        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
+            unsafe {
+                ManuallyDrop::drop(&mut op.payload.$variant);
+            }
+        }
+
+        pub(crate) unsafe fn $get_fd_fn(_op: &UringOp) -> Option<IoFd> {
+            None
         }
     };
 }
 
 macro_rules! impl_default_completion {
     ($fn_name:ident) => {
-        pub(crate) unsafe fn $fn_name<P: BufPool>(
-            _op: &mut UringOp<P>,
+        pub(crate) unsafe fn $fn_name(
+            _op: &mut UringOp,
             result: i32,
         ) -> io::Result<usize> {
             if result >= 0 {
@@ -43,7 +69,7 @@ macro_rules! impl_default_completion {
 // ReadFixed
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_read_fixed<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_read_fixed(op: &mut UringOp) -> squeue::Entry {
     let read_op = unsafe { &mut *op.payload.read };
     let buf_index = read_op.buf.buf_index();
     
@@ -87,13 +113,13 @@ pub(crate) unsafe fn make_sqe_read_fixed<P: BufPool>(op: &mut UringOp<P>) -> squ
 }
 
 impl_default_completion!(on_complete_read_fixed);
-impl_lifecycle!(drop_read_fixed, read);
+impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
 
 // ============================================================================
 // WriteFixed
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_write_fixed<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_write_fixed(op: &mut UringOp) -> squeue::Entry {
     let write_op = unsafe { &mut *op.payload.write };
     let buf_index = write_op.buf.buf_index();
 
@@ -137,13 +163,13 @@ pub(crate) unsafe fn make_sqe_write_fixed<P: BufPool>(op: &mut UringOp<P>) -> sq
 }
 
 impl_default_completion!(on_complete_write_fixed);
-impl_lifecycle!(drop_write_fixed, write);
+impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
 // ============================================================================
 // Recv
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_recv<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_recv(op: &mut UringOp) -> squeue::Entry {
     let recv_op = unsafe { &mut *op.payload.recv };
     match recv_op.fd {
         IoFd::Raw(fd) => opcode::Recv::new(
@@ -162,13 +188,13 @@ pub(crate) unsafe fn make_sqe_recv<P: BufPool>(op: &mut UringOp<P>) -> squeue::E
 }
 
 impl_default_completion!(on_complete_recv);
-impl_lifecycle!(drop_recv, recv);
+impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
 // ============================================================================
 // Send
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_send<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_send(op: &mut UringOp) -> squeue::Entry {
     let send_op = unsafe { &mut *op.payload.send };
     match send_op.fd {
         IoFd::Raw(fd) => opcode::Send::new(
@@ -187,13 +213,13 @@ pub(crate) unsafe fn make_sqe_send<P: BufPool>(op: &mut UringOp<P>) -> squeue::E
 }
 
 impl_default_completion!(on_complete_send);
-impl_lifecycle!(drop_send, send);
+impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
 // ============================================================================
 // Connect
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_connect<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
     let connect_op = unsafe { &mut *op.payload.connect };
     match connect_op.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
@@ -212,13 +238,13 @@ pub(crate) unsafe fn make_sqe_connect<P: BufPool>(op: &mut UringOp<P>) -> squeue
 }
 
 impl_default_completion!(on_complete_connect);
-impl_lifecycle!(drop_connect, connect);
+impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 
 // ============================================================================
 // Accept
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_accept<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
     let accept_op = unsafe { &mut *op.payload.accept };
     match accept_op.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
@@ -236,8 +262,8 @@ pub(crate) unsafe fn make_sqe_accept<P: BufPool>(op: &mut UringOp<P>) -> squeue:
     }
 }
 
-pub(crate) unsafe fn on_complete_accept<P: BufPool>(
-    op: &mut UringOp<P>,
+pub(crate) unsafe fn on_complete_accept(
+    op: &mut UringOp,
     result: i32,
 ) -> io::Result<usize> {
     if result >= 0 {
@@ -258,13 +284,13 @@ pub(crate) unsafe fn on_complete_accept<P: BufPool>(
     }
 }
 
-impl_lifecycle!(drop_accept, accept);
+impl_lifecycle!(drop_accept, get_fd_accept, accept, direct_fd);
 
 // ============================================================================
 // SendTo
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_send_to<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.send_to };
 
     // Initialize internal pointers
@@ -287,13 +313,13 @@ pub(crate) unsafe fn make_sqe_send_to<P: BufPool>(op: &mut UringOp<P>) -> squeue
 }
 
 impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, send_to);
+impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
 // RecvFrom
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_recv_from<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.recv_from };
 
     // Initialize internal pointers
@@ -314,8 +340,8 @@ pub(crate) unsafe fn make_sqe_recv_from<P: BufPool>(op: &mut UringOp<P>) -> sque
     }
 }
 
-pub(crate) unsafe fn on_complete_recv_from<P: BufPool>(
-    op: &mut UringOp<P>,
+pub(crate) unsafe fn on_complete_recv_from(
+    op: &mut UringOp,
     result: i32,
 ) -> io::Result<usize> {
     if result >= 0 {
@@ -333,13 +359,13 @@ pub(crate) unsafe fn on_complete_recv_from<P: BufPool>(
     }
 }
 
-impl_lifecycle!(drop_recv_from, recv_from);
+impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 
 // ============================================================================
 // Close
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_close<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_close(op: &mut UringOp) -> squeue::Entry {
     let close_op = unsafe { &mut *op.payload.close };
     match close_op.fd {
         IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd as i32)).build(),
@@ -348,13 +374,13 @@ pub(crate) unsafe fn make_sqe_close<P: BufPool>(op: &mut UringOp<P>) -> squeue::
 }
 
 impl_default_completion!(on_complete_close);
-impl_lifecycle!(drop_close, close);
+impl_lifecycle!(drop_close, get_fd_close, close, direct_fd);
 
 // ============================================================================
 // Fsync
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_fsync<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp) -> squeue::Entry {
     let fsync_op = unsafe { &mut *op.payload.fsync };
     let flags = if fsync_op.datasync {
         io_uring::types::FsyncFlags::DATASYNC
@@ -371,13 +397,13 @@ pub(crate) unsafe fn make_sqe_fsync<P: BufPool>(op: &mut UringOp<P>) -> squeue::
 }
 
 impl_default_completion!(on_complete_fsync);
-impl_lifecycle!(drop_fsync, fsync);
+impl_lifecycle!(drop_fsync, get_fd_fsync, fsync, direct_fd);
 
 // ============================================================================
 // SyncFileRange
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_sync_range<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_sync_range(op: &mut UringOp) -> squeue::Entry {
     let sync_op = unsafe { &mut *op.payload.sync_range };
     match sync_op.fd {
         IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd as i32), sync_op.nbytes as u32)
@@ -392,13 +418,13 @@ pub(crate) unsafe fn make_sqe_sync_range<P: BufPool>(op: &mut UringOp<P>) -> squ
 }
 
 impl_default_completion!(on_complete_sync_range);
-impl_lifecycle!(drop_sync_range, sync_range);
+impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
 
 // ============================================================================
 // Fallocate
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_fallocate<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_fallocate(op: &mut UringOp) -> squeue::Entry {
     let fallocate_op = unsafe { &mut *op.payload.fallocate };
     match fallocate_op.fd {
         IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd as i32), fallocate_op.len as u64)
@@ -413,13 +439,13 @@ pub(crate) unsafe fn make_sqe_fallocate<P: BufPool>(op: &mut UringOp<P>) -> sque
 }
 
 impl_default_completion!(on_complete_fallocate);
-impl_lifecycle!(drop_fallocate, fallocate);
+impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 
 // ============================================================================
 // Open
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_open<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_open(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.open };
     let path_ptr = payload.op.path.as_slice().as_ptr() as *const _;
     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
@@ -429,13 +455,13 @@ pub(crate) unsafe fn make_sqe_open<P: BufPool>(op: &mut UringOp<P>) -> squeue::E
 }
 
 impl_default_completion!(on_complete_open);
-impl_lifecycle!(drop_open, open);
+impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
 
 // ============================================================================
 // Timeout
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_timeout<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_timeout(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.timeout };
     
     payload.ts[0] = payload.op.duration.as_secs() as i64;
@@ -446,13 +472,13 @@ pub(crate) unsafe fn make_sqe_timeout<P: BufPool>(op: &mut UringOp<P>) -> squeue
 }
 
 impl_default_completion!(on_complete_timeout);
-impl_lifecycle!(drop_timeout, timeout);
+impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);
 
 // ============================================================================
 // Wakeup
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_wakeup<P: BufPool>(op: &mut UringOp<P>) -> squeue::Entry {
+pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.wakeup };
     match payload.op.fd {
         IoFd::Raw(fd) => {
@@ -463,4 +489,4 @@ pub(crate) unsafe fn make_sqe_wakeup<P: BufPool>(op: &mut UringOp<P>) -> squeue:
 }
 
 impl_default_completion!(on_complete_wakeup);
-impl_lifecycle!(drop_wakeup, wakeup);
+impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);

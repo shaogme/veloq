@@ -43,7 +43,7 @@ impl<P: BufPool> File<P> {
         *self.pos.borrow()
     }
 
-    pub async fn read_at(&self, buf: FixedBuf<P>, offset: u64) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
         let op = ReadFixed {
             fd: self.fd,
             buf,
@@ -54,11 +54,7 @@ impl<P: BufPool> File<P> {
         (res, op.buf)
     }
 
-    pub async fn write_at(
-        &self,
-        buf: FixedBuf<P>,
-        offset: u64,
-    ) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
         let op = WriteFixed {
             fd: self.fd,
             buf,
@@ -127,8 +123,8 @@ impl<P: BufPool> File<P> {
 impl<P: BufPool> crate::io::AsyncBufRead<P> for File<P> {
     fn read(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         async move {
             let offset = *self.pos.borrow();
             let (res, buf) = self.read_at(buf, offset).await;
@@ -140,11 +136,11 @@ impl<P: BufPool> crate::io::AsyncBufRead<P> for File<P> {
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufWrite<P> for File<P> {
+impl<P: BufPool> crate::io::AsyncBufWrite for File<P> {
     fn write(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         async move {
             let offset = *self.pos.borrow();
             let (res, buf) = self.write_at(buf, offset).await;
@@ -174,7 +170,8 @@ impl<P: BufPool> Drop for File<P> {
             let driver_weak = self.driver.clone();
             if let Some(driver_rc) = driver_weak.upgrade() {
                 let close = crate::io::op::Close { fd: self.fd };
-                let op = close.into_platform_op();
+                let op: <PlatformDriver<P> as Driver>::Op =
+                    IntoPlatformOp::<PlatformDriver<P>>::into_platform_op(close);
 
                 if let Ok(mut driver) = driver_rc.try_borrow_mut() {
                     driver.submit_background(op).is_ok()

@@ -12,15 +12,15 @@ use std::io;
 pub trait AsyncBufRead<P: BufPool> {
     /// Read data into the buffer.
     /// Returns the number of bytes read and the original buffer.
-    fn read(&self, buf: FixedBuf<P>) -> impl Future<Output = (io::Result<usize>, FixedBuf<P>)>;
+    fn read(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
 }
 
 /// Async buffered writing trait.
 /// Suitable for underlying asynchronous write operations that require passing FixedBuf ownership.
-pub trait AsyncBufWrite<P: BufPool> {
+pub trait AsyncBufWrite {
     /// Write data from the buffer.
     /// Returns the number of bytes written and the original buffer.
-    fn write(&self, buf: FixedBuf<P>) -> impl Future<Output = (io::Result<usize>, FixedBuf<P>)>;
+    fn write(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
 
     /// Flush the buffer (e.g., sync file to disk).
     fn flush(&self) -> impl Future<Output = io::Result<()>>;

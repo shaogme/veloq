@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::io::buffer::hybrid::BufferSize;
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
+fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }

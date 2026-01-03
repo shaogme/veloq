@@ -121,7 +121,7 @@ impl<P: BufPool> TcpStream<P> {
         Ok(Self { fd, driver })
     }
 
-    pub async fn recv(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Recv {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -131,7 +131,7 @@ impl<P: BufPool> TcpStream<P> {
         (res, op_back.buf)
     }
 
-    pub async fn send(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+    pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let op = Send {
             fd: IoFd::Raw(self.fd),
             buf,
@@ -145,17 +145,17 @@ impl<P: BufPool> TcpStream<P> {
 impl<P: BufPool> crate::io::AsyncBufRead<P> for TcpStream<P> {
     fn read(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.recv(buf)
     }
 }
 
-impl<P: BufPool> crate::io::AsyncBufWrite<P> for TcpStream<P> {
+impl<P: BufPool> crate::io::AsyncBufWrite for TcpStream<P> {
     fn write(
         &self,
-        buf: FixedBuf<P>,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        buf: FixedBuf,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.send(buf)
     }
 

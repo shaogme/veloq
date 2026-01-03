@@ -13,7 +13,7 @@ use crate::io::buffer::BufPool;
 pub trait Driver {
     /// Platform-specific operation type
     type Op: PlatformOp;
-    
+
     /// The specific buffer pool type this driver interacts with
     type Pool: BufPool;
 

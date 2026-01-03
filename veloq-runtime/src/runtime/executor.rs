@@ -156,7 +156,7 @@ impl<P: BufPool> LocalExecutor<P> {
 
     pub fn new_with_config(pool: P, config: crate::config::Config) -> Self {
         let driver = Rc::new(RefCell::new(
-            PlatformDriver::new(&config).expect("Failed to create driver"),
+            PlatformDriver::<P>::new(&config).expect("Failed to create driver"),
         ));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let buffer_pool = Rc::new(pool);

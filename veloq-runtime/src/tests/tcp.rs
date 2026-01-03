@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::io::buffer::hybrid::BufferSize;
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf<HybridPool> {
+fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -80,38 +80,26 @@ fn test_tcp_send_recv() {
                 let driver_weak = cx.driver();
                 let cx_clone = cx.clone(); // For server task
 
-                // Server task
+                // Server task: Robust Echo Loop
                 let server_h = cx.spawn_local(async move {
                     let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+                    let pool = cx_clone.buffer_pool().upgrade().unwrap();
 
-                    // Receive data
-                    let buf = cx_clone
-                        .buffer_pool()
-                        .upgrade()
-                        .unwrap()
-                        .alloc(size)
-                        .unwrap();
-                    // buf.set_len(buf.capacity());
-                    let (result, buf) = stream.recv(buf).await;
-                    let bytes_read = result.expect("Recv failed") as usize;
-                    println!("Server received {} bytes", bytes_read);
+                    loop {
+                        let buf = alloc_buf(&pool, size);
+                        let (result, mut buf) = stream.recv(buf).await;
+                        let bytes_read = match result {
+                            Ok(n) if n > 0 => n as usize,
+                            _ => break, // EOF or Error
+                        };
 
-                    // Echo data back
-                    let mut echo_buf = cx_clone
-                        .buffer_pool()
-                        .upgrade()
-                        .unwrap()
-                        .alloc(size)
-                        .unwrap();
-                    // We only copy useful bytes, but we send the whole buffer
-                    let echo_len = std::cmp::min(bytes_read, echo_buf.capacity());
-                    echo_buf.spare_capacity_mut()[..echo_len]
-                        .copy_from_slice(&buf.as_slice()[..echo_len]);
-                    // echo_buf.set_len(bytes_read);
-
-                    let (result, _) = stream.send(echo_buf).await;
-                    result.expect("Send failed");
-                    println!("Server echoed data");
+                        // Echo exact bytes received
+                        buf.set_len(bytes_read);
+                        if let Err(e) = stream.send(buf).await.0 {
+                            println!("Server echo failed: {}", e);
+                            break;
+                        }
+                    }
                 });
 
                 // Client
@@ -123,26 +111,43 @@ fn test_tcp_send_recv() {
                 let mut send_buf = cx.buffer_pool().upgrade().unwrap().alloc(size).unwrap();
                 let test_data = b"Hello, TCP!";
                 send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-                // send_buf.set_len(test_data.len());
+                // Buffer is full length (clamped) by default, containing test_data + zeros
 
                 // Send data
+                let bytes_to_send = send_buf.len();
                 let (result, _) = stream.send(send_buf).await;
-                let bytes_sent = result.expect("Client send failed");
+                let bytes_sent = result.expect("Client send failed") as usize;
+                assert_eq!(bytes_sent, bytes_to_send);
                 println!("Client sent {} bytes", bytes_sent);
 
-                // Receive echo
-                let recv_buf = cx.buffer_pool().upgrade().unwrap().alloc(size).unwrap();
-                // recv_buf.set_len(recv_buf.capacity());
-                let (result, recv_buf) = stream.recv(recv_buf).await;
-                let bytes_received = result.expect("Client recv failed") as usize;
+                // Receive loop verify
+                let mut total_received = 0;
+                let pool = cx.buffer_pool().upgrade().unwrap();
 
-                println!("Client received {} bytes", bytes_received);
+                while total_received < bytes_sent {
+                    let recv_buf = alloc_buf(&pool, size);
+                    let (result, recv_buf) = stream.recv(recv_buf).await;
+                    let n = result.expect("Client recv failed") as usize;
+                    if n == 0 {
+                        break;
+                    } // Unexpected EOF?
+
+                    if total_received == 0 {
+                        // Verify first chunk header
+                        assert!(n >= test_data.len(), "First chunk too small");
+                        assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
+                    }
+                    total_received += n;
+                }
+
+                println!("Client received {} bytes", total_received);
 
                 // Verify
-                assert_eq!(bytes_sent as usize, bytes_received);
-                assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
+                assert_eq!(bytes_sent, total_received);
                 println!("Data verification successful!");
 
+                // Close client to let server exit loop
+                drop(stream);
                 server_h.await;
             }
         });

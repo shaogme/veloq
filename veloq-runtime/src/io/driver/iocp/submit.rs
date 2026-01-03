@@ -3,7 +3,6 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
-use crate::io::buffer::BufPool;
 use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::op::IocpOp;
@@ -27,35 +26,35 @@ use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
 macro_rules! impl_lifecycle {
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, direct_fd) => {
-        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+        pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
         }
 
-        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(op: &IocpOp<P>) -> Option<IoFd> {
+        pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
             unsafe { Some(op.payload.$variant.fd) }
         }
     };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
-        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+        pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
         }
 
-        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(op: &IocpOp<P>) -> Option<IoFd> {
+        pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
             unsafe { Some(op.payload.$variant.op.fd) }
         }
     };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
-        pub(crate) unsafe fn $drop_fn<P: BufPool>(op: &mut IocpOp<P>) {
+        pub(crate) unsafe fn $drop_fn(op: &mut IocpOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
         }
 
-        pub(crate) unsafe fn $get_fd_fn<P: BufPool>(_op: &IocpOp<P>) -> Option<IoFd> {
+        pub(crate) unsafe fn $get_fd_fn(_op: &IocpOp) -> Option<IoFd> {
             None
         }
     };
@@ -63,8 +62,8 @@ macro_rules! impl_lifecycle {
 
 macro_rules! impl_blocking_offload {
     ($fn_name:ident, $variant:ident, $task_variant:ident) => {
-        pub(crate) unsafe fn $fn_name<P: BufPool>(
-            op: &mut IocpOp<P>,
+        pub(crate) unsafe fn $fn_name(
+            op: &mut IocpOp,
             port: HANDLE,
             overlapped: *mut OVERLAPPED,
             _ext: &Extensions,
@@ -90,8 +89,8 @@ macro_rules! impl_blocking_offload {
         }
     };
     ($fn_name:ident, $variant:ident, $task_variant:ident, $payload_name:ident, { $($field:ident : $val:expr),* }) => {
-        pub(crate) unsafe fn $fn_name<P: BufPool>(
-            op: &mut IocpOp<P>,
+        pub(crate) unsafe fn $fn_name(
+            op: &mut IocpOp,
             port: HANDLE,
             overlapped: *mut OVERLAPPED,
             _ext: &Extensions,
@@ -154,8 +153,8 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 // ReadFixed
 // ============================================================================
 
-pub(crate) unsafe fn submit_read_fixed<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_read_fixed(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -198,8 +197,8 @@ impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
 // WriteFixed
 // ============================================================================
 
-pub(crate) unsafe fn submit_write_fixed<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_write_fixed(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -242,8 +241,8 @@ impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 // Recv
 // ============================================================================
 
-pub(crate) unsafe fn submit_recv<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_recv(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -284,8 +283,8 @@ impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 // Send (OpSend)
 // ============================================================================
 
-pub(crate) unsafe fn submit_send<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_send(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -326,8 +325,8 @@ impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 // Connect
 // ============================================================================
 
-pub(crate) unsafe fn submit_connect<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_connect(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     ext: &Extensions,
@@ -411,8 +410,8 @@ pub(crate) unsafe fn submit_connect<P: BufPool>(
     Ok(SubmissionResult::Pending)
 }
 
-pub(crate) unsafe fn on_complete_connect<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn on_complete_connect(
+    op: &mut IocpOp,
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
@@ -440,8 +439,8 @@ impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
 // Accept
 // ============================================================================
 
-pub(crate) unsafe fn submit_accept<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_accept(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     ext: &Extensions,
@@ -481,8 +480,8 @@ pub(crate) unsafe fn submit_accept<P: BufPool>(
     Ok(SubmissionResult::Pending)
 }
 
-pub(crate) unsafe fn on_complete_accept<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn on_complete_accept(
+    op: &mut IocpOp,
     result: usize,
     ext: &Extensions,
 ) -> io::Result<usize> {
@@ -551,8 +550,8 @@ impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
 // SendTo
 // ============================================================================
 
-pub(crate) unsafe fn submit_send_to<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_send_to(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -597,8 +596,8 @@ impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 // RecvFrom
 // ============================================================================
 
-pub(crate) unsafe fn submit_recv_from<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_recv_from(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -643,8 +642,8 @@ impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
 // Open
 // ============================================================================
 
-pub(crate) unsafe fn submit_open<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_open(
+    op: &mut IocpOp,
     port: HANDLE,
     overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -709,8 +708,8 @@ impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
 // Wakeup
 // ============================================================================
 
-pub(crate) unsafe fn submit_wakeup<P: BufPool>(
-    _op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_wakeup(
+    _op: &mut IocpOp,
     _port: HANDLE,
     _overlapped: *mut OVERLAPPED,
     _ext: &Extensions,
@@ -725,8 +724,8 @@ impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);
 // Timeout
 // ============================================================================
 
-pub(crate) unsafe fn submit_timeout<P: BufPool>(
-    op: &mut IocpOp<P>,
+pub(crate) unsafe fn submit_timeout(
+    op: &mut IocpOp,
     _port: HANDLE,
     _overlapped: *mut OVERLAPPED,
     _ext: &Extensions,

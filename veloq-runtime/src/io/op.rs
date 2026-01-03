@@ -181,29 +181,29 @@ impl<T: IntoPlatformOp<PlatformDriver<P>> + 'static, P: BufPool> Drop for Op<T, 
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed<P: BufPool> {
+pub struct ReadFixed {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
     pub offset: u64,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed<P: BufPool> {
+pub struct WriteFixed {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
     pub offset: u64,
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv<P: BufPool> {
+pub struct Recv {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send<P: BufPool> {
+pub struct Send {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
 }
 
 /// Connect a socket to a remote address.
@@ -217,11 +217,11 @@ pub struct Connect {
 /// Open a file.
 /// Path representation is platform-agnostic (raw bytes).
 #[derive(Debug)]
-pub struct Open<P: BufPool> {
+pub struct Open {
     /// Path stored in a fixed buffer.
     /// - Unix: UTF-8 encoded, null-terminated.
     /// - Windows: UTF-16 encoded, null-terminated (stored as bytes).
-    pub path: FixedBuf<P>,
+    pub path: FixedBuf,
     pub flags: i32,
     pub mode: u32,
 }
@@ -264,17 +264,17 @@ pub struct Accept {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo<P: BufPool> {
+pub struct SendTo {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
     /// Target address.
     pub addr: std::net::SocketAddr,
 }
 
 /// Receive data and source address (UDP).
-pub struct RecvFrom<P: BufPool> {
+pub struct RecvFrom {
     pub fd: IoFd,
-    pub buf: FixedBuf<P>,
+    pub buf: FixedBuf,
     /// Source address (populated after completion).
     pub addr: Option<std::net::SocketAddr>,
 }
@@ -387,5 +387,3 @@ impl OpLifecycle for Accept {
         }
     }
 }
-
-

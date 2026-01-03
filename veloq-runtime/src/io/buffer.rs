@@ -6,15 +6,24 @@ pub mod hybrid;
 pub use buddy::BuddyPool;
 pub use hybrid::HybridPool;
 
-// Default implementations are removed to enforce explicit choices
-
 pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+
+#[repr(C)]
+pub struct BufferHeader {
+    pub vtable: &'static PoolVTable,
+    pub pool_data: NonNull<()>,
+    pub context: usize,
+}
+
+pub struct PoolVTable {
+    pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
+}
 
 #[derive(Debug)]
 pub struct DeallocParams {
-    pub ptr: NonNull<u8>,
-    pub cap: usize,
-    pub context: usize,
+    pub ptr: NonNull<u8>, // Points to the Payload (data), not the header
+    pub cap: usize,       // Capacity of the Payload
+    pub context: usize,   // Context restored from header
 }
 
 #[derive(Debug)]
@@ -33,13 +42,10 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
     type BufferSize: Copy + std::fmt::Debug;
 
     /// Allocate memory.
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>>;
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf>;
 
     /// Allocate memory of at least `size` bytes (Low level).
     fn alloc_mem(&self, size: usize) -> AllocResult;
-
-    /// Deallocate memory.
-    unsafe fn dealloc_mem(&self, params: DeallocParams);
 
     /// Get all buffers for io_uring registration.
     #[cfg(target_os = "linux")]
@@ -47,28 +53,27 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
 }
 
 #[derive(Debug)]
-pub struct FixedBuf<P: BufPool> {
-    pool: P,
+pub struct FixedBuf {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
     global_index: u16,
-    context: usize,
 }
 
 // Safety: This buffer is generally not Send because it refers to thread-local pool logic
 // but in Thread-per-Core it stays on thread.
 
-impl<P: BufPool> FixedBuf<P> {
+impl FixedBuf {
+    /// Internal constructor.
+    /// `ptr` must point to the payload (after BufferHeader).
+    /// The memory at `ptr - size_of::<BufferHeader>()` must be a valid initialized BufferHeader.
     #[inline(always)]
-    pub fn new(pool: P, ptr: NonNull<u8>, cap: usize, global_index: u16, context: usize) -> Self {
+    pub unsafe fn new(ptr: NonNull<u8>, cap: usize, global_index: u16) -> Self {
         Self {
-            pool,
             ptr,
             len: cap,
             cap,
             global_index,
-            context,
         }
     }
 
@@ -114,17 +119,29 @@ impl<P: BufPool> FixedBuf<P> {
         assert!(len <= self.cap);
         self.len = len;
     }
+
+    #[inline(always)]
+    pub(crate) unsafe fn header_ptr(&self) -> *mut BufferHeader {
+        unsafe { (self.ptr.as_ptr() as *mut BufferHeader).offset(-1) }
+    }
 }
 
-impl<P: BufPool> Drop for FixedBuf<P> {
+impl Drop for FixedBuf {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe {
-            self.pool.dealloc_mem(DeallocParams {
+            // Retrieve header
+            let header_ptr = self.header_ptr();
+            let header = &*header_ptr;
+
+            let params = DeallocParams {
                 ptr: self.ptr,
                 cap: self.cap,
-                context: self.context,
-            });
+                context: header.context,
+            };
+
+            // Call dealloc via vtable
+            (header.vtable.dealloc)(header.pool_data, params);
         }
     }
 }

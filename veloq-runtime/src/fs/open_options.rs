@@ -101,7 +101,7 @@ impl OpenOptions {
         &self,
         path: &Path,
         context: &crate::runtime::context::RuntimeContext<P>,
-    ) -> std::io::Result<Open<P>> {
+    ) -> std::io::Result<Open> {
         use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
@@ -120,8 +120,8 @@ impl OpenOptions {
                 ptr,
                 cap,
                 global_index,
-                context,
-            } => FixedBuf::new(pool.clone(), ptr, cap, global_index, context),
+                context: _,
+            } => unsafe { FixedBuf::new(ptr, cap, global_index) },
             AllocResult::Failed => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
@@ -180,7 +180,7 @@ impl OpenOptions {
         &self,
         path: &Path,
         context: &crate::runtime::context::RuntimeContext<P>,
-    ) -> std::io::Result<Open<P>> {
+    ) -> std::io::Result<Open> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
@@ -205,8 +205,8 @@ impl OpenOptions {
                 ptr,
                 cap,
                 global_index,
-                context,
-            } => FixedBuf::new(pool.clone(), ptr, cap, global_index, context),
+                context: _,
+            } => unsafe { FixedBuf::new(ptr, cap, global_index) },
             AllocResult::Failed => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,

@@ -38,12 +38,13 @@ use crate::io::buffer::BufPool;
 
 pub struct IocpDriver<P: BufPool> {
     port: HANDLE,
-    ops: OpRegistry<IocpOp<P>, PlatformData>,
+    ops: OpRegistry<IocpOp, PlatformData>,
     extensions: Extensions,
     wheel: Wheel<usize>,
     registered_files: Vec<Option<HANDLE>>,
     free_slots: Vec<usize>,
     pool: ThreadPool,
+    _marker: std::marker::PhantomData<P>,
 }
 
 struct IocpWaker(HANDLE);
@@ -94,6 +95,7 @@ impl<P: BufPool> IocpDriver<P> {
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             pool: ThreadPool::new(16, 128, 1024, Duration::from_secs(30)),
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -208,7 +210,7 @@ impl<P: BufPool> IocpDriver<P> {
 }
 
 impl<P: BufPool> Driver for IocpDriver<P> {
-    type Op = IocpOp<P>;
+    type Op = IocpOp;
     type Pool = P;
 
     fn reserve_op(&mut self) -> usize {

@@ -1,4 +1,6 @@
-use super::{AllocResult, BufPool, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX};
+use super::{
+    AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX, PoolVTable,
+};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -88,27 +90,22 @@ struct Slab {
     global_index_offset: u16,
 }
 
-struct PoolInner {
+/// Raw allocation result from HybridAllocator
+pub struct RawAlloc {
+    pub ptr: NonNull<u8>,
+    pub cap: usize,
+    pub global_index: u16,
+    pub context: usize,
+}
+
+/// Core allocator logic, managing slabs and global fallback
+/// Independent of BufPool trait for easier testing
+pub struct HybridAllocator {
     slabs: Vec<Slab>,
 }
 
-#[derive(Clone)]
-pub struct HybridPool {
-    inner: Rc<RefCell<PoolInner>>,
-}
-
-impl std::fmt::Debug for HybridPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HybridPool").finish_non_exhaustive()
-    }
-}
-
-impl HybridPool {
+impl HybridAllocator {
     pub fn new() -> Self {
-        Self::new_inner()
-    }
-
-    pub fn new_inner() -> Self {
         let mut slabs = Vec::with_capacity(SLABS.len());
         let mut current_global_offset = 0;
 
@@ -133,21 +130,162 @@ impl HybridPool {
             current_global_offset += config.count as u16;
         }
 
-        Self {
-            inner: Rc::new(RefCell::new(PoolInner { slabs })),
+        Self { slabs }
+    }
+
+    /// Allocate memory. `size` is the total size requirement including header.
+    pub fn alloc(&mut self, needed_total: usize) -> Option<RawAlloc> {
+        // Try to find best slab request size
+        let best = BufferSize::best_fit(needed_total);
+
+        if let Some(slab_idx) = best.slab_index() {
+            let slab = &mut self.slabs[slab_idx];
+
+            // Ensure the slab block size is actually sufficient (e.g. if best_fit matched but logical logic thinks otherwise)
+            // best_fit returns Size4K for <= 4096.
+            // If needed_total is 4096, it fits.
+            // If needed_total is 4100, best_fit returns Size16K. Fits.
+            // So this check is mostly sanity.
+            if slab.config.block_size >= needed_total {
+                if let Some(index) = slab.free_indices.pop() {
+                    let block_ptr =
+                        unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
+
+                    // Encode slab_idx (0-2) and index (0-1024) into usize context
+                    let context = (slab_idx << 16) | index;
+
+                    return Some(RawAlloc {
+                        ptr: unsafe { NonNull::new_unchecked(block_ptr) },
+                        cap: slab.config.block_size,
+                        global_index: slab.global_index_offset + index as u16,
+                        context,
+                    });
+                }
+            } else {
+                // If the "best fit" slab is too small (should not happen with correct best_fit), fall through
+            }
+        }
+
+        // Fallback: Global Allocator
+        if needed_total > SIZE_64K {
+            let mut vec: Vec<u8> = Vec::with_capacity(needed_total);
+            let block_ptr = vec.as_mut_ptr();
+            let cap = vec.capacity();
+            std::mem::forget(vec);
+
+            return Some(RawAlloc {
+                ptr: unsafe { NonNull::new_unchecked(block_ptr) },
+                cap,
+                global_index: NO_REGISTRATION_INDEX,
+                context: GLOBAL_ALLOC_CONTEXT,
+            });
+        }
+
+        None
+    }
+
+    /// Deallocate memory block.
+    /// `block_ptr`: pointer to the start of the block (header position).
+    /// `cap`: total capacity of the block (needed for global dealloc).
+    /// `context`: context from allocation.
+    pub unsafe fn dealloc(&mut self, block_ptr: NonNull<u8>, cap: usize, context: usize) {
+        if context == GLOBAL_ALLOC_CONTEXT {
+            // Reconstruct Vec to drop it
+            let _vec = unsafe { Vec::from_raw_parts(block_ptr.as_ptr(), 0, cap) };
+            return;
+        }
+
+        let slab_idx = context >> 16;
+        let index = context & 0xFFFF;
+
+        if let Some(slab) = self.slabs.get_mut(slab_idx) {
+            slab.free_indices.push(index);
         }
     }
 
-    /// Allocate a buffer from the specified size class.
-    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf<HybridPool>> {
-        match self.alloc_mem(size.size()) {
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index,
-                context,
-            } => Some(FixedBuf::new(self.clone(), ptr, cap, global_index, context)),
-            AllocResult::Failed => None,
+    #[cfg(test)]
+    pub fn count_free(&self, slab_idx: usize) -> usize {
+        self.slabs[slab_idx].free_indices.len()
+    }
+}
+
+#[derive(Clone)]
+pub struct HybridPool {
+    inner: Rc<RefCell<HybridAllocator>>,
+}
+
+impl std::fmt::Debug for HybridPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HybridPool").finish_non_exhaustive()
+    }
+}
+
+// VTable Shim
+static HYBRID_POOL_VTABLE: PoolVTable = PoolVTable {
+    dealloc: hybrid_dealloc_shim,
+};
+
+unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
+    let pool_rc = unsafe { Rc::from_raw(pool_data.as_ptr() as *const RefCell<HybridAllocator>) };
+
+    // Calculate block start and total capacity
+    let header_size = std::mem::size_of::<BufferHeader>();
+    let block_ptr = unsafe { params.ptr.as_ptr().sub(header_size) };
+    let total_cap = params.cap + header_size;
+
+    let mut inner = pool_rc.borrow_mut();
+    unsafe {
+        inner.dealloc(NonNull::new_unchecked(block_ptr), total_cap, params.context);
+    }
+}
+
+impl HybridPool {
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(HybridAllocator::new())),
+        }
+    }
+
+    pub fn alloc(&self, size: BufferSize) -> Option<FixedBuf> {
+        self.alloc_mem_inner(size.size())
+            .map(|(ptr, cap, idx)| unsafe {
+                let mut buf = FixedBuf::new(ptr, cap, idx);
+                if buf.capacity() > size.size() {
+                    buf.set_len(size.size());
+                }
+                buf
+            })
+    }
+
+    // Helper to return proper types for FixedBuf or AllocResult
+    fn alloc_mem_inner(&self, size: usize) -> Option<(NonNull<u8>, usize, u16)> {
+        let mut inner = self.inner.borrow_mut();
+        let header_size = std::mem::size_of::<BufferHeader>();
+        let needed_total = size + header_size;
+
+        if let Some(raw) = inner.alloc(needed_total) {
+            let block_ptr = raw.ptr.as_ptr();
+            let header_ptr = block_ptr as *mut BufferHeader;
+            let pool_raw = Rc::into_raw(self.inner.clone());
+
+            unsafe {
+                (*header_ptr) = BufferHeader {
+                    vtable: &HYBRID_POOL_VTABLE,
+                    pool_data: NonNull::new_unchecked(pool_raw as *mut ()),
+                    context: raw.context,
+                };
+
+                let payload_ptr = block_ptr.add(header_size);
+                let payload_cap = raw.cap - header_size;
+
+                Some((
+                    NonNull::new_unchecked(payload_ptr),
+                    payload_cap,
+                    raw.global_index,
+                ))
+            }
+        } else {
+            None
         }
     }
 }
@@ -161,69 +299,23 @@ impl Default for HybridPool {
 impl BufPool for HybridPool {
     type BufferSize = BufferSize;
 
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf<Self>> {
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
         self.alloc(size)
     }
 
     fn alloc_mem(&self, size: usize) -> AllocResult {
-        let mut inner = self.inner.borrow_mut();
+        if let Some((ptr, cap, global_index)) = self.alloc_mem_inner(size) {
+            let header_ptr = unsafe { (ptr.as_ptr() as *mut BufferHeader).offset(-1) };
+            let context = unsafe { (*header_ptr).context };
 
-        // Try to find best slab (smallest that fits)
-        // Try to find best slab (smallest that fits)
-        let best = BufferSize::best_fit(size);
-        if let Some(slab_idx) = best.slab_index() {
-            let slab = &mut inner.slabs[slab_idx];
-
-            if let Some(index) = slab.free_indices.pop() {
-                let ptr = unsafe { slab.memory.as_mut_ptr().add(index * slab.config.block_size) };
-
-                // Encode slab_idx (0-2) and index (0-1024) into usize context
-                // Using (slab_idx << 16) | index
-                let context = (slab_idx << 16) | index;
-
-                return AllocResult::Allocated {
-                    ptr: NonNull::new(ptr).unwrap(),
-                    cap: slab.config.block_size,
-                    global_index: slab.global_index_offset + index as u16,
-                    context,
-                };
-            }
-        }
-
-        // Fallback: Global Allocator (Hybrid Strategy)
-        if size > SIZE_64K {
-            let mut vec = Vec::with_capacity(size);
-            let ptr = unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) };
-            let cap = vec.capacity();
-            std::mem::forget(vec);
-
-            return AllocResult::Allocated {
+            AllocResult::Allocated {
                 ptr,
                 cap,
-                global_index: NO_REGISTRATION_INDEX,
-                context: GLOBAL_ALLOC_CONTEXT,
-            };
-        }
-
-        AllocResult::Failed
-    }
-
-    unsafe fn dealloc_mem(&self, params: DeallocParams) {
-        let ptr = params.ptr;
-        let cap = params.cap;
-        let context = params.context;
-        if context == GLOBAL_ALLOC_CONTEXT {
-            // Global dealloc
-            let _ = unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) };
-            return;
-        }
-
-        let mut inner = self.inner.borrow_mut();
-        let slab_idx = context >> 16;
-        let index = context & 0xFFFF;
-
-        if let Some(slab) = inner.slabs.get_mut(slab_idx) {
-            slab.free_indices.push(index);
+                global_index,
+                context,
+            }
+        } else {
+            AllocResult::Failed
         }
     }
 
@@ -250,26 +342,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hybrid_slab_alloc() {
-        let pool = HybridPool::new();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
-        assert_eq!(buf.capacity(), 4096);
-        assert!(buf.buf_index() != NO_REGISTRATION_INDEX);
+    fn test_allocator_basic() {
+        let mut allocator = HybridAllocator::new();
+        // Check initial free counts
+        assert_eq!(allocator.count_free(0), 1024); // 4K slab
+        assert_eq!(allocator.count_free(1), 128); // 16K slab
+        assert_eq!(allocator.count_free(2), 32); // 64K slab
+
+        // Alloc 4K (fits in 4K slab?)
+        // needed_total = 4096 (payload) + 24 (header) = 4120
+        // best_fit(4120) -> Size16K.
+        // So it takes from slab 1 (16K).
+        let raw = allocator.alloc(4120).unwrap();
+        assert_eq!(raw.cap, SIZE_16K);
+        assert_eq!(raw.context >> 16, 1); // Slab index 1
+        assert_eq!(allocator.count_free(0), 1024);
+        assert_eq!(allocator.count_free(1), 127); // Decremented
+
+        unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context) };
+        assert_eq!(allocator.count_free(1), 128); // Restored
     }
 
     #[test]
-    fn test_hybrid_large_alloc() {
+    fn test_allocator_small() {
+        let mut allocator = HybridAllocator::new();
+        // Request very small size. 100 bytes + 24
+        let raw = allocator.alloc(124).unwrap();
+        // best_fit(124) -> Size4K
+        assert_eq!(raw.cap, SIZE_4K);
+        assert_eq!(raw.context >> 16, 0); // Slab 0
+        assert_eq!(allocator.count_free(0), 1023);
+        unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context) };
+    }
+
+    #[test]
+    fn test_allocator_large() {
+        let mut allocator = HybridAllocator::new();
+        // Request 1MB
+        let raw = allocator.alloc(1024 * 1024).unwrap();
+        assert!(raw.cap >= 1024 * 1024);
+        assert_eq!(raw.context, GLOBAL_ALLOC_CONTEXT);
+        assert_eq!(raw.global_index, NO_REGISTRATION_INDEX);
+
+        unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context) };
+        // No check on slab counts since it was global
+    }
+
+    #[test]
+    fn test_hybrid_pool_integration() {
         let pool = HybridPool::new();
-        let mut buf = pool.alloc(BufferSize::Custom(1024 * 1024)).unwrap(); // 1MB
-        assert!(buf.capacity() >= 1024 * 1024);
-        assert_eq!(buf.buf_index(), NO_REGISTRATION_INDEX);
+        let buf = pool.alloc(BufferSize::Size4K).unwrap();
+        // As established, Size4K request implies 4096 payload.
+        // 4096+24 = 4120 -> Size16K slab.
+        assert!(buf.capacity() >= 4096);
+        let idx = buf.buf_index();
+        // Should be valid index
+        assert_ne!(idx, NO_REGISTRATION_INDEX);
 
-        // Test write
-        let slice = buf.as_slice_mut();
-        slice[0] = 1;
+        drop(buf);
+    }
 
-        let slice = buf.as_slice();
-        assert_eq!(slice[0], 1);
-        assert_eq!(buf.len(), buf.capacity());
+    #[test]
+    fn test_hybrid_alloc_clamping() {
+        let pool = HybridPool::new();
+        let buf = pool.alloc(BufferSize::Size4K).unwrap();
+        // Since it bumped to 16K slab to fit header, capacity > 4096.
+        // But we expect len to be clamped to 4096.
+        assert_eq!(buf.len(), 4096);
+        assert!(buf.capacity() > 4096);
     }
 }
