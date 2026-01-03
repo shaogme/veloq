@@ -11,6 +11,7 @@ use std::rc::Weak;
 pub struct File<P: BufPool> {
     pub(crate) fd: IoFd,
     pub(crate) driver: Weak<RefCell<PlatformDriver<P>>>,
+    pub(crate) pos: RefCell<u64>,
 }
 
 impl<P: BufPool> File<P> {
@@ -32,6 +33,14 @@ impl<P: BufPool> File<P> {
 
     pub fn options() -> OpenOptions {
         OpenOptions::new()
+    }
+
+    pub fn seek(&self, pos: u64) {
+        *self.pos.borrow_mut() = pos;
+    }
+
+    pub fn stream_position(&self) -> u64 {
+        *self.pos.borrow()
     }
 
     pub async fn read_at(&self, buf: FixedBuf<P>, offset: u64) -> (io::Result<usize>, FixedBuf<P>) {
@@ -112,6 +121,46 @@ impl<P: BufPool> File<P> {
         let driver = self.driver.clone();
         let (res, _) = Op::new(op, driver).await;
         res.map(|_| ())
+    }
+}
+
+impl<P: BufPool> crate::io::AsyncBufRead<P> for File<P> {
+    fn read(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        async move {
+            let offset = *self.pos.borrow();
+            let (res, buf) = self.read_at(buf, offset).await;
+            if let Ok(n) = res {
+                *self.pos.borrow_mut() += n as u64;
+            }
+            (res, buf)
+        }
+    }
+}
+
+impl<P: BufPool> crate::io::AsyncBufWrite<P> for File<P> {
+    fn write(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        async move {
+            let offset = *self.pos.borrow();
+            let (res, buf) = self.write_at(buf, offset).await;
+            if let Ok(n) = res {
+                *self.pos.borrow_mut() += n as u64;
+            }
+            (res, buf)
+        }
+    }
+
+    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        self.sync_data()
+    }
+
+    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        self.sync_all()
     }
 }
 

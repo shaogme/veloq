@@ -2,3 +2,30 @@ pub mod buffer;
 pub mod driver;
 pub mod op;
 pub(crate) mod socket;
+pub mod traits;
+
+use crate::io::buffer::{BufPool, FixedBuf};
+use std::future::Future;
+use std::io;
+
+/// Async buffered reading trait.
+/// Suitable for underlying asynchronous read operations that require passing FixedBuf ownership.
+pub trait AsyncBufRead<P: BufPool> {
+    /// Read data into the buffer.
+    /// Returns the number of bytes read and the original buffer.
+    fn read(&self, buf: FixedBuf<P>) -> impl Future<Output = (io::Result<usize>, FixedBuf<P>)>;
+}
+
+/// Async buffered writing trait.
+/// Suitable for underlying asynchronous write operations that require passing FixedBuf ownership.
+pub trait AsyncBufWrite<P: BufPool> {
+    /// Write data from the buffer.
+    /// Returns the number of bytes written and the original buffer.
+    fn write(&self, buf: FixedBuf<P>) -> impl Future<Output = (io::Result<usize>, FixedBuf<P>)>;
+
+    /// Flush the buffer (e.g., sync file to disk).
+    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+
+    /// Close the writing end (e.g., TCP shutdown).
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
+}

@@ -89,6 +89,7 @@ impl OpenOptions {
         Ok(super::file::File {
             fd: IoFd::Raw(fd),
             driver,
+            pos: std::cell::RefCell::new(0),
         })
     }
 

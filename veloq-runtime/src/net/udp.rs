@@ -1,6 +1,6 @@
 use crate::io::buffer::{BufPool, FixedBuf};
 use crate::io::driver::PlatformDriver;
-use crate::io::op::{IoFd, Op, RawHandle, RecvFrom, SendTo};
+use crate::io::op::{Connect, IoFd, Op, RawHandle, Recv, RecvFrom, Send, SendTo};
 use crate::io::socket::Socket;
 use std::cell::RefCell;
 use std::io;
@@ -90,5 +90,63 @@ impl<P: BufPool> UdpSocket<P> {
         let socket =
             unsafe { ManuallyDrop::new(Socket::from_raw(self.fd as *mut std::ffi::c_void)) };
         socket.local_addr()
+    }
+
+    pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
+        let op = Connect {
+            fd: IoFd::Raw(self.fd),
+            addr: raw_addr,
+            addr_len: raw_addr_len as u32,
+        };
+        let driver = self.driver.clone();
+        let (res, _) = Op::new(op, driver).await;
+        res.map(|_| ())
+    }
+
+    pub async fn send(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+        let op = Send {
+            fd: IoFd::Raw(self.fd),
+            buf,
+        };
+        let future = Op::new(op, self.driver.clone());
+        let (res, op_back) = future.await;
+        (res, op_back.buf)
+    }
+
+    pub async fn recv(&self, buf: FixedBuf<P>) -> (io::Result<usize>, FixedBuf<P>) {
+        let op = Recv {
+            fd: IoFd::Raw(self.fd),
+            buf,
+        };
+        let future = Op::new(op, self.driver.clone());
+        let (res, op_back) = future.await;
+        (res, op_back.buf)
+    }
+}
+
+impl<P: BufPool> crate::io::AsyncBufRead<P> for UdpSocket<P> {
+    fn read(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        self.recv(buf)
+    }
+}
+
+impl<P: BufPool> crate::io::AsyncBufWrite<P> for UdpSocket<P> {
+    fn write(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        self.send(buf)
+    }
+
+    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
     }
 }

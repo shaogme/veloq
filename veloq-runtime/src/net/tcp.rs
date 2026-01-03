@@ -141,3 +141,29 @@ impl<P: BufPool> TcpStream<P> {
         (res, op_back.buf)
     }
 }
+
+impl<P: BufPool> crate::io::AsyncBufRead<P> for TcpStream<P> {
+    fn read(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        self.recv(buf)
+    }
+}
+
+impl<P: BufPool> crate::io::AsyncBufWrite<P> for TcpStream<P> {
+    fn write(
+        &self,
+        buf: FixedBuf<P>,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf<P>)> {
+        self.send(buf)
+    }
+
+    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
+    }
+}
