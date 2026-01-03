@@ -1,4 +1,7 @@
-use std::ops::{Index, IndexMut};
+use std::{
+    mem::MaybeUninit,
+    ops::{Index, IndexMut},
+};
 
 const PAGE_SHIFT: usize = 10;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT; // 1024
@@ -135,7 +138,7 @@ impl<T> StableSlab<T> {
 
         // Use Box::new_uninit_slice to allocate uninitialized memory directly.
         // This avoids the overhead of Vec::with_capacity and push checks.
-        let mut page = Box::new_uninit_slice(PAGE_SIZE);
+        let mut page: Box<[MaybeUninit<Slot<T>>]> = Box::new_uninit_slice(PAGE_SIZE);
 
         let old_head = self.free_head;
         for i in 0..PAGE_SIZE - 1 {
@@ -147,11 +150,11 @@ impl<T> StableSlab<T> {
         let page = unsafe { page.assume_init() };
 
         // Convert Box<[T]> -> Box<[T; PAGE_SIZE]>
-        let boxed_page = page
-            .try_into()
-            .ok()
-            .expect("Page size mismatch during allocation");
+        let page_ptr = Box::into_raw(page) as *mut [Slot<T>; PAGE_SIZE];
 
+        // SAFETY: 我们通过 Box::new_uninit_slice(PAGE_SIZE) 分配，
+        // 且在之前循环中已初始化了所有 PAGE_SIZE 个元素。
+        let boxed_page = unsafe { Box::from_raw(page_ptr) };
         self.pages.push(boxed_page);
         self.free_head = start_idx;
     }
