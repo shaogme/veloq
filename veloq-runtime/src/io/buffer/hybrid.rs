@@ -257,6 +257,14 @@ impl HybridPool {
             })
     }
 
+    pub fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
+        self.alloc_mem_inner(len).map(|(ptr, cap, idx)| unsafe {
+            let mut buf = FixedBuf::new(ptr, cap, idx);
+            buf.set_len(len);
+            buf
+        })
+    }
+
     // Helper to return proper types for FixedBuf or AllocResult
     fn alloc_mem_inner(&self, size: usize) -> Option<(NonNull<u8>, usize, u16)> {
         let mut inner = self.inner.borrow_mut();

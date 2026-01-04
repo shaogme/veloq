@@ -427,6 +427,17 @@ impl BuddyPool {
         }
         None
     }
+
+    pub fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
+        let header_size = std::mem::size_of::<BufferHeader>();
+        let needed = len.checked_add(header_size)?;
+        let size = BufferSize::best_fit(needed)?;
+
+        self.alloc(size).map(|mut buf| {
+            buf.set_len(len);
+            buf
+        })
+    }
 }
 
 impl Default for BuddyPool {

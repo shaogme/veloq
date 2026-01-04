@@ -44,6 +44,23 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
     /// Allocate memory.
     fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf>;
 
+    /// Allocate memory with specific length.
+    fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
+        match self.alloc_mem(len) {
+            AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index,
+                context: _,
+            } => unsafe {
+                let mut buf = FixedBuf::new(ptr, cap, global_index);
+                buf.set_len(len);
+                Some(buf)
+            },
+            AllocResult::Failed => None,
+        }
+    }
+
     /// Allocate memory of at least `size` bytes (Low level).
     fn alloc_mem(&self, size: usize) -> AllocResult;
 
