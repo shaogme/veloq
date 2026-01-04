@@ -110,7 +110,7 @@ pub union IocpOpPayload {
     pub write: ManuallyDrop<WriteFixed>,
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Connect>,
+    pub connect: ManuallyDrop<Box<Connect>>,
     pub accept: ManuallyDrop<Box<AcceptPayload>>,
     pub send_to: ManuallyDrop<Box<SendToPayload>>,
     pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
@@ -205,15 +205,8 @@ impl_into_iocp_op!(
 impl_into_iocp_op!(Recv, recv, submit_recv, None, drop_recv, get_fd_recv);
 impl_into_iocp_op!(OpSend, send, submit_send, None, drop_send, get_fd_send);
 
-impl_into_iocp_op!(
-    Connect,
-    connect,
-    submit_connect,
-    Some(submit::on_complete_connect),
-    drop_connect,
-    get_fd_connect
-);
 impl_into_iocp_op!(Close, close, submit_close, None, drop_close, get_fd_close);
+
 impl_into_iocp_op!(Fsync, fsync, submit_fsync, None, drop_fsync, get_fd_fsync);
 impl_into_iocp_op!(
     SyncFileRange,
@@ -298,6 +291,29 @@ impl IntoPlatformOp<IocpDriver> for SendTo {
     fn from_platform_op(op: IocpOp) -> Self {
         let op = ManuallyDrop::new(op);
         unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.send_to)).op }
+    }
+}
+
+impl IntoPlatformOp<IocpDriver> for Connect {
+    fn into_platform_op(self) -> IocpOp {
+        const TABLE: OpVTable = OpVTable {
+            submit: submit::submit_connect,
+            on_complete: Some(submit::on_complete_connect),
+            drop: submit::drop_connect,
+            get_fd: submit::get_fd_connect,
+        };
+
+        IocpOp {
+            header: OverlappedEntry::new(0),
+            vtable: &TABLE,
+            payload: IocpOpPayload {
+                connect: ManuallyDrop::new(Box::new(self)),
+            },
+        }
+    }
+    fn from_platform_op(op: IocpOp) -> Self {
+        let op = ManuallyDrop::new(op);
+        unsafe { *ManuallyDrop::into_inner(std::ptr::read(&op.payload.connect)) }
     }
 }
 

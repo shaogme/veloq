@@ -343,7 +343,7 @@ pub(crate) unsafe fn submit_connect(
     ext: &Extensions,
     registered_files: &[Option<HANDLE>],
 ) -> io::Result<SubmissionResult> {
-    let connect_op = unsafe { &mut *op.payload.connect };
+    let connect_op = unsafe { &mut **op.payload.connect };
     let handle = resolve_fd(connect_op.fd, registered_files)?;
     unsafe {
         CreateIoCompletionPort(handle, port, 0, 0);
@@ -426,7 +426,7 @@ pub(crate) unsafe fn on_complete_connect(
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let connect_op = unsafe { &*op.payload.connect };
+    let connect_op = unsafe { &**op.payload.connect };
     if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(

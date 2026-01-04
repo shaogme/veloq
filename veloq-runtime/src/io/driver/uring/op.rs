@@ -66,7 +66,7 @@ pub union UringOpPayload {
     pub write: ManuallyDrop<WriteFixed>,
     pub recv: ManuallyDrop<Recv>,
     pub send: ManuallyDrop<OpSend>,
-    pub connect: ManuallyDrop<Connect>,
+    pub connect: ManuallyDrop<Box<Connect>>,
     pub accept: ManuallyDrop<Box<AcceptPayload>>,
     pub send_to: ManuallyDrop<Box<SendToPayload>>,
     pub recv_from: ManuallyDrop<Box<RecvFromPayload>>,
@@ -163,19 +163,39 @@ impl_into_uring_op!(
     drop_write_fixed,
     get_fd_write_fixed
 );
-impl_into_uring_op!(Recv, recv, make_sqe_recv, on_complete_recv, drop_recv, get_fd_recv);
-impl_into_uring_op!(OpSend, send, make_sqe_send, on_complete_send, drop_send, get_fd_send);
+impl_into_uring_op!(
+    Recv,
+    recv,
+    make_sqe_recv,
+    on_complete_recv,
+    drop_recv,
+    get_fd_recv
+);
+impl_into_uring_op!(
+    OpSend,
+    send,
+    make_sqe_send,
+    on_complete_send,
+    drop_send,
+    get_fd_send
+);
 
 impl_into_uring_op!(
-    Connect,
-    connect,
-    make_sqe_connect,
-    on_complete_connect,
-    drop_connect,
-    get_fd_connect
+    Close,
+    close,
+    make_sqe_close,
+    on_complete_close,
+    drop_close,
+    get_fd_close
 );
-impl_into_uring_op!(Close, close, make_sqe_close, on_complete_close, drop_close, get_fd_close);
-impl_into_uring_op!(Fsync, fsync, make_sqe_fsync, on_complete_fsync, drop_fsync, get_fd_fsync);
+impl_into_uring_op!(
+    Fsync,
+    fsync,
+    make_sqe_fsync,
+    on_complete_fsync,
+    drop_fsync,
+    get_fd_fsync
+);
 impl_into_uring_op!(
     SyncFileRange,
     sync_range,
@@ -246,6 +266,28 @@ impl IntoPlatformOp<UringDriver> for SendTo {
     fn from_platform_op(op: UringOp) -> Self {
         let op = ManuallyDrop::new(op);
         unsafe { ManuallyDrop::into_inner(std::ptr::read(&op.payload.send_to)).op }
+    }
+}
+
+impl IntoPlatformOp<UringDriver> for Connect {
+    fn into_platform_op(self) -> UringOp {
+        const TABLE: OpVTable = OpVTable {
+            make_sqe: submit::make_sqe_connect,
+            on_complete: submit::on_complete_connect,
+            drop: submit::drop_connect,
+            get_fd: submit::get_fd_connect,
+        };
+
+        UringOp {
+            vtable: &TABLE,
+            payload: UringOpPayload {
+                connect: ManuallyDrop::new(Box::new(self)),
+            },
+        }
+    }
+    fn from_platform_op(op: UringOp) -> Self {
+        let op = ManuallyDrop::new(op);
+        unsafe { *ManuallyDrop::into_inner(std::ptr::read(&op.payload.connect)) }
     }
 }
 

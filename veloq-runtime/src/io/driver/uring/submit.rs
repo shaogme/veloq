@@ -63,10 +63,7 @@ macro_rules! impl_lifecycle {
 
 macro_rules! impl_default_completion {
     ($fn_name:ident) => {
-        pub(crate) unsafe fn $fn_name(
-            _op: &mut UringOp,
-            result: i32,
-        ) -> io::Result<usize> {
+        pub(crate) unsafe fn $fn_name(_op: &mut UringOp, result: i32) -> io::Result<usize> {
             if result >= 0 {
                 Ok(result as usize)
             } else {
@@ -83,7 +80,7 @@ macro_rules! impl_default_completion {
 pub(crate) unsafe fn make_sqe_read_fixed(op: &mut UringOp) -> squeue::Entry {
     let read_op = unsafe { &mut *op.payload.read };
     let buf_index = read_op.buf.buf_index();
-    
+
     if buf_index == NO_REGISTRATION_INDEX {
         match read_op.fd {
             IoFd::Raw(fd) => opcode::Read::new(
@@ -231,7 +228,7 @@ impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 // ============================================================================
 
 pub(crate) unsafe fn make_sqe_connect(op: &mut UringOp) -> squeue::Entry {
-    let connect_op = unsafe { &mut *op.payload.connect };
+    let connect_op = unsafe { &mut **op.payload.connect };
     match connect_op.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
             types::Fd(fd as i32),
@@ -273,10 +270,7 @@ pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp) -> squeue::Entry {
     }
 }
 
-pub(crate) unsafe fn on_complete_accept(
-    op: &mut UringOp,
-    result: i32,
-) -> io::Result<usize> {
+pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Result<usize> {
     if result >= 0 {
         let accept_op = unsafe { &mut (**op.payload.accept).op };
         // Try fallback parsing to populate remote_addr early
@@ -315,8 +309,9 @@ pub(crate) unsafe fn make_sqe_send_to(op: &mut UringOp) -> squeue::Entry {
     // msg_control already zeroed
 
     match payload.op.fd {
-        IoFd::Raw(fd) => opcode::SendMsg::new(types::Fd(fd as i32), &payload.msghdr as *const _)
-            .build(),
+        IoFd::Raw(fd) => {
+            opcode::SendMsg::new(types::Fd(fd as i32), &payload.msghdr as *const _).build()
+        }
         IoFd::Fixed(idx) => {
             opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build()
         }
@@ -343,24 +338,21 @@ pub(crate) unsafe fn make_sqe_recv_from(op: &mut UringOp) -> squeue::Entry {
     payload.msghdr.msg_iovlen = 1;
 
     match payload.op.fd {
-        IoFd::Raw(fd) => opcode::RecvMsg::new(types::Fd(fd as i32), &mut payload.msghdr as *mut _)
-            .build(),
+        IoFd::Raw(fd) => {
+            opcode::RecvMsg::new(types::Fd(fd as i32), &mut payload.msghdr as *mut _).build()
+        }
         IoFd::Fixed(idx) => {
             opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build()
         }
     }
 }
 
-pub(crate) unsafe fn on_complete_recv_from(
-    op: &mut UringOp,
-    result: i32,
-) -> io::Result<usize> {
+pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io::Result<usize> {
     if result >= 0 {
         let payload = unsafe { &mut **op.payload.recv_from };
         let len = payload.msghdr.msg_namelen as usize;
-        let addr_bytes = unsafe {
-            std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len)
-        };
+        let addr_bytes =
+            unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
         if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
             payload.op.addr = Some(addr);
         }
@@ -474,11 +466,11 @@ impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
 
 pub(crate) unsafe fn make_sqe_timeout(op: &mut UringOp) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.timeout };
-    
+
     payload.ts[0] = payload.op.duration.as_secs() as i64;
     payload.ts[1] = payload.op.duration.subsec_nanos() as i64;
     let ts_ptr = payload.ts.as_ptr() as *const types::Timespec;
-    
+
     opcode::Timeout::new(ts_ptr).build()
 }
 
