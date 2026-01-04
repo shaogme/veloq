@@ -14,7 +14,47 @@ use crate::runtime::executor::Spawner;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::Task;
 
-// No global thread-local storage anymore.
+thread_local! {
+    static CONTEXT: RefCell<Option<RuntimeContext>> = RefCell::new(None);
+}
+
+/// Sets the thread-local runtime context.
+pub(crate) fn enter(context: RuntimeContext) -> ContextGuard {
+    CONTEXT.with(|ctx| {
+        let prev = ctx.borrow_mut().replace(context);
+        ContextGuard { prev }
+    })
+}
+
+/// Guard that resets the runtime context when dropped.
+pub(crate) struct ContextGuard {
+    prev: Option<RuntimeContext>,
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        CONTEXT.with(|ctx| {
+            *ctx.borrow_mut() = self.prev.take();
+        });
+    }
+}
+
+/// Retrieve the current runtime context.
+///
+/// # Panics
+/// Panics if called outside a runtime context.
+pub fn current() -> RuntimeContext {
+    CONTEXT.with(|ctx| {
+        ctx.borrow()
+            .clone()
+            .expect("Runtime context not set. Are you running inside an executor?")
+    })
+}
+
+/// Try to retrieve the current runtime context.
+pub fn try_current() -> Option<RuntimeContext> {
+    CONTEXT.with(|ctx| ctx.borrow().clone())
+}
 
 /// Context passed to runtime tasks.
 ///
@@ -94,7 +134,6 @@ impl RuntimeContext {
                 .borrow_mut()
                 .register_buffers(&bufs)
                 .expect("Failed to register buffer pool");
-
         }
         #[cfg(not(target_os = "linux"))]
         {

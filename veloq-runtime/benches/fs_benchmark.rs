@@ -28,80 +28,78 @@ fn benchmark_1gb_write(c: &mut Criterion) {
         let pool_for_bench = pool.clone();
 
         b.iter(|| {
+            let pool_inner = pool_for_bench.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
-            exec.block_on(|cx| {
-                let cx = cx.clone();
-                let pool = pool_for_bench.clone();
-                async move {
-                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
-                    let chunk_size = CHUNK_SIZE_ENUM.size();
-                    let file_path = Path::new("bench_1gb_test.tmp");
+            exec.block_on(async move {
+                let cx = veloq_runtime::runtime::context::current();
+                let pool = pool_inner;
 
-                    if file_path.exists() {
-                        let _ = std::fs::remove_file(file_path);
-                    }
+                const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
+                let chunk_size = CHUNK_SIZE_ENUM.size();
+                let file_path = Path::new("bench_1gb_test.tmp");
 
-                    // Use File::create which takes pool and context
-                    let file = File::create(&file_path, pool.as_ref(), &cx)
-                        .await
-                        .expect("Failed to create");
-
-                    let file = Rc::new(file);
-
-                    // Pre-allocate space to avoid metadata lock contention during extended writes
-                    file.fallocate(0, TOTAL_SIZE)
-                        .await
-                        .expect("Fallocate failed");
-
-                    // 限制并发度为 BufferPool 中该尺寸 Chunk 的最大可用数 (32)
-                    let concurrency_limit = 32;
-                    let mut tasks = VecDeque::new();
-                    let mut offset: u64 = 0;
-
-                    while offset < TOTAL_SIZE {
-                        // 1. 尝试分配并在此窗口内提交任务
-                        if tasks.len() < concurrency_limit {
-                            // Use pool directly
-                            if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
-                                let remaining = TOTAL_SIZE - offset;
-                                let write_len =
-                                    std::cmp::min(remaining, chunk_size as u64) as usize;
-
-                                let file_clone = file.clone();
-                                let current_offset = offset;
-
-                                let fut =
-                                    async move { file_clone.write_at(buf, current_offset).await };
-
-                                // Use cx.spawn_local
-                                tasks.push_back(cx.spawn_local(fut));
-                                offset += write_len as u64;
-                                continue;
-                            }
-                        }
-
-                        // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
-                        if let Some(handle) = tasks.pop_front() {
-                            let (res, _buf) = handle.await;
-                            res.expect("Write failed");
-                        } else {
-                            panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
-                        }
-                    }
-
-                    // 3. 等待剩余任务
-                    while let Some(handle) = tasks.pop_front() {
-                        let (res, _buf) = handle.await;
-                        res.expect("Write failed");
-                    }
-
-                    // 使用 verify range 替代 sync_all
-                    file.sync_range(0, TOTAL_SIZE).await.expect("Sync failed");
-
-                    // 清理
-                    drop(file);
+                if file_path.exists() {
                     let _ = std::fs::remove_file(file_path);
                 }
+
+                // Use File::create which takes pool and context
+                let file = File::create(&file_path, pool.as_ref())
+                    .await
+                    .expect("Failed to create");
+
+                let file = Rc::new(file);
+
+                // Pre-allocate space to avoid metadata lock contention during extended writes
+                file.fallocate(0, TOTAL_SIZE)
+                    .await
+                    .expect("Fallocate failed");
+
+                // 限制并发度为 BufferPool 中该尺寸 Chunk 的最大可用数 (32)
+                let concurrency_limit = 32;
+                let mut tasks = VecDeque::new();
+                let mut offset: u64 = 0;
+
+                while offset < TOTAL_SIZE {
+                    // 1. 尝试分配并在此窗口内提交任务
+                    if tasks.len() < concurrency_limit {
+                        // Use pool directly
+                        if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
+                            let remaining = TOTAL_SIZE - offset;
+                            let write_len = std::cmp::min(remaining, chunk_size as u64) as usize;
+
+                            let file_clone = file.clone();
+                            let current_offset = offset;
+
+                            let fut = async move { file_clone.write_at(buf, current_offset).await };
+
+                            // Use cx.spawn_local
+                            tasks.push_back(cx.spawn_local(fut));
+                            offset += write_len as u64;
+                            continue;
+                        }
+                    }
+
+                    // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
+                    if let Some(handle) = tasks.pop_front() {
+                        let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                        res.expect("Write failed");
+                    } else {
+                        panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                    }
+                }
+
+                // 3. 等待剩余任务
+                while let Some(handle) = tasks.pop_front() {
+                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                    res.expect("Write failed");
+                }
+
+                // 使用 verify range 替代 sync_all
+                file.sync_range(0, TOTAL_SIZE).await.expect("Sync failed");
+
+                // 清理
+                drop(file);
+                let _ = std::fs::remove_file(file_path);
             });
         })
     });
@@ -128,101 +126,101 @@ fn benchmark_32_files_write(c: &mut Criterion) {
         let pool_for_bench = pool.clone();
 
         b.iter(|| {
-            exec.block_on(|cx| {
-                let cx = cx.clone();
-                let pool = pool_for_bench.clone();
-                async move {
-                    const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
-                    let chunk_size = CHUNK_SIZE_ENUM.size();
+            let pool_inner = pool_for_bench.clone();
+            // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
+            exec.block_on(async move {
+                let cx = veloq_runtime::runtime::context::current();
+                let pool = pool_inner;
 
-                    let mut files = Vec::with_capacity(FILE_COUNT);
-                    let mut file_paths = Vec::with_capacity(FILE_COUNT);
+                const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
+                let chunk_size = CHUNK_SIZE_ENUM.size();
 
-                    for i in 0..FILE_COUNT {
-                        let path_str = format!("bench_32_{}.tmp", i);
-                        let path = PathBuf::from(path_str);
+                let mut files = Vec::with_capacity(FILE_COUNT);
+                let mut file_paths = Vec::with_capacity(FILE_COUNT);
 
-                        if path.exists() {
-                            let _ = std::fs::remove_file(&path);
-                        }
+                for i in 0..FILE_COUNT {
+                    let path_str = format!("bench_32_{}.tmp", i);
+                    let path = PathBuf::from(path_str);
 
-                        let file = File::create(&path, pool.as_ref(), &cx)
-                            .await
-                            .expect("Failed to create");
-                        let file = Rc::new(file);
-
-                        file.fallocate(0, FILE_SIZE)
-                            .await
-                            .expect("Fallocate failed");
-
-                        files.push(file);
-                        file_paths.push(path);
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
                     }
 
-                    let concurrency_limit = 32;
-                    let mut tasks = VecDeque::new();
-                    let mut offsets = vec![0u64; FILE_COUNT];
-                    let mut current_file_idx = 0;
+                    let file = File::create(&path, pool.as_ref())
+                        .await
+                        .expect("Failed to create");
+                    let file = Rc::new(file);
 
-                    loop {
-                        let all_submitted = offsets.iter().all(|&o| o >= FILE_SIZE);
+                    file.fallocate(0, FILE_SIZE)
+                        .await
+                        .expect("Fallocate failed");
 
-                        if all_submitted && tasks.is_empty() {
-                            break;
-                        }
+                    files.push(file);
+                    file_paths.push(path);
+                }
 
-                        // 1. 尝试分配并在此窗口内提交任务
-                        if tasks.len() < concurrency_limit && !all_submitted {
-                            // Find next file that needs writing
-                            let mut found = None;
-                            for _ in 0..FILE_COUNT {
-                                if offsets[current_file_idx] < FILE_SIZE {
-                                    found = Some(current_file_idx);
-                                    current_file_idx = (current_file_idx + 1) % FILE_COUNT;
-                                    break;
-                                }
+                let concurrency_limit = 32;
+                let mut tasks = VecDeque::new();
+                let mut offsets = vec![0u64; FILE_COUNT];
+                let mut current_file_idx = 0;
+
+                loop {
+                    let all_submitted = offsets.iter().all(|&o| o >= FILE_SIZE);
+
+                    if all_submitted && tasks.is_empty() {
+                        break;
+                    }
+
+                    // 1. 尝试分配并在此窗口内提交任务
+                    if tasks.len() < concurrency_limit && !all_submitted {
+                        // Find next file that needs writing
+                        let mut found = None;
+                        for _ in 0..FILE_COUNT {
+                            if offsets[current_file_idx] < FILE_SIZE {
+                                found = Some(current_file_idx);
                                 current_file_idx = (current_file_idx + 1) % FILE_COUNT;
+                                break;
                             }
-
-                            if let Some(idx) = found {
-                                if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
-                                    let remaining = FILE_SIZE - offsets[idx];
-                                    let write_len =
-                                        std::cmp::min(remaining, chunk_size as u64) as usize;
-
-                                    let file_clone = files[idx].clone();
-                                    let current_offset = offsets[idx];
-
-                                    let fut = async move {
-                                        file_clone.write_at(buf, current_offset).await
-                                    };
-
-                                    tasks.push_back(cx.spawn_local(fut));
-                                    offsets[idx] += write_len as u64;
-                                    continue;
-                                }
-                            }
+                            current_file_idx = (current_file_idx + 1) % FILE_COUNT;
                         }
 
-                        // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
-                        if let Some(handle) = tasks.pop_front() {
-                            let (res, _buf) = handle.await;
-                            res.expect("Write failed");
-                        } else {
-                            if !all_submitted {
-                                panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                        if let Some(idx) = found {
+                            if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
+                                let remaining = FILE_SIZE - offsets[idx];
+                                let write_len =
+                                    std::cmp::min(remaining, chunk_size as u64) as usize;
+
+                                let file_clone = files[idx].clone();
+                                let current_offset = offsets[idx];
+
+                                let fut =
+                                    async move { file_clone.write_at(buf, current_offset).await };
+
+                                tasks.push_back(cx.spawn_local(fut));
+                                offsets[idx] += write_len as u64;
+                                continue;
                             }
                         }
                     }
 
-                    for file in &files {
-                        file.sync_range(0, FILE_SIZE).await.expect("Sync failed");
+                    // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
+                    if let Some(handle) = tasks.pop_front() {
+                        let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                        res.expect("Write failed");
+                    } else {
+                        if !all_submitted {
+                            panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                        }
                     }
+                }
 
-                    drop(files);
-                    for path in file_paths {
-                        let _ = std::fs::remove_file(path);
-                    }
+                for file in &files {
+                    file.sync_range(0, FILE_SIZE).await.expect("Sync failed");
+                }
+
+                drop(files);
+                for path in file_paths {
+                    let _ = std::fs::remove_file(path);
                 }
             });
         })

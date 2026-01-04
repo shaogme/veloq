@@ -268,10 +268,9 @@ impl LocalExecutor {
         handle
     }
 
-    pub fn block_on<F, Fut>(&mut self, func: F) -> Fut::Output
+    pub fn block_on<F>(&mut self, future: F) -> F::Output
     where
-        F: FnOnce(&RuntimeContext) -> Fut,
-        Fut: Future,
+        F: Future,
     {
         let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
 
@@ -281,7 +280,8 @@ impl LocalExecutor {
             spawner,
         );
 
-        let future = func(&context);
+        let _guard = crate::runtime::context::enter(context);
+
         let mut pinned_future = Box::pin(future);
         let main_woken = Rc::new(RefCell::new(true));
         let waker = main_task_waker(main_woken.clone());
@@ -428,7 +428,7 @@ impl Runtime {
             // Wait for main thread to register us before we start
             let _ = ack_rx.recv();
 
-            executor.block_on(move |_cx| future);
+            executor.block_on(future);
         });
 
         let executor_handle = handle_rx.recv().expect("Worker thread failed to start");

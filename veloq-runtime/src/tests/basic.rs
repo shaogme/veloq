@@ -16,16 +16,14 @@ fn test_spawn_local_basic() {
     let result = Rc::new(RefCell::new(0));
     let result_clone = result.clone();
 
-    exec.block_on(|cx| {
-        let cx = cx.clone();
-        async move {
-            let handle = cx.spawn_local(async move {
-                *result_clone.borrow_mut() = 42;
-                "done"
-            });
+    exec.block_on(async move {
+        let cx = crate::runtime::context::current();
+        let handle = cx.spawn_local(async move {
+            *result_clone.borrow_mut() = 42;
+            "done"
+        });
 
-            assert_eq!(handle.await, "done");
-        }
+        assert_eq!(handle.await, "done");
     });
 
     assert_eq!(*result.borrow(), 42);
@@ -39,17 +37,15 @@ fn test_spawn_local_not_send() {
     let data = Rc::new(vec![1, 2, 3]);
     let data_clone = data.clone();
 
-    exec.block_on(|cx| {
-        let cx = cx.clone();
-        async move {
-            // This would fail to compile with spawn()
-            let handle = cx.spawn_local(async move {
-                assert_eq!(data_clone.len(), 3);
-                data_clone[0] + data_clone[1] + data_clone[2]
-            });
+    exec.block_on(async move {
+        let cx = crate::runtime::context::current();
+        // This would fail to compile with spawn()
+        let handle = cx.spawn_local(async move {
+            assert_eq!(data_clone.len(), 3);
+            data_clone[0] + data_clone[1] + data_clone[2]
+        });
 
-            assert_eq!(handle.await, 6);
-        }
+        assert_eq!(handle.await, 6);
     });
 }
 
@@ -60,22 +56,20 @@ fn test_nested_spawn_local() {
     let counter = Rc::new(RefCell::new(0));
     let c1 = counter.clone();
 
-    exec.block_on(|cx| {
-        let cx = cx.clone();
-        async move {
-            let cx2 = cx.clone();
-            let h1 = cx.spawn_local(async move {
-                *c1.borrow_mut() += 1;
-                let c2 = c1.clone();
-                let cx3 = cx2.clone(); // Capture cx for inner task
+    exec.block_on(async move {
+        let cx = crate::runtime::context::current();
+        let cx2 = cx.clone();
+        let h1 = cx.spawn_local(async move {
+            *c1.borrow_mut() += 1;
+            let c2 = c1.clone();
+            let cx3 = cx2.clone(); // Capture cx for inner task
 
-                let h2 = cx3.spawn_local(async move {
-                    *c2.borrow_mut() += 10;
-                });
-                h2.await;
+            let h2 = cx3.spawn_local(async move {
+                *c2.borrow_mut() += 10;
             });
-            h1.await;
-        }
+            h2.await;
+        });
+        h1.await;
     });
 
     assert_eq!(*counter.borrow(), 11);

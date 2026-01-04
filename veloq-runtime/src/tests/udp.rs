@@ -25,20 +25,18 @@ fn alloc_buf(pool: &HybridPool, size: BufferSize) -> FixedBuf {
 fn test_udp_bind() {
     let mut exec = LocalExecutor::default();
 
-    exec.block_on(|cx| {
-        let cx = cx.clone();
-        async move {
-            let driver = cx.driver();
-            let socket =
-                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind UDP socket");
+    exec.block_on(async move {
+        let cx = crate::runtime::context::current();
+        let driver = cx.driver();
+        let socket =
+            UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind UDP socket");
 
-            let addr = socket.local_addr().expect("Failed to get local address");
+        let addr = socket.local_addr().expect("Failed to get local address");
 
-            assert_eq!(addr.ip().to_string(), "127.0.0.1");
-            assert_ne!(addr.port(), 0);
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_ne!(addr.port(), 0);
 
-            println!("UDP socket bound to: {}", addr);
-        }
+        println!("UDP socket bound to: {}", addr);
     });
 }
 
@@ -53,48 +51,47 @@ fn test_udp_send_recv() {
 
         let pool_clone = pool.clone();
 
-        exec.block_on(|cx| {
-            let cx = cx.clone();
+        exec.block_on(async move {
+            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
-            async move {
-                let driver = cx.driver();
 
-                let socket1 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 1");
-                let socket2 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 2");
+            let driver = cx.driver();
 
-                let addr1 = socket1.local_addr().expect("Failed to get addr1");
-                let addr2 = socket2.local_addr().expect("Failed to get addr2");
-                println!("Socket 1 bound to: {}", addr1);
-                println!("Socket 2 bound to: {}", addr2);
+            let socket1 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
+            let socket2 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
 
-                let socket1_rc = Rc::new(socket1);
-                let socket2_rc = Rc::new(socket2);
-                let socket1_clone = socket1_rc.clone();
-                let pool_clone = pool.clone();
+            let addr1 = socket1.local_addr().expect("Failed to get addr1");
+            let addr2 = socket2.local_addr().expect("Failed to get addr2");
+            println!("Socket 1 bound to: {}", addr1);
+            println!("Socket 2 bound to: {}", addr2);
 
-                // Receiver task: socket1 waits for data
-                let handler = cx.spawn_local(async move {
-                    let buf = alloc_buf(&pool_clone, size);
-                    // buf.set_len(buf.capacity());
-                    let (result, _buf) = socket1_clone.recv_from(buf).await;
-                    let (bytes_read, from_addr) = result.expect("recv_from failed");
-                    println!("Socket 1 received {} bytes from {}", bytes_read, from_addr);
-                    assert_eq!(from_addr, addr2);
-                });
+            let socket1_rc = Rc::new(socket1);
+            let socket2_rc = Rc::new(socket2);
+            let socket1_clone = socket1_rc.clone();
+            let pool_clone = pool.clone();
 
-                // Sender: socket2 sends data to socket1
-                let mut send_buf = alloc_buf(&pool, size);
-                let test_data = b"Hello, UDP!";
-                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+            // Receiver task: socket1 waits for data
+            let handler = cx.spawn_local(async move {
+                let buf = alloc_buf(&pool_clone, size);
+                // buf.set_len(buf.capacity());
+                let (result, _buf) = socket1_clone.recv_from(buf).await;
+                let (bytes_read, from_addr) = result.expect("recv_from failed");
+                println!("Socket 1 received {} bytes from {}", bytes_read, from_addr);
+                assert_eq!(from_addr, addr2);
+            });
 
-                let (result, _) = socket2_rc.send_to(send_buf, addr1).await;
-                let bytes_sent = result.expect("send_to failed");
-                println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
+            // Sender: socket2 sends data to socket1
+            let mut send_buf = alloc_buf(&pool, size);
+            let test_data = b"Hello, UDP!";
+            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
 
-                handler.await;
-            }
+            let (result, _) = socket2_rc.send_to(send_buf, addr1).await;
+            let bytes_sent = result.expect("send_to failed");
+            println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
+
+            handler.await;
         });
     }
 }
@@ -110,72 +107,70 @@ fn test_udp_echo() {
 
         let pool_clone = pool.clone();
 
-        exec.block_on(|cx| {
-            let cx = cx.clone();
+        exec.block_on(async move {
+            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            async move {
-                let driver = cx.driver();
-                // Create server and client sockets
-                let server = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind server socket");
-                let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind client socket");
+            let driver = cx.driver();
+            // Create server and client sockets
+            let server = UdpSocket::bind("127.0.0.1:0", driver.clone())
+                .expect("Failed to bind server socket");
+            let client = UdpSocket::bind("127.0.0.1:0", driver.clone())
+                .expect("Failed to bind client socket");
 
-                let server_addr = server.local_addr().expect("Failed to get server address");
-                let client_addr = client.local_addr().expect("Failed to get client address");
-                println!("Server bound to: {}", server_addr);
-                println!("Client bound to: {}", client_addr);
+            let server_addr = server.local_addr().expect("Failed to get server address");
+            let client_addr = client.local_addr().expect("Failed to get client address");
+            println!("Server bound to: {}", server_addr);
+            println!("Client bound to: {}", client_addr);
 
-                let server_rc = Rc::new(server);
-                let client_rc = Rc::new(client);
-                let server_clone = server_rc.clone();
-                let pool_server = pool.clone();
+            let server_rc = Rc::new(server);
+            let client_rc = Rc::new(client);
+            let server_clone = server_rc.clone();
+            let pool_server = pool.clone();
 
-                // Server task: receive and echo back
-                let server_h = cx.spawn_local(async move {
-                    // Receive data
-                    let buf = pool_server.alloc(size).unwrap();
-                    let (result, buf) = server_clone.recv_from(buf).await;
-                    let (bytes_read, from_addr) = result.expect("Server recv_from failed");
-                    println!("Server received {} bytes from {}", bytes_read, from_addr);
+            // Server task: receive and echo back
+            let server_h = cx.spawn_local(async move {
+                // Receive data
+                let buf = pool_server.alloc(size).unwrap();
+                let (result, buf) = server_clone.recv_from(buf).await;
+                let (bytes_read, from_addr) = result.expect("Server recv_from failed");
+                println!("Server received {} bytes from {}", bytes_read, from_addr);
 
-                    // Echo back
-                    let mut echo_buf = pool_server.alloc(size).unwrap();
-                    echo_buf.spare_capacity_mut()[..bytes_read as usize]
-                        .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                // Echo back
+                let mut echo_buf = pool_server.alloc(size).unwrap();
+                echo_buf.spare_capacity_mut()[..bytes_read as usize]
+                    .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
 
-                    let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
-                    result.expect("Server send_to failed");
-                    println!("Server echoed data back to {}", from_addr);
-                });
+                let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
+                result.expect("Server send_to failed");
+                println!("Server echoed data back to {}", from_addr);
+            });
 
-                // Client: send data to server
-                let mut send_buf = pool.alloc(size).unwrap();
-                let test_data = b"Echo this message!";
-                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+            // Client: send data to server
+            let mut send_buf = pool.alloc(size).unwrap();
+            let test_data = b"Echo this message!";
+            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
 
-                let (result, _) = client_rc.send_to(send_buf, server_addr).await;
-                let bytes_sent = result.expect("Client send_to failed");
-                println!("Client sent {} bytes", bytes_sent);
+            let (result, _) = client_rc.send_to(send_buf, server_addr).await;
+            let bytes_sent = result.expect("Client send_to failed");
+            println!("Client sent {} bytes", bytes_sent);
 
-                // Receive echo response
-                let recv_buf = pool.alloc(size).unwrap();
-                let (result, recv_buf) = client_rc.recv_from(recv_buf).await;
-                let (bytes_received, from_addr) = result.expect("Client recv_from failed");
+            // Receive echo response
+            let recv_buf = pool.alloc(size).unwrap();
+            let (result, recv_buf) = client_rc.recv_from(recv_buf).await;
+            let (bytes_received, from_addr) = result.expect("Client recv_from failed");
 
-                println!(
-                    "Client received {} bytes from {}",
-                    bytes_received, from_addr
-                );
+            println!(
+                "Client received {} bytes from {}",
+                bytes_received, from_addr
+            );
 
-                // Verify
-                assert_eq!(from_addr, server_addr);
-                assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
-                println!("UDP echo test successful!");
+            // Verify
+            assert_eq!(from_addr, server_addr);
+            assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
+            println!("UDP echo test successful!");
 
-                server_h.await;
-            }
+            server_h.await;
         });
     }
 }
@@ -189,53 +184,51 @@ fn test_udp_multiple_messages() {
         exec.register_buffers(pool.as_ref());
         let pool_clone = pool.clone();
 
-        exec.block_on(|cx| {
-            let cx = cx.clone();
+        exec.block_on(async move {
+            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            async move {
-                let driver = cx.driver();
+            let driver = cx.driver();
 
-                let socket1 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 1");
-                let socket2 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 2");
+            let socket1 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
+            let socket2 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
 
-                let addr1 = socket1.local_addr().expect("Failed to get addr1");
-                let _addr2 = socket2.local_addr().expect("Failed to get addr2");
+            let addr1 = socket1.local_addr().expect("Failed to get addr1");
+            let _addr2 = socket2.local_addr().expect("Failed to get addr2");
 
-                const NUM_MESSAGES: usize = 5;
+            const NUM_MESSAGES: usize = 5;
 
-                let socket1_rc = Rc::new(socket1);
-                let socket2_rc = Rc::new(socket2);
-                let socket1_clone = socket1_rc.clone();
-                let pool_clone = pool.clone();
+            let socket1_rc = Rc::new(socket1);
+            let socket2_rc = Rc::new(socket2);
+            let socket1_clone = socket1_rc.clone();
+            let pool_clone = pool.clone();
 
-                // Receiver task
-                let h_recv = cx.spawn_local(async move {
-                    for i in 0..NUM_MESSAGES {
-                        let buf = alloc_buf(&pool_clone, size);
-                        let (result, _buf) = socket1_clone.recv_from(buf).await;
-                        let (bytes, from) = result.expect("recv_from failed");
-                        println!("Received message {} ({} bytes) from {}", i, bytes, from);
-                    }
-                    println!("Received all {} messages", NUM_MESSAGES);
-                });
-
-                // Sender
+            // Receiver task
+            let h_recv = cx.spawn_local(async move {
                 for i in 0..NUM_MESSAGES {
-                    let mut buf = alloc_buf(&pool, size);
-                    let msg = format!("Message {}", i);
-                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-
-                    let (result, _) = socket2_rc.send_to(buf, addr1).await;
-                    result.expect("send_to failed");
-                    println!("Sent message {}", i);
+                    let buf = alloc_buf(&pool_clone, size);
+                    let (result, _buf) = socket1_clone.recv_from(buf).await;
+                    let (bytes, from) = result.expect("recv_from failed");
+                    println!("Received message {} ({} bytes) from {}", i, bytes, from);
                 }
-                println!("Sent all {} messages", NUM_MESSAGES);
+                println!("Received all {} messages", NUM_MESSAGES);
+            });
 
-                h_recv.await;
+            // Sender
+            for i in 0..NUM_MESSAGES {
+                let mut buf = alloc_buf(&pool, size);
+                let msg = format!("Message {}", i);
+                buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+
+                let (result, _) = socket2_rc.send_to(buf, addr1).await;
+                result.expect("send_to failed");
+                println!("Sent message {}", i);
             }
+            println!("Sent all {} messages", NUM_MESSAGES);
+
+            h_recv.await;
         });
     }
 }
@@ -249,54 +242,52 @@ fn test_udp_large_data() {
         exec.register_buffers(pool.as_ref());
         let pool_clone = pool.clone();
 
-        exec.block_on(|cx| {
-            let cx = cx.clone();
+        exec.block_on(async move {
+            let cx = crate::runtime::context::current();
             let pool = pool_clone.clone();
 
-            async move {
-                let driver = cx.driver();
+            let driver = cx.driver();
 
-                let socket1 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 1");
-                let socket2 = UdpSocket::bind("127.0.0.1:0", driver.clone())
-                    .expect("Failed to bind socket 2");
+            let socket1 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 1");
+            let socket2 =
+                UdpSocket::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind socket 2");
 
-                let addr1 = socket1.local_addr().expect("Failed to get addr1");
+            let addr1 = socket1.local_addr().expect("Failed to get addr1");
 
-                // UDP datagrams are limited, use a reasonable size (less than MTU)
-                const DATA_SIZE: usize = 1024;
+            // UDP datagrams are limited, use a reasonable size (less than MTU)
+            const DATA_SIZE: usize = 1024;
 
-                let socket1_rc = Rc::new(socket1);
-                let socket2_rc = Rc::new(socket2);
-                let socket1_clone = socket1_rc.clone();
-                let pool_clone = pool.clone();
+            let socket1_rc = Rc::new(socket1);
+            let socket2_rc = Rc::new(socket2);
+            let socket1_clone = socket1_rc.clone();
+            let pool_clone = pool.clone();
 
-                // Receiver task
-                let h_recv = cx.spawn_local(async move {
-                    let buf = alloc_buf(&pool_clone, size);
-                    let (result, buf) = socket1_clone.recv_from(buf).await;
-                    let (bytes, _from) = result.expect("recv_from failed");
-                    println!("Received {} bytes", bytes);
+            // Receiver task
+            let h_recv = cx.spawn_local(async move {
+                let buf = alloc_buf(&pool_clone, size);
+                let (result, buf) = socket1_clone.recv_from(buf).await;
+                let (bytes, _from) = result.expect("recv_from failed");
+                println!("Received {} bytes", bytes);
 
-                    // Verify data pattern
-                    for i in 0..DATA_SIZE {
-                        assert_eq!(buf.as_slice()[i], (i % 256) as u8);
-                    }
-                    println!("Data verification successful!");
-                });
-
-                // Sender
-                let mut buf = alloc_buf(&pool, size);
+                // Verify data pattern
                 for i in 0..DATA_SIZE {
-                    buf.spare_capacity_mut()[i] = (i % 256) as u8;
+                    assert_eq!(buf.as_slice()[i], (i % 256) as u8);
                 }
+                println!("Data verification successful!");
+            });
 
-                let (result, _) = socket2_rc.send_to(buf, addr1).await;
-                let bytes = result.expect("send_to failed") as usize;
-                println!("Sent {} bytes", bytes);
-
-                h_recv.await;
+            // Sender
+            let mut buf = alloc_buf(&pool, size);
+            for i in 0..DATA_SIZE {
+                buf.spare_capacity_mut()[i] = (i % 256) as u8;
             }
+
+            let (result, _) = socket2_rc.send_to(buf, addr1).await;
+            let bytes = result.expect("send_to failed") as usize;
+            println!("Sent {} bytes", bytes);
+
+            h_recv.await;
         });
     }
 }
@@ -306,25 +297,23 @@ fn test_udp_large_data() {
 fn test_udp_ipv6() {
     let mut exec = LocalExecutor::default();
 
-    exec.block_on(|cx| {
-        let cx = cx.clone();
-        async move {
-            let driver = cx.driver();
-            let socket_result = UdpSocket::bind("::1:0", driver.clone());
+    exec.block_on(async move {
+        let cx = crate::runtime::context::current();
+        let driver = cx.driver();
+        let socket_result = UdpSocket::bind("::1:0", driver.clone());
 
-            if socket_result.is_err() {
-                println!("IPv6 not available, skipping test");
-                return;
-            }
-
-            let socket = socket_result.unwrap();
-            let addr = socket.local_addr().expect("Failed to get local address");
-
-            assert!(addr.is_ipv6());
-            println!("IPv6 UDP socket bound to: {}", addr);
-
-            drop(socket);
+        if socket_result.is_err() {
+            println!("IPv6 not available, skipping test");
+            return;
         }
+
+        let socket = socket_result.unwrap();
+        let addr = socket.local_addr().expect("Failed to get local address");
+
+        assert!(addr.is_ipv6());
+        println!("IPv6 UDP socket bound to: {}", addr);
+
+        drop(socket);
     });
 }
 

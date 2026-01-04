@@ -81,12 +81,12 @@ impl OpenOptions {
         &self,
         path: impl AsRef<Path>,
         pool: &dyn BufPool,
-        context: &crate::runtime::context::RuntimeContext,
     ) -> std::io::Result<super::file::File> {
         // 1. 根据不同平台生成对应的 Op 参数
         let op = self.build_op(path.as_ref(), pool).await?;
 
-        // 2. 提交给 runtime (显式传递 driver)
+        // 2. 提交给 runtime (隐式获取 driver)
+        let context = crate::runtime::context::current();
         let driver = context.driver();
         let (res, _) = Op::new(op, driver.clone()).await;
 
@@ -120,7 +120,6 @@ impl OpenOptions {
                 ));
             }
         };
-
 
         // Write path + null
         let slice = buf.as_slice_mut();

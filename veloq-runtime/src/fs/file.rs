@@ -2,7 +2,7 @@ use super::open_options::OpenOptions; // Use generic OpenOptions
 use crate::io::buffer::{BufPool, FixedBuf};
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
-use crate::runtime::context::RuntimeContext;
+
 use std::cell::RefCell;
 use std::io;
 use std::path::Path;
@@ -15,27 +15,16 @@ pub struct File {
 }
 
 impl File {
-    pub async fn open(
-        path: impl AsRef<Path>,
-        pool: &dyn BufPool,
-        context: &RuntimeContext,
-    ) -> io::Result<File> {
-        OpenOptions::new()
-            .read(true)
-            .open(path, pool, context)
-            .await
+    pub async fn open(path: impl AsRef<Path>, pool: &dyn BufPool) -> io::Result<File> {
+        OpenOptions::new().read(true).open(path, pool).await
     }
 
-    pub async fn create(
-        path: impl AsRef<Path>,
-        pool: &dyn BufPool,
-        context: &RuntimeContext,
-    ) -> io::Result<File> {
+    pub async fn create(path: impl AsRef<Path>, pool: &dyn BufPool) -> io::Result<File> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path, pool, context)
+            .open(path, pool)
             .await
     }
 

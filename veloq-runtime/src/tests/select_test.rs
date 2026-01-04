@@ -31,7 +31,7 @@ impl Future for PendingFuture {
 #[test]
 fn test_select_basic() {
     let mut exec = LocalExecutor::default();
-    exec.block_on(|_cx| async {
+    exec.block_on(async {
         let res = select! {
             val = ready(1) => { val },
             _ = PendingFuture => { 2 },
@@ -44,7 +44,7 @@ fn test_select_basic() {
 fn test_select_biased() {
     // Both are ready immediately. First one should win.
     let mut exec = LocalExecutor::default();
-    exec.block_on(|_cx| async {
+    exec.block_on(async {
         let res = select! {
             val = ready(10) => { val },
             val2 = ready(20) => { val2 },
@@ -57,7 +57,7 @@ fn test_select_biased() {
 fn test_select_biased_reverse() {
     // Both are ready immediately. First one declared (which is ready(20)) should win.
     let mut exec = LocalExecutor::default();
-    exec.block_on(|_cx| async {
+    exec.block_on(async {
         let res = select! {
             val = ready(20) => { val },
             val2 = ready(10) => { val2 },
@@ -70,7 +70,7 @@ fn test_select_biased_reverse() {
 fn test_select_expression() {
     // Test using complex expressions in select
     let mut exec = LocalExecutor::default();
-    exec.block_on(|_cx| async {
+    exec.block_on(async {
         let res = select! {
             v = async { 5 + 5 } => { v },
             _ = PendingFuture => { 0 }
