@@ -1,3 +1,5 @@
+use crate::io::buffer::BufPoolExt;
+
 use super::{
     AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX, PoolVTable,
 };
@@ -312,12 +314,6 @@ impl Default for HybridPool {
 }
 
 impl BufPool for HybridPool {
-    type BufferSize = BufferSize;
-
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
-        self.alloc(size)
-    }
-
     fn alloc_mem(&self, size: usize) -> AllocResult {
         if let Some((ptr, cap, global_index)) = self.alloc_mem_inner(size) {
             let header_ptr = unsafe { (ptr.as_ptr() as *mut BufferHeader).offset(-1) };
@@ -349,6 +345,15 @@ impl BufPool for HybridPool {
             }
         }
         iovecs
+    }
+}
+
+impl BufPoolExt for HybridPool {
+    type BufferSize = BufferSize;
+
+    #[inline(always)]
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
+        self.alloc(size)
     }
 }
 

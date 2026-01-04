@@ -4,11 +4,11 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use crate::io::buffer::BufPool;
 use crate::io::driver::{Driver, PlatformDriver};
 use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::task::Task;
 
-use crate::io::buffer::BufPool;
 use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
 use std::pin::Pin;
@@ -131,10 +131,54 @@ impl Spawner {
     }
 }
 
-pub struct LocalExecutor<P: BufPool> {
+/// Builder for LocalExecutor.
+/// Allows explicit configuration of the driver and buffer registration.
+pub struct LocalExecutorBuilder {
+    config: crate::config::Config,
+}
+
+impl Default for LocalExecutorBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalExecutorBuilder {
+    pub fn new() -> Self {
+        Self {
+            config: crate::config::Config::default(),
+        }
+    }
+
+    pub fn config(mut self, config: crate::config::Config) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Build the LocalExecutor.
+    /// Buffer pool management is now external to the executor.
+    pub fn build(self) -> LocalExecutor {
+        #[allow(unused_mut)]
+        let mut driver = PlatformDriver::new(&self.config).expect("Failed to create driver");
+
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+
+        LocalExecutor {
+            driver: Rc::new(RefCell::new(driver)),
+            queue,
+            injector: Arc::new(SegQueue::new()),
+            injected_load: Arc::new(AtomicUsize::new(0)),
+            local_load: Arc::new(AtomicUsize::new(0)),
+            registry: None,
+            cached_peers: Vec::new(),
+            local_epoch: 0,
+        }
+    }
+}
+
+pub struct LocalExecutor {
     driver: Rc<RefCell<PlatformDriver>>,
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
-    buffer_pool: Rc<P>,
 
     // Always present components for task injection
     injector: Arc<SegQueue<Job>>,
@@ -149,44 +193,26 @@ pub struct LocalExecutor<P: BufPool> {
     local_epoch: usize,
 }
 
-impl<P: BufPool> LocalExecutor<P> {
+impl LocalExecutor {
     pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
         Rc::downgrade(&self.driver)
     }
 
-    /// Create a new standalone LocalExecutor.
-    pub fn new(pool: P) -> Self {
-        let config = crate::config::Config::default();
-        Self::new_with_config(pool, config)
+    /// Create a new builder for LocalExecutor.
+    pub fn builder() -> LocalExecutorBuilder {
+        LocalExecutorBuilder::new()
     }
 
-    pub fn new_with_config(pool: P, config: crate::config::Config) -> Self {
-        let driver = Rc::new(RefCell::new(
-            PlatformDriver::new(&config).expect("Failed to create driver"),
-        ));
-        let queue = Rc::new(RefCell::new(VecDeque::new()));
-        let buffer_pool = Rc::new(pool);
+    /// Create a new standalone LocalExecutor.
+    /// Note: This will NOT register any buffer pool with the driver on Linux.
+    pub fn new() -> Self {
+        Self::builder().build()
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            let iovecs = buffer_pool.get_registration_buffers();
-            driver
-                .borrow_mut()
-                .register_buffer_pool(&iovecs)
-                .expect("Failed to register buffer pool");
-        }
-
-        Self {
-            driver,
-            queue,
-            buffer_pool,
-            injector: Arc::new(SegQueue::new()),
-            injected_load: Arc::new(AtomicUsize::new(0)),
-            local_load: Arc::new(AtomicUsize::new(0)),
-            registry: None,
-            cached_peers: Vec::new(),
-            local_epoch: 0,
-        }
+    /// Create a new standalone LocalExecutor with config.
+    /// Note: This will NOT register any buffer pool with the driver on Linux.
+    pub fn new_with_config(config: crate::config::Config) -> Self {
+        Self::builder().config(config).build()
     }
 
     /// Attach this executor to a registry.
@@ -202,6 +228,25 @@ impl<P: BufPool> LocalExecutor<P> {
             waker: self.driver.borrow().create_waker(),
             injected_load: self.injected_load.clone(),
             local_load: self.local_load.clone(),
+        }
+    }
+
+    /// Register buffers from a buffer pool with the underlying driver.
+    ///
+    /// This is primarily for io_uring on Linux to register fixed buffers.
+    /// On other platforms, this may be a no-op.
+    pub fn register_buffers(&self, pool: &dyn BufPool) {
+        #[cfg(target_os = "linux")]
+        {
+            let bufs = pool.get_registration_buffers();
+            self.driver
+                .borrow_mut()
+                .register_buffers(&bufs)
+                .expect("Failed to register buffer pool");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pool;
         }
     }
 
@@ -225,7 +270,7 @@ impl<P: BufPool> LocalExecutor<P> {
 
     pub fn block_on<F, Fut>(&mut self, func: F) -> Fut::Output
     where
-        F: FnOnce(&RuntimeContext<P>) -> Fut,
+        F: FnOnce(&RuntimeContext) -> Fut,
         Fut: Future,
     {
         let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
@@ -233,7 +278,6 @@ impl<P: BufPool> LocalExecutor<P> {
         let context = RuntimeContext::new(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
-            Rc::downgrade(&self.buffer_pool),
             spawner,
         );
 
@@ -333,12 +377,13 @@ impl<P: BufPool> LocalExecutor<P> {
     }
 }
 
-impl<P: BufPool + Default> Default for LocalExecutor<P> {
+impl Default for LocalExecutor {
     fn default() -> Self {
-        Self::new(P::default())
+        Self::new()
     }
 }
 
+#[allow(dead_code)]
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
@@ -354,20 +399,28 @@ impl Runtime {
         }
     }
 
-    pub fn spawn_worker<F, Fut, P>(&mut self, future_factory: F)
+    /// Spawn a worker thread with user-provided initialization logic.
+    ///
+    /// The `init_fn` closure is executed in the new thread and is responsible for:
+    /// 1. Creating and configuring a `LocalExecutor` (e.g. registering buffers).
+    /// 2. Creating the main future to run.
+    ///
+    /// This allows full user control over resource management (like buffer pools).
+    pub fn spawn_worker<Init, Fut>(&mut self, init_fn: Init)
     where
-        P: BufPool + Default + 'static,
-        F: FnOnce(RuntimeContext<P>) -> Fut + Send + 'static,
+        Init: FnOnce() -> (LocalExecutor, Fut) + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let registry = self.registry.clone();
-        let config = self.config.clone();
 
         let (handle_tx, handle_rx) = std::sync::mpsc::channel();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
 
         let thread_handle = std::thread::spawn(move || {
-            let mut executor = LocalExecutor::<P>::new_with_config(P::default(), (*config).clone());
+            // User initializes executor and future
+            let (mut executor, future) = init_fn();
+
+            // Runtime attaches registry
             executor = executor.with_registry(registry);
 
             handle_tx.send(executor.handle()).unwrap();
@@ -375,7 +428,7 @@ impl Runtime {
             // Wait for main thread to register us before we start
             let _ = ack_rx.recv();
 
-            executor.block_on(move |cx| future_factory(cx.clone()));
+            executor.block_on(move |_cx| future);
         });
 
         let executor_handle = handle_rx.recv().expect("Worker thread failed to start");

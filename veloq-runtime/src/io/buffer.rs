@@ -38,12 +38,7 @@ pub enum AllocResult {
 }
 
 /// Trait for memory pool implementation allows custom memory management
-pub trait BufPool: Clone + std::fmt::Debug + 'static {
-    type BufferSize: Copy + std::fmt::Debug;
-
-    /// Allocate memory.
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf>;
-
+pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate memory with specific length.
     fn alloc_len(&self, len: usize) -> Option<FixedBuf> {
         match self.alloc_mem(len) {
@@ -67,6 +62,13 @@ pub trait BufPool: Clone + std::fmt::Debug + 'static {
     /// Get all buffers for io_uring registration.
     #[cfg(target_os = "linux")]
     fn get_registration_buffers(&self) -> Vec<libc::iovec>;
+}
+
+pub trait BufPoolExt: BufPool + Clone {
+    type BufferSize: Copy + std::fmt::Debug;
+
+    /// Allocate memory.
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf>;
 }
 
 #[derive(Debug)]

@@ -8,12 +8,11 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::{Rc, Weak};
 
+use crate::io::buffer::BufPool;
 use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::Spawner;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::Task;
-
-use crate::io::buffer::BufPool;
 
 // No global thread-local storage anymore.
 
@@ -22,25 +21,22 @@ use crate::io::buffer::BufPool;
 /// This provides access to the executor's facilities like spawning tasks
 /// and accessing the IO driver.
 #[derive(Clone)]
-pub struct RuntimeContext<P: BufPool> {
+pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-    pub(crate) buffer_pool: Weak<P>,
     pub(crate) spawner: Option<Spawner>,
 }
 
-impl<P: BufPool> RuntimeContext<P> {
+impl RuntimeContext {
     /// Create a new RuntimeContext.
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
-        buffer_pool: Weak<P>,
         spawner: Option<Spawner>,
     ) -> Self {
         Self {
             driver,
             queue,
-            buffer_pool,
             spawner,
         }
     }
@@ -89,9 +85,21 @@ impl<P: BufPool> RuntimeContext<P> {
         self.driver.clone()
     }
 
-    /// Get a weak reference to the current buffer pool.
-    pub fn buffer_pool(&self) -> Weak<P> {
-        self.buffer_pool.clone()
+    /// Register buffers with the underlying driver.
+    pub fn register_buffers(&self, pool: &dyn BufPool) {
+        #[cfg(target_os = "linux")]
+        if let Some(driver) = self.driver.upgrade() {
+            let bufs = pool.get_registration_buffers();
+            driver
+                .borrow_mut()
+                .register_buffers(&bufs)
+                .expect("Failed to register buffer pool");
+
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pool;
+        }
     }
 }
 

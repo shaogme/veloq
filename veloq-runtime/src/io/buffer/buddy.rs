@@ -1,3 +1,5 @@
+use crate::io::buffer::BufPoolExt;
+
 use super::{AllocResult, BufPool, BufferHeader, DeallocParams, FixedBuf, PoolVTable};
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -446,12 +448,6 @@ impl Default for BuddyPool {
 }
 
 impl BufPool for BuddyPool {
-    type BufferSize = BufferSize;
-
-    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
-        self.alloc(size)
-    }
-
     fn alloc_mem(&self, size: usize) -> AllocResult {
         // Warning: This method is low-level. If used by FixedBuf, it expects BufferHeader.
         // But AllocResult uses raw ptr.
@@ -507,6 +503,15 @@ impl BufPool for BuddyPool {
             iov_base: inner.base_ptr as *mut _,
             iov_len: ARENA_SIZE,
         }]
+    }
+}
+
+impl BufPoolExt for BuddyPool {
+    type BufferSize = BufferSize;
+
+    #[inline(always)]
+    fn alloc(&self, size: Self::BufferSize) -> Option<FixedBuf> {
+        self.alloc(size)
     }
 }
 

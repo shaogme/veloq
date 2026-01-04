@@ -21,11 +21,17 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_1gb_concurrent", |b| {
-        let mut exec = LocalExecutor::<BuddyPool>::default();
+        let mut exec = LocalExecutor::default();
+        let pool = Rc::new(BuddyPool::new());
+        exec.register_buffers(pool.as_ref());
+
+        let pool_for_bench = pool.clone();
+
         b.iter(|| {
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(|cx| {
                 let cx = cx.clone();
+                let pool = pool_for_bench.clone();
                 async move {
                     const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
                     let chunk_size = CHUNK_SIZE_ENUM.size();
@@ -35,8 +41,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                         let _ = std::fs::remove_file(file_path);
                     }
 
-                    // Use File::create which takes context
-                    let file = File::create(&file_path, &cx)
+                    // Use File::create which takes pool and context
+                    let file = File::create(&file_path, pool.as_ref(), &cx)
                         .await
                         .expect("Failed to create");
 
@@ -55,10 +61,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     while offset < TOTAL_SIZE {
                         // 1. 尝试分配并在此窗口内提交任务
                         if tasks.len() < concurrency_limit {
-                            // Use cx.buffer_pool()
-                            if let Some(buf) =
-                                cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
-                            {
+                            // Use pool directly
+                            if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
                                 let remaining = TOTAL_SIZE - offset;
                                 let write_len =
                                     std::cmp::min(remaining, chunk_size as u64) as usize;
@@ -117,10 +121,16 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     group.bench_function("write_32_files_concurrent", |b| {
-        let mut exec = LocalExecutor::<BuddyPool>::default();
+        let mut exec = LocalExecutor::default();
+        let pool = Rc::new(BuddyPool::new());
+        exec.register_buffers(pool.as_ref());
+
+        let pool_for_bench = pool.clone();
+
         b.iter(|| {
             exec.block_on(|cx| {
                 let cx = cx.clone();
+                let pool = pool_for_bench.clone();
                 async move {
                     const CHUNK_SIZE_ENUM: BufferSize = BufferSize::Size4M;
                     let chunk_size = CHUNK_SIZE_ENUM.size();
@@ -136,7 +146,9 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             let _ = std::fs::remove_file(&path);
                         }
 
-                        let file = File::create(&path, &cx).await.expect("Failed to create");
+                        let file = File::create(&path, pool.as_ref(), &cx)
+                            .await
+                            .expect("Failed to create");
                         let file = Rc::new(file);
 
                         file.fallocate(0, FILE_SIZE)
@@ -173,9 +185,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             }
 
                             if let Some(idx) = found {
-                                if let Some(buf) =
-                                    cx.buffer_pool().upgrade().unwrap().alloc(CHUNK_SIZE_ENUM)
-                                {
+                                if let Some(buf) = pool.alloc(CHUNK_SIZE_ENUM) {
                                     let remaining = FILE_SIZE - offsets[idx];
                                     let write_len =
                                         std::cmp::min(remaining, chunk_size as u64) as usize;

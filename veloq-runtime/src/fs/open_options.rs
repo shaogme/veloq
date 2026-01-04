@@ -1,5 +1,5 @@
 use crate::io::{
-    buffer::{AllocResult, BufPool, FixedBuf},
+    buffer::BufPool,
     op::{Op, Open},
 };
 use std::path::Path;
@@ -77,13 +77,14 @@ impl OpenOptions {
     }
 
     /// 对外的公共 API：清晰、线性、无平台噪音
-    pub async fn open<P: BufPool>(
+    pub async fn open(
         &self,
         path: impl AsRef<Path>,
-        context: &crate::runtime::context::RuntimeContext<P>,
+        pool: &dyn BufPool,
+        context: &crate::runtime::context::RuntimeContext,
     ) -> std::io::Result<super::file::File> {
         // 1. 根据不同平台生成对应的 Op 参数
-        let op = self.build_op(path.as_ref(), context).await?;
+        let op = self.build_op(path.as_ref(), pool).await?;
 
         // 2. 提交给 runtime (显式传递 driver)
         let driver = context.driver();
@@ -103,38 +104,23 @@ impl OpenOptions {
     // Unix 平台实现
     // ==========================================
     #[cfg(unix)]
-    async fn build_op<P: BufPool>(
-        &self,
-        path: &Path,
-        context: &crate::runtime::context::RuntimeContext<P>,
-    ) -> std::io::Result<Open> {
+    async fn build_op(&self, path: &Path, pool: &dyn BufPool) -> std::io::Result<Open> {
         use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
         // ensure null termination
         let len = path_bytes.len() + 1;
 
-        let pool = context
-            .buffer_pool()
-            .upgrade()
-            .expect("runtime dropped")
-            .as_ref()
-            .clone();
-
-        let mut buf = match pool.alloc_mem(len) {
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index,
-                context: _,
-            } => unsafe { FixedBuf::new(ptr, cap, global_index) },
-            AllocResult::Failed => {
+        let mut buf = match pool.alloc_len(len) {
+            Some(buf) => buf,
+            None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
                     "buf pool exhausted",
                 ));
             }
         };
+
 
         // Write path + null
         let slice = buf.as_slice_mut();
@@ -182,11 +168,7 @@ impl OpenOptions {
     // Windows 平台实现
     // ==========================================
     #[cfg(windows)]
-    async fn build_op<P: BufPool>(
-        &self,
-        path: &Path,
-        context: &crate::runtime::context::RuntimeContext<P>,
-    ) -> std::io::Result<Open> {
+    async fn build_op(&self, path: &Path, pool: &dyn BufPool) -> std::io::Result<Open> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
@@ -199,21 +181,9 @@ impl OpenOptions {
             .collect();
         let len_bytes = path_w.len() * 2;
 
-        let pool = context
-            .buffer_pool()
-            .upgrade()
-            .expect("runtime dropped")
-            .as_ref()
-            .clone();
-
-        let mut buf = match pool.alloc_mem(len_bytes) {
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index,
-                context: _,
-            } => unsafe { FixedBuf::new(ptr, cap, global_index) },
-            AllocResult::Failed => {
+        let mut buf = match pool.alloc_len(len_bytes) {
+            Some(buf) => buf,
+            None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
                     "buf pool exhausted",

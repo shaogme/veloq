@@ -350,7 +350,7 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffer_pool(&mut self, vec: &Vec<libc::iovec>) -> io::Result<()> {
+    fn register_buffers(&mut self, vec: &Vec<libc::iovec>) -> io::Result<()> {
         self.register_buffers(vec)
     }
 

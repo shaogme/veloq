@@ -15,22 +15,27 @@ pub struct File {
 }
 
 impl File {
-    pub async fn open<P: BufPool>(
+    pub async fn open(
         path: impl AsRef<Path>,
-        context: &RuntimeContext<P>,
+        pool: &dyn BufPool,
+        context: &RuntimeContext,
     ) -> io::Result<File> {
-        OpenOptions::new().read(true).open(path, context).await
+        OpenOptions::new()
+            .read(true)
+            .open(path, pool, context)
+            .await
     }
 
-    pub async fn create<P: BufPool>(
+    pub async fn create(
         path: impl AsRef<Path>,
-        context: &RuntimeContext<P>,
+        pool: &dyn BufPool,
+        context: &RuntimeContext,
     ) -> io::Result<File> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path, context)
+            .open(path, pool, context)
             .await
     }
 
@@ -124,10 +129,7 @@ impl File {
 }
 
 impl crate::io::AsyncBufRead for File {
-    async fn read(
-        &self,
-        buf: FixedBuf,
-    ) -> (io::Result<usize>, FixedBuf) {
+    async fn read(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let offset = *self.pos.borrow();
         let (res, buf) = self.read_at(buf, offset).await;
         if let Ok(n) = res {
@@ -138,10 +140,7 @@ impl crate::io::AsyncBufRead for File {
 }
 
 impl crate::io::AsyncBufWrite for File {
-    async fn write(
-        &self,
-        buf: FixedBuf,
-    ) -> (io::Result<usize>, FixedBuf) {
+    async fn write(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
         let offset = *self.pos.borrow();
         let (res, buf) = self.write_at(buf, offset).await;
         if let Ok(n) = res {

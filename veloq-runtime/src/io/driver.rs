@@ -40,7 +40,7 @@ pub trait Driver {
     /// Register a buffer pool with the driver.
     /// This allows the driver to optimize buffer access (e.g. fixed buffers in io_uring).
     #[cfg(target_os = "linux")]
-    fn register_buffer_pool(&mut self, pool: &Vec<libc::iovec>) -> io::Result<()>;
+    fn register_buffers(&mut self, pool: &Vec<libc::iovec>) -> io::Result<()>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.
