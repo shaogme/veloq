@@ -41,5 +41,12 @@ jobs:
       - name: Build
         run: cargo build --verbose
       
-      - name: Run tests
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test --verbose -- --include-ignored
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
         run: cargo test --verbose -- --include-ignored
