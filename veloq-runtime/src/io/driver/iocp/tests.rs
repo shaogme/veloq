@@ -204,7 +204,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Alloc buffer
     let buf = pool
-        .alloc(BufferSize::Size4K)
+        .alloc(BufferSize::Size8K)
         .expect("Failed to alloc buffer");
 
     // Create Recv Op

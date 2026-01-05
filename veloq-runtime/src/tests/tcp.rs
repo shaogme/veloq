@@ -59,7 +59,7 @@ fn test_tcp_connect_with_global_api() {
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
-    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
         let pool = HybridPool::new();
@@ -198,7 +198,7 @@ fn test_tcp_multiple_connections() {
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
-    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
         let pool = HybridPool::new();
         exec.register_buffers(&pool);
@@ -313,7 +313,7 @@ fn test_tcp_connect_refused() {
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
-    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
         let pool = HybridPool::new();
         exec.register_buffers(&pool);
@@ -460,7 +460,7 @@ fn test_multithread_tcp_echo() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let (addr_tx, addr_rx) = mpsc::channel();
         let mut runtime = Runtime::new(crate::config::Config::default());
 

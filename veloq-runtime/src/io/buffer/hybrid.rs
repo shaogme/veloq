@@ -15,16 +15,19 @@ use std::rc::Rc;
 const ALIGNMENT: usize = 4096;
 const PAGE_SIZE: usize = 4096;
 
-const SIZE_4K: usize = 4096;
+const SIZE_8K: usize = 8192;
 const SIZE_16K: usize = 16384;
+const SIZE_32K: usize = 32768;
 const SIZE_64K: usize = 65536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferSize {
-    /// 4KB
-    Size4K,
+    /// 8KB (4KB Payload with 4KB Alignment)
+    Size8K,
     /// 16KB
     Size16K,
+    /// 32KB
+    Size32K,
     /// 64KB
     Size64K,
     /// Custom size
@@ -35,9 +38,10 @@ impl BufferSize {
     #[inline(always)]
     pub fn size(&self) -> usize {
         match self {
-            BufferSize::Size4K => SIZE_4K,
-            BufferSize::Size16K => SIZE_16K,
-            BufferSize::Size64K => SIZE_64K,
+            BufferSize::Size8K => SIZE_8K - ALIGNMENT,
+            BufferSize::Size16K => SIZE_16K - ALIGNMENT,
+            BufferSize::Size32K => SIZE_32K - ALIGNMENT,
+            BufferSize::Size64K => SIZE_64K - ALIGNMENT,
             BufferSize::Custom(size) => *size,
         }
     }
@@ -45,18 +49,21 @@ impl BufferSize {
     #[inline(always)]
     pub fn slab_index(&self) -> Option<usize> {
         match self {
-            BufferSize::Size4K => Some(0),
+            BufferSize::Size8K => Some(0),
             BufferSize::Size16K => Some(1),
-            BufferSize::Size64K => Some(2),
+            BufferSize::Size32K => Some(2),
+            BufferSize::Size64K => Some(3),
             BufferSize::Custom(_) => None,
         }
     }
 
     pub fn best_fit(size: usize) -> Self {
-        if size <= SIZE_4K {
-            BufferSize::Size4K
+        if size <= SIZE_8K {
+            BufferSize::Size8K
         } else if size <= SIZE_16K {
             BufferSize::Size16K
+        } else if size <= SIZE_32K {
+            BufferSize::Size32K
         } else if size <= SIZE_64K {
             BufferSize::Size64K
         } else {
@@ -71,19 +78,24 @@ struct SlabConfig {
     count: usize,
 }
 
-// Define 3 classes of buffer sizes
-// Class 0: 4KB, 1024 count -> 4MB
+// Define 4 classes of buffer sizes
+// Class 0: 8KB, 512 count -> 4MB
 // Class 1: 16KB, 128 count -> 2MB
-// Class 2: 64KB, 32 count -> 2MB
-// Total memory: ~8MB
-const SLABS: [SlabConfig; 3] = [
+// Class 2: 32KB, 64 count -> 2MB
+// Class 3: 64KB, 32 count -> 2MB
+// Total memory: 10MB
+const SLABS: [SlabConfig; 4] = [
     SlabConfig {
-        block_size: SIZE_4K,
-        count: 1024,
+        block_size: SIZE_8K,
+        count: 512,
     },
     SlabConfig {
         block_size: SIZE_16K,
         count: 128,
+    },
+    SlabConfig {
+        block_size: SIZE_32K,
+        count: 64,
     },
     SlabConfig {
         block_size: SIZE_64K,
@@ -156,8 +168,9 @@ impl HybridAllocator {
         if let Some(slab_idx) = best.slab_index() {
             let slab = &mut self.slabs[slab_idx];
 
-            // Ensure the slab block size is actually sufficient (e.g. if best_fit matched but logical logic thinks otherwise)
-            // best_fit returns Size4K for <= 4096.
+            // Ensure the slab block size is actually sufficient
+            // best_fit returns Size8K for <= 8192.
+            // If needed_total is 4136, it fits.
             // If needed_total is 4096, it fits.
             // If needed_total is 4100, best_fit returns Size16K. Fits.
             // So this check is mostly sanity.
@@ -166,7 +179,7 @@ impl HybridAllocator {
                     let block_ptr =
                         unsafe { slab.memory.as_ptr().add(index * slab.config.block_size) };
 
-                    // Encode slab_idx (0-2) and index (0-1024) into usize context
+                    // Encode slab_idx (0-3) and index (0-512) into usize context
                     let context = (slab_idx << 16) | index;
 
                     return Some(RawAlloc {
@@ -379,33 +392,35 @@ mod tests {
     fn test_allocator_basic() {
         let mut allocator = HybridAllocator::new();
         // Check initial free counts
-        assert_eq!(allocator.count_free(0), 1024); // 4K slab
+        assert_eq!(allocator.count_free(0), 512); // 8K slab
         assert_eq!(allocator.count_free(1), 128); // 16K slab
-        assert_eq!(allocator.count_free(2), 32); // 64K slab
+        assert_eq!(allocator.count_free(2), 64); // 32K slab
+        assert_eq!(allocator.count_free(3), 32); // 64K slab
 
-        // Alloc 4K (fits in 4K slab?)
-        // needed_total = 4096 (payload) + 512 (offset) = 4608
-        // best_fit(4608) -> Size16K.
-        // So it takes from slab 1 (16K).
-        let raw = allocator.alloc(4608).unwrap();
-        assert_eq!(raw.cap, SIZE_16K);
-        assert_eq!(raw.context >> 16, 1); // Slab index 1
-        assert_eq!(allocator.count_free(0), 1024);
-        assert_eq!(allocator.count_free(1), 127); // Decremented
+        // Alloc 8K (fits in 8K slab?)
+        // needed_total = 4096 (payload) + 4096 (offset) = 8192
+        // best_fit(8192) -> Size8K.
+        // So it takes from slab 0 (8K).
+        let raw = allocator.alloc(8192).unwrap();
+        assert_eq!(raw.cap, SIZE_8K);
+        assert_eq!(raw.context >> 16, 0); // Slab index 0
+        assert_eq!(allocator.count_free(0), 511);
+        assert_eq!(allocator.count_free(1), 128);
 
         unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context) };
-        assert_eq!(allocator.count_free(1), 128); // Restored
+        assert_eq!(allocator.count_free(0), 512); // Restored
     }
 
     #[test]
     fn test_allocator_small() {
         let mut allocator = HybridAllocator::new();
-        // Request very small size. 100 bytes + 512
-        let raw = allocator.alloc(612).unwrap();
-        // best_fit(612) -> Size4K
-        assert_eq!(raw.cap, SIZE_4K);
+        // Request very small size. 100 bytes + 4096 offset
+        // 4196 needed.
+        let raw = allocator.alloc(4196).unwrap();
+        // best_fit(4196) -> Size8K
+        assert_eq!(raw.cap, SIZE_8K);
         assert_eq!(raw.context >> 16, 0); // Slab 0
-        assert_eq!(allocator.count_free(0), 1023);
+        assert_eq!(allocator.count_free(0), 511);
         unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context) };
     }
 
@@ -425,9 +440,9 @@ mod tests {
     #[test]
     fn test_hybrid_pool_integration() {
         let pool = HybridPool::new();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
-        // As established, Size4K request implies 4096 payload.
-        // 4096+24 = 4120 -> Size16K slab.
+        let buf = pool.alloc(BufferSize::Size8K).unwrap();
+        // Size8K request implies 8192 block. 4096 payload.
+        // 4096 + 4096 = 8192 -> Size8K slab.
         assert!(buf.capacity() >= 4096);
         let idx = buf.buf_index();
         // Should be valid index
@@ -439,10 +454,36 @@ mod tests {
     #[test]
     fn test_hybrid_alloc_clamping() {
         let pool = HybridPool::new();
-        let buf = pool.alloc(BufferSize::Size4K).unwrap();
-        // Since it bumped to 16K slab to fit header, capacity > 4096.
-        // But we expect len to be clamped to 4096.
+        let buf = pool.alloc(BufferSize::Size8K).unwrap();
+        // 8K Block. 4096 alignment. Capacity 4096.
         assert_eq!(buf.len(), 4096);
-        assert!(buf.capacity() > 4096);
+        assert_eq!(buf.capacity(), 4096);
+    }
+
+    #[test]
+    fn test_hybrid_all_sizes() {
+        let pool = HybridPool::new();
+
+        let sizes = [
+            BufferSize::Size8K,
+            BufferSize::Size16K,
+            BufferSize::Size32K,
+            BufferSize::Size64K,
+        ];
+
+        for size in sizes {
+            let buf = pool.alloc(size).unwrap();
+            let min_expected = match size {
+                BufferSize::Size8K => 4096,
+                BufferSize::Size16K => 12288, // 16384 - 4096
+                BufferSize::Size32K => 28672, // 32768 - 4096
+                BufferSize::Size64K => 61440, // 65536 - 4096
+                _ => 0,
+            };
+            assert!(buf.capacity() >= min_expected);
+            // Verify alignment
+            let ptr = buf.as_slice().as_ptr() as usize;
+            assert_eq!(ptr % 4096, 0);
+        }
     }
 }

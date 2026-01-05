@@ -171,6 +171,11 @@ impl FixedBuf {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
     }
 
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
     // Pointer to start of capacity
     #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {

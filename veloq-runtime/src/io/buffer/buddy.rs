@@ -8,8 +8,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 // Buddy System Constants
-const ARENA_SIZE: usize = 16 * 1024 * 1024; // 16MB Total
-const MIN_BLOCK_SIZE: usize = 4096; // 4KB
+const ARENA_SIZE: usize = 32 * 1024 * 1024; // 32MB Total to support higher concurrency with overhead
+const MIN_BLOCK_SIZE: usize = 8192; // 8KB to support 4KB payload with 4KB alignment
 
 // Alignment requirement for Direct I/O.
 // We use 4096 (Page Size) to ensure compatibility with strict Direct I/O requirements.
@@ -24,32 +24,32 @@ const TAG_ORDER_MASK: u8 = 0x7F;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferSize {
-    /// 4KB (Order 0)
-    Size4K = 0,
-    /// 8KB (Order 1)
-    Size8K = 1,
-    /// 16KB (Order 2)
-    Size16K = 2,
-    /// 32KB (Order 3)
-    Size32K = 3,
-    /// 64KB (Order 4)
-    Size64K = 4,
-    /// 128KB (Order 5)
-    Size128K = 5,
-    /// 256KB (Order 6)
-    Size256K = 6,
-    /// 512KB (Order 7)
-    Size512K = 7,
-    /// 1MB (Order 8)
-    Size1M = 8,
-    /// 2MB (Order 9)
-    Size2M = 9,
-    /// 4MB (Order 10)
-    Size4M = 10,
-    /// 8MB (Order 11)
-    Size8M = 11,
-    /// 16MB (Order 12)
-    Size16M = 12,
+    /// 8KB (Order 0) -> 4KB Payload
+    Size8K = 0,
+    /// 16KB (Order 1)
+    Size16K = 1,
+    /// 32KB (Order 2)
+    Size32K = 2,
+    /// 64KB (Order 3)
+    Size64K = 3,
+    /// 128KB (Order 4)
+    Size128K = 4,
+    /// 256KB (Order 5)
+    Size256K = 5,
+    /// 512KB (Order 6)
+    Size512K = 6,
+    /// 1MB (Order 7)
+    Size1M = 7,
+    /// 2MB (Order 8)
+    Size2M = 8,
+    /// 4MB (Order 9)
+    Size4M = 9,
+    /// 8MB (Order 10)
+    Size8M = 10,
+    /// 16MB (Order 11)
+    Size16M = 11,
+    /// 32MB (Order 12)
+    Size32M = 12,
 }
 
 impl BufferSize {
@@ -65,19 +65,19 @@ impl BufferSize {
 
     pub fn from_order(order: usize) -> Option<Self> {
         match order {
-            0 => Some(BufferSize::Size4K),
-            1 => Some(BufferSize::Size8K),
-            2 => Some(BufferSize::Size16K),
-            3 => Some(BufferSize::Size32K),
-            4 => Some(BufferSize::Size64K),
-            5 => Some(BufferSize::Size128K),
-            6 => Some(BufferSize::Size256K),
-            7 => Some(BufferSize::Size512K),
-            8 => Some(BufferSize::Size1M),
-            9 => Some(BufferSize::Size2M),
-            10 => Some(BufferSize::Size4M),
-            11 => Some(BufferSize::Size8M),
-            12 => Some(BufferSize::Size16M),
+            0 => Some(BufferSize::Size8K),
+            1 => Some(BufferSize::Size16K),
+            2 => Some(BufferSize::Size32K),
+            3 => Some(BufferSize::Size64K),
+            4 => Some(BufferSize::Size128K),
+            5 => Some(BufferSize::Size256K),
+            6 => Some(BufferSize::Size512K),
+            7 => Some(BufferSize::Size1M),
+            8 => Some(BufferSize::Size2M),
+            9 => Some(BufferSize::Size4M),
+            10 => Some(BufferSize::Size8M),
+            11 => Some(BufferSize::Size16M),
+            12 => Some(BufferSize::Size32M),
             _ => None,
         }
     }
@@ -87,7 +87,7 @@ impl BufferSize {
             return None;
         }
         if size <= MIN_BLOCK_SIZE {
-            return Some(BufferSize::Size4K);
+            return Some(BufferSize::Size8K);
         }
 
         let mut s = MIN_BLOCK_SIZE;
@@ -535,15 +535,15 @@ mod tests {
         // 初始状态：1个 MaxOrder 块
         assert_eq!(allocator.count_free(NUM_ORDERS - 1), 1);
 
-        // 分配 4KB
-        let (ptr1, size1) = allocator.alloc(BufferSize::Size4K).unwrap();
-        assert_eq!(size1, BufferSize::Size4K);
+        // 分配 8KB (Order 0)
+        let (ptr1, size1) = allocator.alloc(BufferSize::Size8K).unwrap();
+        assert_eq!(size1, BufferSize::Size8K);
 
         // 分裂路径验证
-        // 16M -> ... -> 8K -> 4K(Allocated) + 4K(Free)
-        // 所有的中间级 (8K, 16K ... 8M) 都应该各有一个 Free 块
-        assert_eq!(allocator.count_free(0), 1); // 剩下一个 4K
-        assert_eq!(allocator.count_free(1), 1); // 剩下一个 8K
+        // 16M -> ... -> 16K -> 8K(Allocated) + 8K(Free)
+        // 所有的中间级 (16K ... 16M) 都应该各有一个 Free 块
+        assert_eq!(allocator.count_free(0), 1); // 剩下一个 8K
+        assert_eq!(allocator.count_free(1), 1); // 剩下一个 16K
         assert_eq!(allocator.count_free(NUM_ORDERS - 1), 0); // MaxOrder 没了
 
         unsafe { allocator.dealloc(ptr1, size1) };
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn test_pool_integration() {
         let pool = BuddyPool::new();
-        // With 4096 alignment, a 4K block has 0 capacity (4096 - 4096).
+        // With 4096 alignment, a 8K block has 4096 capacity.
         // Minimal usable block is 8K.
         let buf = pool.alloc(BufferSize::Size8K).unwrap();
         // Capacity should be 8192 - 4096 = 4096

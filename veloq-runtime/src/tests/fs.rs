@@ -8,7 +8,7 @@ use std::path::Path;
 fn test_file_integrity() {
     use crate::io::buffer::hybrid::BufferSize;
 
-    for size in [BufferSize::Size4K, BufferSize::Size16K, BufferSize::Size64K] {
+    for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
         let pool = HybridPool::new();
