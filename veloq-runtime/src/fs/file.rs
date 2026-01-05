@@ -10,6 +10,17 @@ use std::path::Path;
 use std::pin::Pin;
 use std::rc::Weak;
 
+#[cfg(not(unix))]
+macro_rules! ignore {
+    ($($x:expr),* $(,)?) => {
+        {
+            $(
+                let _ = $x;
+            )*
+        }
+    };
+}
+
 pub struct File {
     pub(crate) fd: IoFd,
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
@@ -40,7 +51,6 @@ impl<'a> SyncRangeBuilder<'a> {
         }
     }
 
-    #[allow(unused_mut, unused_variables)]
     pub fn wait_before(mut self, wait: bool) -> Self {
         #[cfg(unix)]
         if wait {
@@ -48,10 +58,11 @@ impl<'a> SyncRangeBuilder<'a> {
         } else {
             self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_BEFORE as u32);
         }
+        #[cfg(not(unix))]
+        ignore!(wait, &mut self);
         self
     }
 
-    #[allow(unused_mut, unused_variables)]
     pub fn write(mut self, write: bool) -> Self {
         #[cfg(unix)]
         if write {
@@ -59,10 +70,11 @@ impl<'a> SyncRangeBuilder<'a> {
         } else {
             self.flags &= !(libc::SYNC_FILE_RANGE_WRITE as u32);
         }
+        #[cfg(not(unix))]
+        ignore!(write, &mut self);
         self
     }
 
-    #[allow(unused_mut, unused_variables)]
     pub fn wait_after(mut self, wait: bool) -> Self {
         #[cfg(unix)]
         if wait {
@@ -70,6 +82,8 @@ impl<'a> SyncRangeBuilder<'a> {
         } else {
             self.flags &= !(libc::SYNC_FILE_RANGE_WAIT_AFTER as u32);
         }
+        #[cfg(not(unix))]
+        ignore!(wait, &mut self);
         self
     }
 }
