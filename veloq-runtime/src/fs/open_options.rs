@@ -4,6 +4,18 @@ use crate::io::{
 };
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferingMode {
+    /// Use system default buffering (Page Cache).
+    Buffered,
+    /// Bypass system cache (e.g., O_DIRECT on Unix, FILE_FLAG_NO_BUFFERING on Windows).
+    /// Requires buffer alignment (handled by BufPool).
+    Direct,
+    /// Bypass system cache and force write-through to physical storage
+    /// (e.g., O_DIRECT | O_DSYNC on Unix, FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH on Windows).
+    DirectSync,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     read: bool,
@@ -14,6 +26,7 @@ pub struct OpenOptions {
     create_new: bool,
     mode: u32,
     custom_flags: i32,
+    buffering_mode: BufferingMode,
 }
 
 impl Default for OpenOptions {
@@ -33,7 +46,13 @@ impl OpenOptions {
             create_new: false,
             mode: 0o666,
             custom_flags: 0,
+            buffering_mode: BufferingMode::Buffered,
         }
+    }
+
+    pub fn buffering(&mut self, mode: BufferingMode) -> &mut Self {
+        self.buffering_mode = mode;
+        self
     }
 
     pub fn read(&mut self, read: bool) -> &mut Self {
@@ -154,6 +173,18 @@ impl OpenOptions {
         if self.truncate {
             flags |= libc::O_TRUNC;
         }
+
+        match self.buffering_mode {
+            BufferingMode::Buffered => {}
+            BufferingMode::Direct => {
+                flags |= libc::O_DIRECT;
+            }
+            BufferingMode::DirectSync => {
+                // Linux: O_DIRECT for bypass cache, O_DSYNC for data integrity
+                flags |= libc::O_DIRECT | libc::O_DSYNC;
+            }
+        }
+
         flags |= self.custom_flags;
 
         Ok(Open {
@@ -171,6 +202,11 @@ impl OpenOptions {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+
+        // Custom bit-packing constants for passing flags via 'mode' field
+        // These must match the decoding logic in blocking.rs
+        const FAKE_NO_BUFFERING: u32 = 1 << 8;
+        const FAKE_WRITE_THROUGH: u32 = 1 << 9;
 
         // 1. Process Path (UTF-16 + Null)
         let path_w: Vec<u16> = path
@@ -227,13 +263,23 @@ impl OpenOptions {
         const OPEN_ALWAYS: u32 = 4;
         const TRUNCATE_EXISTING: u32 = 5;
 
-        let disposition = match (self.create, self.create_new, self.truncate) {
+        let mut disposition = match (self.create, self.create_new, self.truncate) {
             (_, true, _) => CREATE_NEW,
             (true, _, true) => CREATE_ALWAYS,
             (true, _, false) => OPEN_ALWAYS,
             (false, _, true) => TRUNCATE_EXISTING,
             (false, _, false) => OPEN_EXISTING,
         };
+
+        match self.buffering_mode {
+            BufferingMode::Buffered => {}
+            BufferingMode::Direct => {
+                disposition |= FAKE_NO_BUFFERING;
+            }
+            BufferingMode::DirectSync => {
+                disposition |= FAKE_NO_BUFFERING | FAKE_WRITE_THROUGH;
+            }
+        }
 
         Ok(Open {
             path: buf,

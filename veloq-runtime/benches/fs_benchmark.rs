@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
-use veloq_runtime::fs::File;
+use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::io::buffer::BuddyPool;
 use veloq_runtime::io::buffer::buddy::BufferSize;
 
@@ -43,7 +43,12 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 }
 
                 // Use File::create which takes pool and context
-                let file = File::create(&file_path, pool.as_ref())
+                let file = File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .buffering(BufferingMode::DirectSync)
+                    .open(&file_path, pool.as_ref())
                     .await
                     .expect("Failed to create");
 
@@ -146,7 +151,12 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         let _ = std::fs::remove_file(&path);
                     }
 
-                    let file = File::create(&path, pool.as_ref())
+                    let file = File::options()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .buffering(BufferingMode::DirectSync)
+                        .open(&path, pool.as_ref())
                         .await
                         .expect("Failed to create");
                     let file = Rc::new(file);

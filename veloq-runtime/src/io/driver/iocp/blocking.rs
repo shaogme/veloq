@@ -57,14 +57,30 @@ impl BlockingTask {
                 mode,
                 completion,
             } => {
+                let real_disposition = mode & 0xFF;
+                // Bits 8, 9 are used for Buffering Mode flags
+                const FAKE_NO_BUFFERING: u32 = 1 << 8;
+                const FAKE_WRITE_THROUGH: u32 = 1 << 9;
+
+                let mut flags_and_attributes = FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL;
+
+                if (mode & FAKE_NO_BUFFERING) != 0 {
+                    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+                    flags_and_attributes |= FILE_FLAG_NO_BUFFERING;
+                }
+                if (mode & FAKE_WRITE_THROUGH) != 0 {
+                    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH;
+                    flags_and_attributes |= FILE_FLAG_WRITE_THROUGH;
+                }
+
                 let handle = unsafe {
                     CreateFileW(
                         path_ptr as *const u16,
                         flags as u32,
                         0,
                         std::ptr::null(),
-                        mode,
-                        FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
+                        real_disposition,
+                        flags_and_attributes,
                         std::ptr::null_mut(),
                     )
                 };
@@ -298,10 +314,12 @@ impl ThreadPool {
                     state.idle_workers.fetch_sub(1, Ordering::SeqCst);
                     queue = guard;
 
-                    if result.timed_out() && queue.is_empty()
-                        && state.active_workers.load(Ordering::SeqCst) > core_threads {
-                            return;
-                        }
+                    if result.timed_out()
+                        && queue.is_empty()
+                        && state.active_workers.load(Ordering::SeqCst) > core_threads
+                    {
+                        return;
+                    }
                 }
                 queue.pop_front()
             };
