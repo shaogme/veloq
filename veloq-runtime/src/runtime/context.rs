@@ -8,14 +8,17 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::{Rc, Weak};
 
-use crate::io::buffer::BufPool;
+use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::Spawner;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::Task;
 
+use std::cell::OnceCell;
+
 thread_local! {
     static CONTEXT: RefCell<Option<RuntimeContext>> = RefCell::new(None);
+    static CURRENT_POOL: OnceCell<AnyBufPool> = OnceCell::new();
 }
 
 /// Sets the thread-local runtime context.
@@ -44,11 +47,7 @@ impl Drop for ContextGuard {
 /// # Panics
 /// Panics if called outside a runtime context.
 pub fn current() -> RuntimeContext {
-    CONTEXT.with(|ctx| {
-        ctx.borrow()
-            .clone()
-            .expect("Runtime context not set. Are you running inside an executor?")
-    })
+    try_current().expect("Runtime context not set. Are you running inside an executor?")
 }
 
 /// Try to retrieve the current runtime context.
@@ -170,4 +169,38 @@ impl Future for YieldNow {
             std::task::Poll::Pending
         }
     }
+}
+
+/// Bind a buffer pool to the current thread.
+/// This should be called once per thread, usually during executor initialization.
+///
+/// # Panics
+/// Panics if a pool is already bound to this thread.
+pub fn bind_pool<P: BufPool + Clone + 'static>(pool: P) {
+    try_bind_pool(pool)
+        .ok()
+        .expect("Buffer pool already bound for this thread");
+}
+
+/// Try to bind a buffer pool to the current thread.
+/// Returns error if already bound.
+pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), ()> {
+    let any_pool = AnyBufPool::new(pool);
+    // 1. Set TLS
+    CURRENT_POOL.with(|cell| cell.set(any_pool).map_err(|_| ()))?;
+
+    // 2. Try Auto-Register (Active Hook)
+    // If we are already running inside a RuntimeContext, register immediately.
+    if let Some(ctx) = try_current() {
+        if let Some(pool) = current_pool() {
+            ctx.register_buffers(&pool);
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the current thread's buffer pool.
+pub fn current_pool() -> Option<AnyBufPool> {
+    CURRENT_POOL.with(|cell| cell.get().cloned())
 }

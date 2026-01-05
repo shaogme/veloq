@@ -96,13 +96,16 @@ impl OpenOptions {
     }
 
     /// 对外的公共 API：清晰、线性、无平台噪音
-    pub async fn open(
-        &self,
-        path: impl AsRef<Path>,
-        pool: &dyn BufPool,
-    ) -> std::io::Result<super::file::File> {
+    pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
+        let pool = crate::runtime::context::current_pool().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No buffer pool bound to current thread",
+            )
+        })?;
+
         // 1. 根据不同平台生成对应的 Op 参数
-        let op = self.build_op(path.as_ref(), pool).await?;
+        let op = self.build_op(path.as_ref(), &pool).await?;
 
         // 2. 提交给 runtime (隐式获取 driver)
         let context = crate::runtime::context::current();

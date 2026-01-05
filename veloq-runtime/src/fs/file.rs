@@ -1,5 +1,5 @@
 use super::open_options::OpenOptions; // Use generic OpenOptions
-use crate::io::buffer::{BufPool, FixedBuf};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::PlatformDriver;
 use crate::io::op::{Fallocate, Fsync, IoFd, Op, ReadFixed, SyncFileRange, WriteFixed};
 
@@ -13,11 +13,9 @@ use std::rc::Weak;
 #[cfg(not(unix))]
 macro_rules! ignore {
     ($($x:expr),* $(,)?) => {
-        {
-            $(
-                let _ = $x;
-            )*
-        }
+        $(
+            let _ = $x;
+        )*
     };
 }
 
@@ -108,16 +106,16 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
 }
 
 impl File {
-    pub async fn open(path: impl AsRef<Path>, pool: &dyn BufPool) -> io::Result<File> {
-        OpenOptions::new().read(true).open(path, pool).await
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+        OpenOptions::new().read(true).open(path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>, pool: &dyn BufPool) -> io::Result<File> {
+    pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path, pool)
+            .open(path)
             .await
     }
 

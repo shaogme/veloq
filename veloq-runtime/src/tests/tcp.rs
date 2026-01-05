@@ -59,11 +59,11 @@ fn test_tcp_connect_with_global_api() {
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
+    let pool = HybridPool::new().unwrap();
+    crate::runtime::context::bind_pool(pool.clone());
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         println!("Testing with BufferSize: {:?}", size);
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new().unwrap();
-        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -198,10 +198,10 @@ fn test_tcp_multiple_connections() {
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
+    let pool = HybridPool::new().unwrap();
+    crate::runtime::context::bind_pool(pool.clone());
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new().unwrap();
-        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -313,10 +313,10 @@ fn test_tcp_connect_refused() {
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
+    let pool = HybridPool::new().unwrap();
+    crate::runtime::context::bind_pool(pool.clone());
     for size in [BufferSize::Size8K, BufferSize::Size16K, BufferSize::Size64K] {
         let mut exec = LocalExecutor::default();
-        let pool = HybridPool::new().unwrap();
-        exec.register_buffers(&pool);
         let driver = exec.driver_handle();
 
         let listener =
@@ -416,7 +416,7 @@ fn test_multithread_tcp_connections() {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
             let pool = HybridPool::new().unwrap();
-            exec.register_buffers(&pool);
+            crate::runtime::context::bind_pool(pool.clone());
 
             let listener =
                 TcpListener::bind("127.0.0.1:0", driver.clone()).expect("Failed to bind listener");
@@ -469,7 +469,7 @@ fn test_multithread_tcp_echo() {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
             let pool = HybridPool::new().unwrap();
-            exec.register_buffers(&pool);
+            crate::runtime::context::bind_pool(pool.clone());
 
             let fut = async move {
                 let listener = TcpListener::bind("127.0.0.1:0", driver.clone())
@@ -505,7 +505,7 @@ fn test_multithread_tcp_echo() {
             let exec = LocalExecutor::new();
             let driver = exec.driver_handle();
             let pool = HybridPool::new().unwrap();
-            exec.register_buffers(&pool);
+            crate::runtime::context::bind_pool(pool.clone());
 
             let fut = async move {
                 // Wait for server address

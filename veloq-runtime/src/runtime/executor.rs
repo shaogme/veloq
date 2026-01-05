@@ -282,6 +282,12 @@ impl LocalExecutor {
 
         let _guard = crate::runtime::context::enter(context);
 
+        // Auto-Register (Passive Scan)
+        // If a pool was bound before block_on (e.g. in thread init), register it now.
+        if let Some(pool) = crate::runtime::context::current_pool() {
+            crate::runtime::context::current().register_buffers(&pool);
+        }
+
         let mut pinned_future = Box::pin(future);
         let main_woken = Rc::new(RefCell::new(true));
         let waker = main_task_waker(main_woken.clone());

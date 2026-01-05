@@ -284,3 +284,151 @@ impl Drop for AlignedMemory {
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
+
+// ============================================================================
+// Type-Erased Box<dyn BufPool> Replacement (Thread-Local Friendly)
+// ============================================================================
+
+/// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
+pub struct BufPoolVTable {
+    pub alloc_mem: unsafe fn(*const (), usize) -> AllocResult,
+    #[cfg(target_os = "linux")]
+    pub get_registration_buffers: unsafe fn(*const ()) -> Vec<libc::iovec>,
+    pub vtable: unsafe fn(*const ()) -> &'static PoolVTable,
+    pub pool_data: unsafe fn(*const ()) -> NonNull<()>,
+    pub clone: unsafe fn(*const ()) -> *mut (),
+    pub drop: unsafe fn(*mut ()),
+    pub fmt: unsafe fn(*const (), &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+}
+
+/// 类型擦除的 Pool 句柄，可存储在 TLS 中。
+/// 类似于 `Box<dyn BufPool + Clone>`，但使用手写 VTable 避免了 dyn 限制和对象安全问题。
+pub struct AnyBufPool {
+    data: *mut (),
+    vtable: &'static BufPoolVTable,
+}
+
+impl AnyBufPool {
+    /// 从任意实现了 `BufPool + Clone` 的类型构造 `AnyBufPool`。
+    pub fn new<P: BufPool + Clone + 'static>(pool: P) -> Self {
+        unsafe fn alloc_mem_shim<P: BufPool>(ptr: *const (), size: usize) -> AllocResult {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.alloc_mem(size)
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe fn get_registration_buffers_shim<P: BufPool>(ptr: *const ()) -> Vec<libc::iovec> {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.get_registration_buffers()
+            }
+        }
+
+        unsafe fn vtable_shim<P: BufPool>(ptr: *const ()) -> &'static PoolVTable {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.vtable()
+            }
+        }
+
+        unsafe fn pool_data_shim<P: BufPool>(ptr: *const ()) -> NonNull<()> {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                pool.pool_data()
+            }
+        }
+
+        unsafe fn clone_shim<P: BufPool + Clone>(ptr: *const ()) -> *mut () {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                let new_pool = Box::new(pool.clone());
+                Box::into_raw(new_pool) as *mut ()
+            }
+        }
+
+        unsafe fn drop_shim<P: BufPool>(ptr: *mut ()) {
+            unsafe {
+                let _ = Box::from_raw(ptr as *mut P);
+            }
+        }
+
+        unsafe fn fmt_shim<P: BufPool>(
+            ptr: *const (),
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            unsafe {
+                let pool = &*(ptr as *const P);
+                std::fmt::Debug::fmt(pool, f)
+            }
+        }
+
+        struct VTableGen<P>(std::marker::PhantomData<P>);
+
+        impl<P: BufPool + Clone + 'static> VTableGen<P> {
+            const VTABLE: BufPoolVTable = BufPoolVTable {
+                alloc_mem: alloc_mem_shim::<P>,
+                #[cfg(target_os = "linux")]
+                get_registration_buffers: get_registration_buffers_shim::<P>,
+                vtable: vtable_shim::<P>,
+                pool_data: pool_data_shim::<P>,
+                clone: clone_shim::<P>,
+                drop: drop_shim::<P>,
+                fmt: fmt_shim::<P>,
+            };
+        }
+
+        AnyBufPool {
+            data: Box::into_raw(Box::new(pool)) as *mut (),
+            vtable: &VTableGen::<P>::VTABLE,
+        }
+    }
+}
+
+impl BufPool for AnyBufPool {
+    fn alloc_mem(&self, size: usize) -> AllocResult {
+        unsafe { (self.vtable.alloc_mem)(self.data, size) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_registration_buffers(&self) -> Vec<libc::iovec> {
+        unsafe { (self.vtable.get_registration_buffers)(self.data) }
+    }
+
+    // For non-Linux, generic trait impl doesn't require this method inside the impl
+    // unless defined in the trait. The trait def has `#[cfg(target_os = "linux")]`
+    // so `AnyBufPool` implementation must match.
+
+    fn vtable(&self) -> &'static PoolVTable {
+        unsafe { (self.vtable.vtable)(self.data) }
+    }
+
+    fn pool_data(&self) -> NonNull<()> {
+        unsafe { (self.vtable.pool_data)(self.data) }
+    }
+}
+
+impl Clone for AnyBufPool {
+    fn clone(&self) -> Self {
+        unsafe {
+            let new_data = (self.vtable.clone)(self.data);
+            Self {
+                data: new_data,
+                vtable: self.vtable,
+            }
+        }
+    }
+}
+
+impl Drop for AnyBufPool {
+    fn drop(&mut self) {
+        unsafe { (self.vtable.drop)(self.data) }
+    }
+}
+
+impl std::fmt::Debug for AnyBufPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { (self.vtable.fmt)(self.data, f) }
+    }
+}
