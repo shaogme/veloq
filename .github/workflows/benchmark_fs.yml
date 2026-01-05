@@ -36,9 +36,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-bench-
 
-      - name: Increase memory lock limit (Linux only)
+      - name: Run FS Benchmark (Linux)
         if: runner.os == 'Linux'
-        run: sudo prlimit --pid $$ --memlock=unlimited:unlimited
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo bench -p veloq-runtime --bench fs_benchmark --verbose
 
-      - name: Run FS Benchmark
+      - name: Run FS Benchmark (Windows)
+        if: runner.os == 'Windows'
         run: cargo bench -p veloq-runtime --bench fs_benchmark --verbose
