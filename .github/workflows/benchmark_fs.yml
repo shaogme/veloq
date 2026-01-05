@@ -1,0 +1,44 @@
+name: FS Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # Run daily
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Increase memory lock limit (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo prlimit --pid $$ --memlock=unlimited:unlimited
+
+      - name: Run FS Benchmark
+        run: cargo bench -p veloq-runtime --bench fs_benchmark --verbose
