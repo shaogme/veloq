@@ -24,7 +24,7 @@ use crate::runtime::mesh::{self, Consumer, Producer};
 pub type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub(crate) struct MeshContext {
-    id: usize,
+    pub(crate) id: usize,
     state: Arc<AtomicU8>,
     ingress: Vec<Consumer<Job>>,
     egress: Vec<Producer<Job>>,
@@ -101,8 +101,6 @@ impl ExecutorHandle {
     }
 }
 
-/// A registry that maintains the set of all active executors.
-/// Used for global task spawning (P2C) and work stealing.
 /// A registry that maintains the set of all active executors.
 /// Used for global task spawning (P2C) and work stealing.
 pub struct ExecutorRegistry {
@@ -207,6 +205,41 @@ impl Spawner {
         target.injector.push(job);
         target.injected_load.fetch_add(1, Ordering::Relaxed);
         target.waker.wake().expect("Failed to wake worker");
+    }
+
+    pub fn spawn_to<F>(
+        &self,
+        future: F,
+        worker_id: usize,
+    ) -> crate::runtime::join::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (handle, producer) = crate::runtime::join::JoinHandle::new();
+
+        let job: Job = Box::pin(async move {
+            let output = future.await;
+            producer.set(output);
+        });
+
+        self.spawn_job_to(job, worker_id);
+        handle
+    }
+
+    pub(crate) fn spawn_job_to(&self, job: Job, worker_id: usize) {
+        let reader = self.reader.borrow();
+        let workers = reader.load();
+
+        if let Some(target) = workers.get(worker_id) {
+            target.injector.push(job);
+            target.injected_load.fetch_add(1, Ordering::Relaxed);
+            target.waker.wake().expect("Failed to wake worker");
+        } else {
+            // Panic if the worker_id is invalid, as this implies a logic error in the caller
+            // assuming the existence of a specific worker.
+            panic!("Worker {} not found in registry", worker_id);
+        }
     }
 
     pub(crate) fn with_workers<R>(&self, f: impl FnOnce(&[ExecutorHandle]) -> R) -> R {

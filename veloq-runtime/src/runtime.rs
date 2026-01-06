@@ -4,6 +4,6 @@ pub mod join;
 pub mod mesh;
 pub mod task;
 
-pub use context::{RuntimeContext, spawn, spawn_local, yield_now};
+pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::{LocalExecutor, Runtime};
 pub use join::{JoinHandle, LocalJoinHandle};

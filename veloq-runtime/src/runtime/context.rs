@@ -200,6 +200,59 @@ impl RuntimeContext {
             let _ = pool;
         }
     }
+
+    /// Spawn a new task on a specific worker thread.
+    ///
+    /// # Panics
+    /// Panics if called outside of a runtime context, if the executor registry is missing,
+    /// or if the `worker_id` is invalid.
+    pub fn spawn_to<F>(&self, future: F, worker_id: usize) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let spawner = self
+            .spawner
+            .as_ref()
+            .expect("spawn_to() called on a context without a global spawner");
+
+        let (handle, producer) = JoinHandle::new();
+        let job = Box::pin(async move {
+            let output = future.await;
+            producer.set(output);
+        });
+
+        // Optimization: If spawning to self, just push to local queue
+        if let Some(mesh_weak) = &self.mesh
+            && let Some(mesh_rc) = mesh_weak.upgrade()
+        {
+            if mesh_rc.borrow().id == worker_id {
+                let queue = self
+                    .queue
+                    .upgrade()
+                    .expect("executor has been dropped but context remains?");
+                let task = Task::new(job, self.queue.clone());
+                queue.borrow_mut().push_back(task);
+                return handle;
+            }
+
+            // Try Mesh
+            if let Some(driver_rc) = self.driver.upgrade() {
+                let mut mesh = mesh_rc.borrow_mut();
+                let mut driver = driver_rc.borrow_mut();
+
+                if let Err(returned_job) = mesh.send_to(worker_id, job, &mut driver) {
+                    // Mesh full or error, fallback to global injector
+                    spawner.spawn_job_to(returned_job, worker_id);
+                }
+                return handle;
+            }
+        }
+
+        // Fallback (e.g., no mesh or driver dropped)
+        spawner.spawn_job_to(job, worker_id);
+        handle
+    }
 }
 
 /// Yields execution back to the executor, allowing other tasks to run.
@@ -311,4 +364,17 @@ where
     F::Output: 'static,
 {
     current().spawn_local(future)
+}
+
+/// Spawns a new asynchronous task on a specific worker thread.
+///
+/// # Panics
+///
+/// Panics if called outside of a runtime context, or if the `worker_id` is invalid.
+pub fn spawn_to<F>(future: F, worker_id: usize) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    current().spawn_to(future, worker_id)
 }
