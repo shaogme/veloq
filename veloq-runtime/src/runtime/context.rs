@@ -64,6 +64,7 @@ pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     pub(crate) spawner: Option<Spawner>,
+    pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
 }
 
 impl RuntimeContext {
@@ -72,11 +73,13 @@ impl RuntimeContext {
         driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
         spawner: Option<Spawner>,
+        mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     ) -> Self {
         Self {
             driver,
             queue,
             spawner,
+            mesh,
         }
     }
 
@@ -94,7 +97,56 @@ impl RuntimeContext {
             .as_ref()
             .expect("spawn() called on a context without a global spawner");
 
-        spawner.spawn(future)
+        let (handle, producer) = JoinHandle::new();
+        let job = Box::pin(async move {
+            let output = future.await;
+            producer.set(output);
+        });
+
+        self.spawn_impl(job, spawner);
+        handle
+    }
+
+    fn spawn_impl(&self, job: crate::runtime::executor::Job, spawner: &Spawner) {
+        if let Some(mesh_weak) = &self.mesh
+            && let Some(mesh_rc) = mesh_weak.upgrade()
+            && let Some(driver_rc) = self.driver.upgrade()
+        {
+            let registry = spawner.registry();
+            let workers = registry.get_all_handles();
+
+            if !workers.is_empty() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static RND: AtomicUsize = AtomicUsize::new(0);
+
+                let seed = RND.fetch_add(1, Ordering::Relaxed);
+                let count = workers.len();
+                let idx1 = seed % count;
+                let idx2 = (idx1 + 7) % count;
+
+                let w1 = &workers[idx1];
+                let w2 = &workers[idx2];
+                let target = if w1.total_load() <= w2.total_load() {
+                    w1
+                } else {
+                    w2
+                };
+
+                if target.id() != usize::MAX {
+                    let mut mesh = mesh_rc.borrow_mut();
+                    let mut driver = driver_rc.borrow_mut();
+
+                    if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
+                        // Fallback on full/error
+                        spawner.registry().spawn(returned_job);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Default Fallback
+        spawner.registry().spawn(job);
     }
 
     /// Spawn a new local task on the current executor.

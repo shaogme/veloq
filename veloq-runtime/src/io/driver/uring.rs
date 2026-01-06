@@ -512,19 +512,20 @@ impl Driver for UringDriver {
     ) -> Poll<(io::Result<usize>, Self::Op)> {
         // First check if stored in backlog (not submitted)
         if let Some(entry) = self.ops.get_mut(user_data)
-            && !entry.platform_data.submitted {
-                // Not in ring yet. Try to flush backlog.
-                self.flush_backlog();
-                self.flush_cancellations();
+            && !entry.platform_data.submitted
+        {
+            // Not in ring yet. Try to flush backlog.
+            self.flush_backlog();
+            self.flush_cancellations();
 
-                // Check again
-                let entry = self.ops.get_mut(user_data).unwrap();
-                if !entry.platform_data.submitted {
-                    // Still not in ring. Register waker.
-                    entry.waker = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
+            // Check again
+            let entry = self.ops.get_mut(user_data).unwrap();
+            if !entry.platform_data.submitted {
+                // Still not in ring. Register waker.
+                entry.waker = Some(cx.waker().clone());
+                return Poll::Pending;
             }
+        }
 
         // Delegate to ops registry for result check
         self.ops.poll_op(user_data, cx)
@@ -581,6 +582,28 @@ impl Driver for UringDriver {
                 return Ok(());
             }
             return Err(err);
+        }
+        Ok(())
+    }
+
+    fn inner_handle(&self) -> crate::io::op::RawHandle {
+        use std::os::unix::io::AsRawFd;
+        self.ring.as_raw_fd()
+    }
+
+    fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()> {
+        let fd = handle as i32;
+        // Send a MsgRing to the target ring.
+        // We set data to BACKGROUND_USER_DATA so the target treats it as a wake-up (and ignores the CQE).
+        // We set our user_data to BACKGROUND_USER_DATA so we also ignore the completion of the MsgRing op itself.
+        let sqe = opcode::MsgRing::new(io_uring::types::Fd(fd))
+            .len(0)
+            .data(BACKGROUND_USER_DATA)
+            .build()
+            .user_data(BACKGROUND_USER_DATA);
+
+        if !self.push_entry(sqe) {
+            return Err(io::Error::new(io::ErrorKind::Other, "SQ full"));
         }
         Ok(())
     }

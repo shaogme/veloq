@@ -12,17 +12,78 @@ use crate::runtime::task::Task;
 use crate::io::driver::RemoteWaker;
 use crate::runtime::context::RuntimeContext;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crossbeam_queue::SegQueue;
+use veloq_queue::MpscQueue;
+
+use crate::runtime::mesh::{self, Consumer, Producer};
 
 pub type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+pub(crate) struct MeshContext {
+    id: usize,
+    state: Arc<AtomicU8>,
+    ingress: Vec<Consumer<Job>>,
+    egress: Vec<Producer<Job>>,
+    peer_handles: Arc<Vec<AtomicUsize>>,
+}
+
+impl MeshContext {
+    pub fn send_to(
+        &mut self,
+        peer_id: usize,
+        job: Job,
+        driver: &mut PlatformDriver,
+    ) -> Result<(), Job> {
+        if peer_id >= self.egress.len() {
+            return Err(job);
+        }
+        let producer = &mut self.egress[peer_id];
+
+        if let Err(job) = producer.push(job) {
+            return Err(job);
+        }
+
+        let state = producer.target_state();
+        if state == mesh::PARKED || state == mesh::PARKING {
+            let handle = self.peer_handles[peer_id].load(Ordering::Acquire);
+            if handle != 0 {
+                let _ = driver.notify_mesh(handle as _);
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_ingress(
+        &mut self,
+        local_queue: &RefCell<VecDeque<Rc<Task>>>,
+        queue_handle: &std::rc::Weak<RefCell<VecDeque<Rc<Task>>>>,
+        injected_load: &AtomicUsize,
+        local_load: &AtomicUsize,
+    ) -> bool {
+        let mut did_work = false;
+
+        for consumer in &mut self.ingress {
+            if let Some(job) = consumer.pop() {
+                injected_load.fetch_sub(1, Ordering::Relaxed);
+                local_load.fetch_add(1, Ordering::Relaxed);
+
+                let task = Task::new(job, queue_handle.clone());
+                local_queue.borrow_mut().push_back(task);
+
+                did_work = true;
+            }
+        }
+        did_work
+    }
+}
 
 /// Handle to a remote executor, used for task injection and load monitoring.
 #[derive(Clone)]
 pub struct ExecutorHandle {
-    pub(crate) injector: Arc<SegQueue<Job>>,
+    pub(crate) id: usize,
+    pub(crate) injector: Arc<MpscQueue<Job>>,
     pub(crate) waker: Arc<dyn RemoteWaker>,
     pub(crate) injected_load: Arc<AtomicUsize>,
     pub(crate) local_load: Arc<AtomicUsize>,
@@ -31,6 +92,10 @@ pub struct ExecutorHandle {
 impl ExecutorHandle {
     pub fn total_load(&self) -> usize {
         self.injected_load.load(Ordering::Relaxed) + self.local_load.load(Ordering::Relaxed)
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
     }
 }
 
@@ -129,6 +194,10 @@ impl Spawner {
         self.registry.spawn(job);
         handle
     }
+
+    pub(crate) fn registry(&self) -> &Arc<ExecutorRegistry> {
+        &self.registry
+    }
 }
 
 /// Builder for LocalExecutor.
@@ -166,12 +235,13 @@ impl LocalExecutorBuilder {
         LocalExecutor {
             driver: Rc::new(RefCell::new(driver)),
             queue,
-            injector: Arc::new(SegQueue::new()),
+            injector: Arc::new(MpscQueue::new()),
             injected_load: Arc::new(AtomicUsize::new(0)),
             local_load: Arc::new(AtomicUsize::new(0)),
             registry: None,
             cached_peers: Vec::new(),
             local_epoch: 0,
+            mesh: None,
         }
     }
 }
@@ -181,7 +251,7 @@ pub struct LocalExecutor {
     queue: Rc<RefCell<VecDeque<Rc<Task>>>>,
 
     // Always present components for task injection
-    injector: Arc<SegQueue<Job>>,
+    injector: Arc<MpscQueue<Job>>,
     injected_load: Arc<AtomicUsize>,
     local_load: Arc<AtomicUsize>,
 
@@ -191,6 +261,9 @@ pub struct LocalExecutor {
     // Local cache for work stealing (Lazy Cache)
     cached_peers: Vec<ExecutorHandle>,
     local_epoch: usize,
+
+    // Mesh Networking
+    mesh: Option<Rc<RefCell<MeshContext>>>,
 }
 
 impl LocalExecutor {
@@ -223,7 +296,13 @@ impl LocalExecutor {
     }
 
     pub fn handle(&self) -> ExecutorHandle {
+        let id = self
+            .mesh
+            .as_ref()
+            .map(|m| m.borrow().id)
+            .unwrap_or(usize::MAX);
         ExecutorHandle {
+            id,
             injector: self.injector.clone(),
             waker: self.driver.borrow().create_waker(),
             injected_load: self.injected_load.clone(),
@@ -268,24 +347,52 @@ impl LocalExecutor {
         handle
     }
 
+    pub(crate) fn attach_mesh(
+        &mut self,
+        id: usize,
+        state: Arc<AtomicU8>,
+        ingress: Vec<Consumer<Job>>,
+        egress: Vec<Producer<Job>>,
+        peer_handles: Arc<Vec<AtomicUsize>>,
+    ) {
+        let mesh = MeshContext {
+            id,
+            state,
+            ingress,
+            egress,
+            peer_handles,
+        };
+        self.mesh = Some(Rc::new(RefCell::new(mesh)));
+    }
+
     pub fn block_on<F>(&mut self, future: F) -> F::Output
     where
         F: Future,
     {
         let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
 
+        // Pass the Mesh context if available
+        let mesh_weak = self.mesh.as_ref().map(Rc::downgrade);
+
         let context = RuntimeContext::new(
             Rc::downgrade(&self.driver),
             Rc::downgrade(&self.queue),
             spawner,
+            mesh_weak,
         );
 
         let _guard = crate::runtime::context::enter(context);
 
         // Auto-Register (Passive Scan)
-        // If a pool was bound before block_on (e.g. in thread init), register it now.
         if let Some(pool) = crate::runtime::context::current_pool() {
             crate::runtime::context::current().register_buffers(&pool);
+        }
+
+        // Register Mesh Handle
+        if let Some(mesh_rc) = &self.mesh {
+            let mesh = mesh_rc.borrow();
+            let handle = self.driver.borrow().inner_handle();
+            mesh.peer_handles[mesh.id].store(handle as usize, Ordering::Release);
         }
 
         let mut pinned_future = Box::pin(future);
@@ -295,11 +402,27 @@ impl LocalExecutor {
 
         const BUDGET: usize = 64;
 
+        let queue_weak = Rc::downgrade(&self.queue);
+
         loop {
             let mut executed = 0;
 
             while executed < BUDGET {
                 let mut did_work = false;
+
+                // 0. Poll Mesh (Highest Priority for responsiveness)
+                if let Some(mesh_rc) = &self.mesh {
+                    // Start a scope to borrow mesh temporarily
+                    let mut mesh = mesh_rc.borrow_mut();
+                    if mesh.poll_ingress(
+                        &self.queue,
+                        &queue_weak,
+                        &self.injected_load,
+                        &self.local_load,
+                    ) {
+                        did_work = true;
+                    }
+                }
 
                 // 1. Poll Main Future
                 if *main_woken.borrow() {
@@ -325,13 +448,11 @@ impl LocalExecutor {
                     self.local_load.fetch_add(1, Ordering::Relaxed);
                     let task = Task::new(job, Rc::downgrade(&self.queue));
                     self.queue.borrow_mut().push_back(task);
-                    // Loop back to run it
                     continue;
                 }
 
                 // 4. Steal from Registry (Work Stealing)
                 if let Some(registry) = &self.registry {
-                    // Lazy Cache Update (Epoch Check)
                     let current_epoch = registry.current_epoch();
                     if self.local_epoch != current_epoch {
                         self.cached_peers = registry.get_all_handles();
@@ -339,16 +460,14 @@ impl LocalExecutor {
                     }
 
                     if !self.cached_peers.is_empty() {
-                        // Random start for stealing to reduce contention
                         let seed = self as *const _ as usize;
-                        let start_idx = seed.wrapping_add(executed); // simple perturb
+                        let start_idx = seed.wrapping_add(executed);
                         let count = self.cached_peers.len();
 
                         for i in 0..count {
                             let idx = (start_idx + i) % count;
                             let target = &self.cached_peers[idx];
 
-                            // Don't steal from self
                             if Arc::ptr_eq(&target.injector, &self.injector) {
                                 continue;
                             }
@@ -359,7 +478,7 @@ impl LocalExecutor {
                                 let task = Task::new(job, Rc::downgrade(&self.queue));
                                 self.queue.borrow_mut().push_back(task);
                                 did_work = true;
-                                break; // Break cache loop, loop back to main while to run
+                                break;
                             }
                         }
                     }
@@ -373,11 +492,42 @@ impl LocalExecutor {
             // 5. IO Wait
             let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
             let mut driver = self.driver.borrow_mut();
+
             if has_pending_tasks {
                 driver.submit_queue().unwrap();
                 driver.process_completions();
             } else {
-                driver.wait().unwrap();
+                let mut can_park = true;
+
+                if let Some(mesh_rc) = &self.mesh {
+                    let mut mesh = mesh_rc.borrow_mut();
+                    // 1. Set PARKING
+                    mesh.state.store(mesh::PARKING, Ordering::Release);
+
+                    // 2. Poll Mesh (Double check)
+                    if mesh.poll_ingress(
+                        &self.queue,
+                        &queue_weak,
+                        &self.injected_load,
+                        &self.local_load,
+                    ) {
+                        mesh.state.store(mesh::RUNNING, Ordering::Relaxed);
+                        can_park = false;
+                    } else {
+                        // 3. Commit PARKED
+                        mesh.state.store(mesh::PARKED, Ordering::Release);
+                    }
+                }
+
+                if can_park {
+                    driver.wait().unwrap();
+                }
+
+                // Restore RUNNING
+                if let Some(mesh_rc) = &self.mesh {
+                    let mesh = mesh_rc.borrow();
+                    mesh.state.store(mesh::RUNNING, Ordering::Release);
+                }
             }
         }
     }
@@ -389,19 +539,73 @@ impl Default for LocalExecutor {
     }
 }
 
+// Define a struct to hold Mesh Fabric until distributed
+struct MeshFabric {
+    // [worker_id] -> Ingress/Egress
+    ingress: Vec<Vec<Consumer<Job>>>,
+    egress: Vec<Vec<Producer<Job>>>,
+    states: Vec<Arc<AtomicU8>>,
+}
+
 #[allow(dead_code)]
 pub struct Runtime {
     handles: Vec<std::thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
     config: Arc<crate::config::Config>,
+
+    // Mesh
+    mesh_fabric: Arc<Mutex<Option<MeshFabric>>>,
+    peer_handles: Arc<Vec<AtomicUsize>>,
+    worker_count: usize,
+    next_worker_id: AtomicUsize,
 }
 
 impl Runtime {
     pub fn new(config: crate::config::Config) -> Self {
+        let worker_count = config.worker_threads.unwrap_or_else(num_cpus::get);
+
+        // Initialize Mesh Fabric
+        let mut ingress_storage: Vec<Vec<Consumer<Job>>> =
+            (0..worker_count).map(|_| Vec::new()).collect();
+        let mut egress_storage: Vec<Vec<Producer<Job>>> =
+            (0..worker_count).map(|_| Vec::new()).collect();
+        let mut states = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            states.push(Arc::new(AtomicU8::new(mesh::RUNNING)));
+        }
+
+        // Create N*N channels
+        // Channel(i -> j): Producer in egress[i], Consumer in ingress[j]
+        for i in 0..worker_count {
+            for j in 0..worker_count {
+                // Producer i needs target (j) state
+                let target_state = states[j].clone();
+                let (tx, rx) = mesh::channel(256, target_state); // Capacity 256 per channel?
+                egress_storage[i].push(tx);
+                ingress_storage[j].push(rx);
+            }
+        }
+
+        let fabric = MeshFabric {
+            ingress: ingress_storage,
+            egress: egress_storage,
+            states,
+        };
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            handles.push(AtomicUsize::new(0));
+        }
+
         Self {
             handles: Vec::new(),
             registry: Arc::new(ExecutorRegistry::new()),
             config: Arc::new(config),
+            mesh_fabric: Arc::new(Mutex::new(Some(fabric))),
+            peer_handles: Arc::new(handles),
+            worker_count,
+            next_worker_id: AtomicUsize::new(0),
         }
     }
 
@@ -419,6 +623,12 @@ impl Runtime {
     {
         let registry = self.registry.clone();
 
+        // Mesh Setup
+        let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+        let fabric_clone = self.mesh_fabric.clone();
+        let peer_handles = self.peer_handles.clone();
+        let use_mesh = worker_id < self.worker_count;
+
         let (handle_tx, handle_rx) = std::sync::mpsc::channel();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
 
@@ -428,6 +638,21 @@ impl Runtime {
 
             // Runtime attaches registry
             executor = executor.with_registry(registry);
+
+            // Attach Mesh if applicable
+            if use_mesh {
+                let mut fabric_guard = fabric_clone.lock().unwrap();
+                if let Some(fabric) = fabric_guard.as_mut() {
+                    // Take ownership of channels
+                    // Note: This is a bit fragile if worker_id >= ingress.len(),
+                    // but we guard with use_mesh check.
+                    let ingress = std::mem::take(&mut fabric.ingress[worker_id]);
+                    let egress = std::mem::take(&mut fabric.egress[worker_id]);
+                    let state = fabric.states[worker_id].clone();
+
+                    executor.attach_mesh(worker_id, state, ingress, egress, peer_handles);
+                }
+            }
 
             handle_tx.send(executor.handle()).unwrap();
 

@@ -1,6 +1,7 @@
 pub mod context;
 pub mod executor;
 pub mod join;
+pub mod mesh;
 pub mod task;
 
 pub use context::{RuntimeContext, yield_now};

@@ -59,8 +59,15 @@ pub trait Driver {
     /// The driver takes ownership of resources and ensures cleanup.
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
+    /// Notify another driver instance (Mesh Wakeup).
+    fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()>;
+
     /// Wake up the driver from blocking wait.
     fn wake(&mut self) -> io::Result<()>;
+
+    /// Get the low-level driver handle (RawFd on Linux, HANDLE on Windows).
+    /// Used for direct mesh communication (e.g. MSG_RING).
+    fn inner_handle(&self) -> crate::io::op::RawHandle;
 
     /// Create a thread-safe waker.
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
