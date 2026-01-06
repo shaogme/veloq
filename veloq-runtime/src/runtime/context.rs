@@ -104,11 +104,7 @@ impl RuntimeContext {
             .as_ref()
             .expect("spawn() called on a context without a global spawner");
 
-        let (handle, producer) = JoinHandle::new();
-        let job = Box::pin(async move {
-            let output = future.await;
-            producer.set(output);
-        });
+        let (handle, job) = crate::runtime::executor::pack_job(future);
 
         self.spawn_impl(job, spawner);
         handle
@@ -127,11 +123,7 @@ impl RuntimeContext {
         F::Output: Send + 'static,
     {
         if let Some(handle) = &self.handle {
-            let (join_handle, producer) = JoinHandle::new();
-            let job = Box::pin(async move {
-                let output = future.await;
-                producer.set(output);
-            });
+            let (join_handle, job) = crate::runtime::executor::pack_job(future);
 
             handle.injector.push(job);
             handle
@@ -150,46 +142,8 @@ impl RuntimeContext {
             && let Some(mesh_rc) = mesh_weak.upgrade()
             && let Some(driver_rc) = self.driver.upgrade()
         {
-            let dispatched = spawner.with_workers(|workers| {
-                if !workers.is_empty() {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static RND: AtomicUsize = AtomicUsize::new(0);
-
-                    let seed = RND.fetch_add(1, Ordering::Relaxed);
-                    let count = workers.len();
-                    let idx1 = seed % count;
-                    let idx2 = (idx1 + 7) % count;
-
-                    let w1 = &workers[idx1];
-                    let w2 = &workers[idx2];
-                    let target = if w1.total_load() <= w2.total_load() {
-                        w1
-                    } else {
-                        w2
-                    };
-
-                    if target.id() != usize::MAX {
-                        let mut mesh = mesh_rc.borrow_mut();
-                        let mut driver = driver_rc.borrow_mut();
-
-                        if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
-                            // Fallback on full/error - return ownership of job
-                            return Err(returned_job);
-                        }
-                        return Ok(());
-                    }
-                }
-                Err(job)
-            });
-
-            match dispatched {
-                Ok(_) => return,
-                Err(job) => {
-                    // Fallback to global injector
-                    spawner.spawn_job(job);
-                    return;
-                }
-            }
+            spawner.spawn_with_mesh(job, &mesh_rc, &driver_rc);
+            return;
         }
 
         // Default Fallback
@@ -254,11 +208,7 @@ impl RuntimeContext {
             .as_ref()
             .expect("spawn_to() called on a context without a global spawner");
 
-        let (handle, producer) = JoinHandle::new();
-        let job = Box::pin(async move {
-            let output = future.await;
-            producer.set(output);
-        });
+        let (handle, job) = crate::runtime::executor::pack_job(future);
 
         // Optimization: If spawning to self, just push to local queue
         if let Some(mesh_weak) = &self.mesh

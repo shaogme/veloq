@@ -23,6 +23,19 @@ use crate::runtime::mesh::{self, Consumer, Producer};
 
 pub type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+pub(crate) fn pack_job<F>(future: F) -> (crate::runtime::join::JoinHandle<F::Output>, Job)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (handle, producer) = crate::runtime::join::JoinHandle::new();
+    let job = Box::pin(async move {
+        let output = future.await;
+        producer.set(output);
+    });
+    (handle, job)
+}
+
 pub(crate) struct MeshContext {
     pub(crate) id: usize,
     state: Arc<AtomicU8>,
@@ -164,13 +177,7 @@ impl Spawner {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let (handle, producer) = crate::runtime::join::JoinHandle::new();
-
-        let job: Job = Box::pin(async move {
-            let output = future.await;
-            producer.set(output);
-        });
-
+        let (handle, job) = pack_job(future);
         self.spawn_job(job);
         handle
     }
@@ -178,10 +185,55 @@ impl Spawner {
     pub(crate) fn spawn_job(&self, job: Job) {
         let reader = self.reader.borrow();
         let workers = reader.load();
-        let count = workers.len();
 
-        if count == 0 {
+        if let Some(target) = self.p2c_select(&workers) {
+            target.injector.push(job);
+            target.injected_load.fetch_add(1, Ordering::Relaxed);
+            target.waker.wake().expect("Failed to wake worker");
+        } else {
             panic!("No workers available in registry");
+        }
+    }
+
+    pub(crate) fn spawn_with_mesh(
+        &self,
+        job: Job,
+        mesh: &RefCell<MeshContext>,
+        driver: &RefCell<PlatformDriver>,
+    ) {
+        let reader = self.reader.borrow();
+        let workers = reader.load();
+
+        if let Some(target) = self.p2c_select(&workers) {
+            // Try mesh first if target has ID
+            if target.id() != usize::MAX {
+                let mut mesh = mesh.borrow_mut();
+                let mut driver = driver.borrow_mut();
+
+                if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
+                    // Fallback on full/error -> inject
+                    drop(mesh);
+                    drop(driver);
+                    target.injector.push(returned_job);
+                    target.injected_load.fetch_add(1, Ordering::Relaxed);
+                    target.waker.wake().expect("Failed to wake worker");
+                }
+                return;
+            }
+
+            // No valid ID (unlikely for registered worker) -> inject
+            target.injector.push(job);
+            target.injected_load.fetch_add(1, Ordering::Relaxed);
+            target.waker.wake().expect("Failed to wake worker");
+        } else {
+            panic!("No workers available in registry");
+        }
+    }
+
+    fn p2c_select<'a>(&self, workers: &'a [ExecutorHandle]) -> Option<&'a ExecutorHandle> {
+        let count = workers.len();
+        if count == 0 {
+            return None;
         }
 
         let seed = self.registry.next.fetch_add(1, Ordering::Relaxed);
@@ -200,11 +252,7 @@ impl Spawner {
         let load1 = w1.total_load();
         let load2 = w2.total_load();
 
-        let target = if load1 <= load2 { w1 } else { w2 };
-
-        target.injector.push(job);
-        target.injected_load.fetch_add(1, Ordering::Relaxed);
-        target.waker.wake().expect("Failed to wake worker");
+        if load1 <= load2 { Some(w1) } else { Some(w2) }
     }
 
     pub fn spawn_to<F>(
@@ -216,13 +264,7 @@ impl Spawner {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let (handle, producer) = crate::runtime::join::JoinHandle::new();
-
-        let job: Job = Box::pin(async move {
-            let output = future.await;
-            producer.set(output);
-        });
-
+        let (handle, job) = pack_job(future);
         self.spawn_job_to(job, worker_id);
         handle
     }
@@ -240,12 +282,6 @@ impl Spawner {
             // assuming the existence of a specific worker.
             panic!("Worker {} not found in registry", worker_id);
         }
-    }
-
-    pub(crate) fn with_workers<R>(&self, f: impl FnOnce(&[ExecutorHandle]) -> R) -> R {
-        let reader = self.reader.borrow();
-        let guard = reader.load();
-        f(&guard)
     }
 }
 
