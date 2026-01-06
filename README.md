@@ -1,3 +1,11 @@
+# Veloq
+
+🚀 一个基于 **Thread-per-Core** 模型的高性能 Rust 异步运行时。
+
+📚 **在线文档 (Documentation)**: [https://shaog-r.github.io/veloq/](https://shaog-r.github.io/veloq/)
+
+---
+
 # Linux Kernel Requirements (内核版本要求)
 
 Veloq Runtime 基于 `io_uring` 构建高性能异步运行时。由于使用了较新的 io_uring 特性，对 Linux 内核版本有一定要求。

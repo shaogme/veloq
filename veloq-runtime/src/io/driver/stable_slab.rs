@@ -112,6 +112,11 @@ impl<T> StableSlab<T> {
         self.get(key).is_some()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len

@@ -1,0 +1,67 @@
+name: Deploy mdBook site to Pages
+
+on:
+  push:
+    branches: ["main"]
+    # 只有 docs/src 文件夹下的内容或 book.toml 改变时才运行
+    paths:
+      - 'docs/src/**'
+      - 'docs/book.toml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+
+      # 缓存 cargo 安装的二进制文件 (mdbook & mdbook-mermaid)
+      - name: Cache Cargo Binaries
+        id: cache-cargo-bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-bin-mdbook-v1
+
+      # 如果缓存未命中，则安装 mdbook 和插件
+      - name: Install mdbook & mdbook-mermaid
+        if: steps.cache-cargo-bin.outputs.cache-hit != 'true'
+        run: cargo install mdbook mdbook-mermaid --locked
+
+      - name: Build mdBook
+        run: |
+          cd docs
+          mdbook build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs/book
+
+  deploy:
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
