@@ -1,4 +1,3 @@
-
 /// I/O Driver Operation Mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
@@ -41,15 +40,35 @@ impl Default for IocpConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct Config {
-    pub uring: UringConfig,
-    pub iocp: IocpConfig,
-    pub worker_threads: Option<usize>,
-    pub direct_io: bool,
+    pub(crate) uring: UringConfig,
+    pub(crate) iocp: IocpConfig,
+    pub(crate) worker_threads: Option<usize>,
+    pub(crate) direct_io: bool,
 }
 
 impl Config {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn uring(self, uring: UringConfig) -> Self {
+        Self { uring, ..self }
+    }
+
+    pub fn iocp(self, iocp: IocpConfig) -> Self {
+        Self { iocp, ..self }
+    }
+
+    pub fn worker_threads(self, worker_threads: usize) -> Self {
+        Self {
+            worker_threads: Some(worker_threads),
+            ..self
+        }
+    }
+
+    pub fn direct_io(self, direct_io: bool) -> Self {
+        Self { direct_io, ..self }
     }
 }

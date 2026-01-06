@@ -15,8 +15,15 @@ impl Task {
         future: impl Future<Output = ()> + 'static,
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     ) -> Rc<Self> {
+        Self::from_boxed(Box::pin(future), queue)
+    }
+
+    pub(crate) fn from_boxed(
+        future: Pin<Box<dyn Future<Output = ()>>>,
+        queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
+    ) -> Rc<Self> {
         Rc::new(Self {
-            future: RefCell::new(Some(Box::pin(future))),
+            future: RefCell::new(Some(future)),
             queue,
         })
     }

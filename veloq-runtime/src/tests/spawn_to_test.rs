@@ -1,6 +1,4 @@
-use crate::runtime::{LocalExecutor, Runtime, spawn_to, yield_now};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::runtime::{Runtime, spawn_to};
 
 fn current_worker_id() -> Option<usize> {
     let ctx = crate::runtime::context::current();
@@ -19,31 +17,14 @@ fn test_spawn_to_worker() {
         ..Default::default()
     };
 
-    let mut runtime = Runtime::new(config);
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_clone = finished.clone();
+    let runtime = Runtime::builder().config(config).build().unwrap();
 
-    // Spawn 4 workers
-    for _ in 0..4 {
-        let f = finished.clone();
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
-            (exec, async move {
-                // Keep alive
-                while !f.load(Ordering::Relaxed) {
-                    yield_now().await;
-                }
-            })
-        });
-    }
-
-    // Inject a task that spawns to a specific worker
-    runtime.spawn(async move {
+    runtime.block_on(async move {
         // Target worker 2
         let target_id = 2;
 
         let handle = spawn_to(
-            async move {
+            || async move {
                 let id = current_worker_id();
                 id
             },
@@ -60,16 +41,12 @@ fn test_spawn_to_worker() {
 
         // Target worker 3
         let target_id_3 = 3;
-        let handle3 = spawn_to(async move { current_worker_id() }, target_id_3);
+        let handle3 = spawn_to(|| async move { current_worker_id() }, target_id_3);
 
         assert_eq!(
             handle3.await,
             Some(target_id_3),
             "Task should run on target worker 3"
         );
-
-        finished_clone.store(true, Ordering::Relaxed);
     });
-
-    runtime.block_on_all();
 }

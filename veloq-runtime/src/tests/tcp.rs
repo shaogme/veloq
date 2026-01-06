@@ -1,6 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{FixedBuf, HybridPool};
+use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::executor::{LocalExecutor, Runtime};
 use crate::spawn_local;
@@ -376,45 +376,66 @@ fn test_tcp_ipv6() {
 #[test]
 fn test_multithread_tcp_connections() {
     let connection_count = Arc::new(AtomicUsize::new(0));
-    let mut runtime = Runtime::new(crate::config::Config::default());
-
     const NUM_WORKERS: usize = 3;
 
-    for worker_id in 0..NUM_WORKERS {
-        let counter = connection_count.clone();
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(NUM_WORKERS),
+            ..Default::default()
+        })
+        .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+        .build()
+        .unwrap();
 
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-            let fut = async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
-                println!("Worker {} listening on {}", worker_id, listen_addr);
+    let connection_count_for_block = connection_count.clone();
 
-                let listener_rc = Rc::new(listener);
-                let listener_clone = listener_rc.clone();
+    runtime.block_on(async move {
+        // We will spawn a task for each worker pinned to that worker
+        for worker_id in 0..NUM_WORKERS {
+            let counter = connection_count_for_block.clone();
+            let tx_done = tx.clone();
 
-                // Spawn server task inside fut using crate::spawn_local
-                crate::spawn_local(async move {
-                    let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
-                    println!("Worker {} accepted from {}", worker_id, peer);
+            crate::runtime::context::spawn_to(
+                async move || {
+                    let listener =
+                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                    let listen_addr = listener.local_addr().expect("Failed to get local address");
+                    println!("Worker {} listening on {}", worker_id, listen_addr);
+
+                    {
+                        let listener_rc = Rc::new(listener);
+                        let listener_clone = listener_rc.clone();
+
+                        // Spawn server task inside using spawn_local
+                        crate::spawn_local(async move {
+                            let (stream, peer) =
+                                listener_clone.accept().await.expect("Accept failed");
+                            println!("Worker {} accepted from {}", worker_id, peer);
+                            drop(stream);
+                        });
+                    } // Rc is dropped here
+
+                    // Client connects to self
+                    let stream = TcpStream::connect(listen_addr)
+                        .await
+                        .expect("Failed to connect");
+                    println!("Worker {} connected to self", worker_id);
                     drop(stream);
-                });
 
-                // Client connects to self
-                let stream = TcpStream::connect(listen_addr)
-                    .await
-                    .expect("Failed to connect");
-                println!("Worker {} connected to self", worker_id);
-                drop(stream);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tx_done.send(()).unwrap();
+                },
+                worker_id,
+            );
+        }
 
-                counter.fetch_add(1, Ordering::SeqCst);
-            };
-            (exec, fut)
-        });
-    }
-
-    runtime.block_on_all();
+        // Wait for all 3
+        for _ in 0..NUM_WORKERS {
+            rx.recv().unwrap();
+        }
+    });
 
     assert_eq!(connection_count.load(Ordering::SeqCst), NUM_WORKERS);
     println!("All {} workers completed TCP self-connections", NUM_WORKERS);
@@ -428,80 +449,98 @@ fn test_multithread_tcp_echo() {
 
     for size in [8192, 16384, 65536] {
         let (addr_tx, addr_rx) = mpsc::channel();
-        let mut runtime = Runtime::new(crate::config::Config::default());
+        // 2 Workers
+        let runtime = Runtime::builder()
+            .config(crate::config::Config {
+                worker_threads: Some(2),
+                ..Default::default()
+            })
+            .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+            .build()
+            .unwrap();
 
-        // Worker 1: Echo server
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
-            let pool = HybridPool::new().unwrap();
-            crate::runtime::context::bind_pool(pool.clone());
+        let (done_tx, done_rx) = mpsc::channel();
 
-            let fut = async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
-                println!("Echo server listening on {}", listen_addr);
+        runtime.block_on(async move {
+            let addr_tx = addr_tx.clone(); // Move into task
+            let addr_rx = Arc::new(Mutex::new(addr_rx)); // Share receiver attempt? 
 
-                // Send address to client worker
-                addr_tx.send(listen_addr).unwrap();
+            // Worker 0: Echo server
+            crate::runtime::context::spawn_to(
+                async move || {
+                    let listener =
+                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                    let listen_addr = listener.local_addr().expect("Failed to get local address");
+                    println!("Echo server listening on {}", listen_addr);
 
-                // Accept and echo
-                let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
+                    // Send address to client (via channel)
+                    addr_tx.send(listen_addr).unwrap();
 
-                let buf = pool.alloc(size).unwrap();
+                    // Accept and echo
+                    let (stream, _) = Rc::new(listener).accept().await.expect("Accept failed");
+                    let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
 
-                let (result, buf) = stream.recv(buf).await;
-                let bytes = result.expect("Recv failed") as usize;
-                println!("Echo server received {} bytes", bytes);
+                    let buf = pool.alloc(size).unwrap();
 
-                // Echo back
-                let mut echo_buf = pool.alloc(size).unwrap();
-                echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
+                    let (result, buf) = stream.recv(buf).await;
+                    let bytes = result.expect("Recv failed") as usize;
 
-                let (result, _) = stream.send(echo_buf).await;
-                result.expect("Send failed");
-                println!("Echo server sent response");
-            };
-            (exec, fut)
+                    // Echo back
+                    let mut echo_buf = pool.alloc(size).unwrap();
+                    echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
+
+                    let (result, _) = stream.send(echo_buf).await;
+                    result.expect("Send failed");
+                    println!("Echo server sent response");
+                },
+                0,
+            );
+
+            // Worker 1: Client
+            let done_tx = done_tx.clone();
+            let addr_rx = addr_rx.clone();
+            crate::runtime::context::spawn_to(
+                async move || {
+                    // Wait for server address
+                    let listen_addr = {
+                        addr_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                    };
+
+                    let stream = TcpStream::connect(listen_addr)
+                        .await
+                        .expect("Failed to connect");
+
+                    let pool = crate::runtime::context::current_pool().unwrap();
+
+                    // Send data
+                    let mut send_buf = pool.alloc(size).unwrap();
+                    let data = b"Hello from worker 1!";
+                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+
+                    let (result, _) = stream.send(send_buf).await;
+                    let _sent = result.expect("Send failed");
+
+                    // Receive echo
+                    let recv_buf = pool.alloc(size).unwrap();
+                    let (result, recv_buf) = stream.recv(recv_buf).await;
+                    let _received = result.expect("Recv failed") as usize;
+
+                    assert_eq!(&recv_buf.as_slice()[..data.len()], data);
+                    println!("Client received correct echo");
+
+                    done_tx.send(()).unwrap();
+                },
+                1,
+            );
+
+            // Wait for client to finish
+            done_rx.recv().unwrap();
         });
 
-        // Worker 2: Client
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
-            let pool = HybridPool::new().unwrap();
-            crate::runtime::context::bind_pool(pool.clone());
-
-            let fut = async move {
-                // Wait for server address
-                let listen_addr = addr_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("Timeout waiting for server address");
-                println!("Client connecting to {}", listen_addr);
-
-                let stream = TcpStream::connect(listen_addr)
-                    .await
-                    .expect("Failed to connect");
-
-                // Send data
-                let mut send_buf = pool.alloc(size).unwrap();
-                let data = b"Hello from worker 2!";
-                send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
-
-                let (result, _) = stream.send(send_buf).await;
-                let sent = result.expect("Send failed");
-                println!("Client sent {} bytes", sent);
-
-                // Receive echo
-                let recv_buf = pool.alloc(size).unwrap();
-                let (result, recv_buf) = stream.recv(recv_buf).await;
-                let _received = result.expect("Recv failed") as usize;
-
-                assert_eq!(&recv_buf.as_slice()[..data.len()], data);
-                println!("Client received correct echo");
-            };
-            (exec, fut)
-        });
-
-        runtime.block_on_all();
         println!("Multi-thread echo test completed");
     }
 }
@@ -513,69 +552,84 @@ fn test_multithread_concurrent_clients() {
     use std::time::Duration;
 
     let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
-    // Wrap receiver in Arc<Mutex> so it can be shared across threads
     let addr_rx = Arc::new(Mutex::new(addr_rx));
     let connection_count = Arc::new(AtomicUsize::new(0));
-    let mut runtime = Runtime::new(crate::config::Config::default());
 
     const NUM_CLIENTS: usize = 3;
+    const NUM_WORKERS: usize = 4; // 0=Server, 1,2,3=Clients
 
-    // Server worker
-    runtime.spawn_worker(move || {
-        let exec = LocalExecutor::new();
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(NUM_WORKERS),
+            ..Default::default()
+        })
+        .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+        .build()
+        .unwrap();
 
-        let fut = async move {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
-            println!("Server listening on {}", listen_addr);
+    let (done_tx, done_rx) = mpsc::channel();
 
-            // Broadcast address to all clients
-            for _ in 0..NUM_CLIENTS {
-                addr_tx.send(listen_addr).unwrap();
-            }
+    let connection_count_clone = connection_count.clone();
+    runtime.block_on(async move {
+        // Server worker (0)
+        let addr_tx = addr_tx.clone();
+        crate::runtime::context::spawn_to(
+            async move || {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-            let listener_rc = Rc::new(listener);
+                // Broadcast address to all clients
+                for _ in 0..NUM_CLIENTS {
+                    addr_tx.send(listen_addr).unwrap();
+                }
 
-            // Accept all connections
-            for i in 0..NUM_CLIENTS {
-                let (stream, peer) = listener_rc.accept().await.expect("Accept failed");
-                println!("Server accepted connection {} from {}", i, peer);
-                drop(stream);
-            }
-            println!("Server accepted all {} connections", NUM_CLIENTS);
-        };
-        (exec, fut)
+                let listener_rc = Rc::new(listener);
+
+                // Accept all connections
+                for i in 0..NUM_CLIENTS {
+                    let (stream, peer) = listener_rc.accept().await.expect("Accept failed");
+                    println!("Server accepted connection {} from {}", i, peer);
+                    drop(stream);
+                }
+            },
+            0,
+        );
+
+        // Client workers (1..=3)
+        let connection_count_clone = connection_count_clone.clone();
+        for client_id in 1..=NUM_CLIENTS {
+            let rx = addr_rx.clone();
+            let counter = connection_count_clone.clone();
+            let done_tx = done_tx.clone();
+
+            crate::runtime::context::spawn_to(
+                async move || {
+                    let listen_addr = {
+                        rx.lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("Timeout waiting for server address")
+                    };
+
+                    let stream = TcpStream::connect(listen_addr)
+                        .await
+                        .expect("Failed to connect");
+
+                    println!("Client {} connected", client_id);
+                    drop(stream);
+
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    done_tx.send(()).unwrap();
+                },
+                client_id,
+            );
+        }
+
+        // Wait for all clients
+        for _ in 0..NUM_CLIENTS {
+            done_rx.recv().unwrap();
+        }
     });
-
-    // Client workers
-    for client_id in 0..NUM_CLIENTS {
-        let rx = addr_rx.clone();
-        let counter = connection_count.clone();
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
-            let fut = async move {
-                // Get address from shared receiver
-                let listen_addr = {
-                    let rx_guard = rx.lock().unwrap();
-                    rx_guard
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("Timeout waiting for server address")
-                };
-
-                let stream = TcpStream::connect(listen_addr)
-                    .await
-                    .expect("Failed to connect");
-
-                println!("Client {} connected", client_id);
-                drop(stream);
-
-                counter.fetch_add(1, Ordering::SeqCst);
-            };
-            (exec, fut)
-        });
-    }
-
-    runtime.block_on_all();
 
     assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
     println!("All {} clients completed", NUM_CLIENTS);

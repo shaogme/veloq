@@ -77,96 +77,77 @@ fn test_nested_spawn_local() {
 /// Test global spawn works from within the Runtime (injecting into workers).
 #[test]
 fn test_runtime_global_spawn() {
-    let mut runtime = Runtime::new(crate::config::Config::default());
+    // 1 Worker
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
     let (tx, rx) = std::sync::mpsc::channel();
 
-    // Spawn 1 worker that stays alive
-    // Updated to return (LocalExecutor, Future)
-    runtime.spawn_worker(move || {
-        let exec = LocalExecutor::new();
-        let fut = async move {
-            // Keep alive for a bit to allow receiving tasks
-            let mut i = 0;
-            while i < 10 {
-                crate::runtime::context::yield_now().await;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                i += 1;
-            }
-        };
-        (exec, fut)
+    // Block on main thread
+    runtime.block_on(async move {
+        // Spawn a task globally from the main thread
+        let handle = crate::runtime::context::spawn(|| async move { 42 });
+        let res = handle.await;
+        tx.send(res).unwrap();
     });
 
-    // Spawn a task globally from the main thread
-    let _handle = runtime.spawn(async move { 42 });
-
-    // We can't await the handle directly in a blocking test without blocking on the runtime.
-
-    // Let's spawn a task that sends a signal.
-    runtime.spawn(async move {
-        tx.send(true).unwrap();
-    });
-
-    runtime.block_on_all();
-    assert!(rx.recv().unwrap());
+    assert_eq!(rx.recv().unwrap(), 42);
 }
 
 /// Test global spawn works from INSIDE a worker.
+/// Implicitly tested by generic spawn, but let's test specific worker-to-worker or such?
+/// Since we can't easily execute specific code on a specific worker unless we schedule it there:
 #[test]
-fn test_spawn_from_worker() {
-    let mut runtime = Runtime::new(crate::config::Config::default());
+fn test_spawn_from_any_thread() {
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(2)) // 2 workers
+        .build()
+        .unwrap();
+
     let (tx, rx) = std::sync::mpsc::channel();
 
-    // We need to capture the spawner to use it inside the worker,
-    // because `spawn_worker` init_fn doesn't provide a way to get context automatically in the future.
-    let spawner = runtime.spawner();
+    runtime.block_on(async move {
+        // Current context (Main) -> spawn -> (Worker 0/1)
+        let handle = crate::runtime::context::spawn(|| async move {
+            // Inside Worker
+            "hello from worker"
+        });
 
-    runtime.spawn_worker(move || {
-        let exec = LocalExecutor::new();
-        let fut = async move {
-            // Use captured spawner
-            let handle = spawner.spawn(async move { "hello from global" });
-
-            // Wait for it
-            let res = handle.await;
-            tx.send(res).unwrap();
-        };
-        (exec, fut)
+        let res = handle.await;
+        tx.send(res).unwrap();
     });
 
-    runtime.block_on_all();
-    assert_eq!(rx.recv().unwrap(), "hello from global");
+    assert_eq!(rx.recv().unwrap(), "hello from worker");
 }
 
 /// Test using both spawn_local and spawn in a worker.
 #[test]
 fn test_mixed_spawn_in_worker() {
-    let mut runtime = Runtime::new(crate::config::Config::default());
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let spawner = runtime.spawner();
-
-    runtime.spawn_worker(move || {
-        let exec = LocalExecutor::new();
-
-        // 1. spawn_local (!Send) - must be done on exec before returning, or we can't do it easily without cx.
-        // But wait, `exec.spawn_local` works!
+    runtime.block_on(async move {
+        // We are on Main Thread (participating as LocalExecutor)
+        // 1. spawn_local (!Send)
         let rc_val = Rc::new(5);
         let rc_clone = rc_val.clone();
-        let local_handle = exec.spawn_local(async move { *rc_clone * 2 });
+        let local_handle = crate::runtime::context::spawn_local(async move { *rc_clone * 2 });
 
-        let fut = async move {
-            // 2. spawn (Send) - using spawner
-            let global_handle = spawner.spawn(async move { 20 });
+        // 2. spawn (Send) - goes to Worker
+        let global_handle = crate::runtime::context::spawn(|| async move { 20 });
 
-            let v1 = local_handle.await;
-            let v2 = global_handle.await;
+        let v1 = local_handle.await;
+        let v2 = global_handle.await;
 
-            tx.send(v1 + v2).unwrap();
-        };
-        (exec, fut)
+        tx.send(v1 + v2).unwrap();
     });
 
-    runtime.block_on_all();
     assert_eq!(rx.recv().unwrap(), 10 + 20);
 }
 
@@ -174,40 +155,37 @@ fn test_mixed_spawn_in_worker() {
 #[test]
 fn test_multi_worker_throughput() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let mut runtime = Runtime::new(crate::config::Config::default());
-    let counter = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .config(crate::config::Config {
+            worker_threads: Some(2),
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
 
-    // Spawn 2 workers that process tasks until done
-    let c_worker = counter.clone();
-    for _ in 0..2 {
-        let c = c_worker.clone();
-        runtime.spawn_worker(move || {
-            let exec = LocalExecutor::new();
-            let fut = async move {
-                let start = std::time::Instant::now();
-                // Run until we see 50 tasks done or timeout
-                while c.load(Ordering::SeqCst) < 50 {
-                    if start.elapsed() > std::time::Duration::from_secs(5) {
-                        break;
-                    }
-                    crate::runtime::context::yield_now().await;
-                }
-            };
-            (exec, fut)
-        });
-    }
+    let counter = Arc::new(AtomicUsize::new(0));
 
     // Spawn 50 global tasks
     for _ in 0..50 {
         let c = counter.clone();
-        runtime.spawn(async move {
+        runtime.spawn(|| async move {
             c.fetch_add(1, Ordering::SeqCst);
         });
     }
 
-    runtime.block_on_all();
+    let counter_clone = counter.clone();
+    runtime.block_on(async move {
+        // Wait for completion
+        let start = std::time::Instant::now();
+        while counter_clone.load(Ordering::SeqCst) < 50 {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+            crate::runtime::context::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
 
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(final_count, 50);
-    println!("Processed {} tasks", final_count);
 }

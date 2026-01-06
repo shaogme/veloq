@@ -52,11 +52,7 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
     pub fn remove(&mut self, user_data: usize) -> OpEntry<Op, P> {
         self.slab.remove(user_data)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.slab.is_empty()
-    }
-
+    
     #[cfg(target_os = "windows")]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut OpEntry<Op, P>)> {
         self.slab.iter_mut()

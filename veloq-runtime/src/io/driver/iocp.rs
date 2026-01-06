@@ -312,14 +312,11 @@ impl Driver for IocpDriver {
     }
 
     fn wait(&mut self) -> io::Result<()> {
-        if self.ops.is_empty() {
-            return Ok(());
-        }
         self.get_completion(u32::MAX)
     }
 
     fn process_completions(&mut self) {
-        let _ = self.get_completion(1);
+        let _ = self.get_completion(0);
     }
 
     fn cancel_op(&mut self, user_data: usize) {

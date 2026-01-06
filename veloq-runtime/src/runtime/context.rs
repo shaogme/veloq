@@ -94,17 +94,17 @@ impl RuntimeContext {
     ///
     /// # Panics
     /// Panics if the current executor does not have a global spawner.
-    pub fn spawn_balanced<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub fn spawn_balanced<F, Output>(&self, async_fn: F) -> JoinHandle<Output>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: AsyncFnOnce() -> Output + Send + 'static,
+        Output: Send + 'static,
     {
         let spawner = self
             .spawner
             .as_ref()
             .expect("spawn() called on a context without a global spawner");
 
-        let (handle, job) = crate::runtime::executor::pack_job(future);
+        let (handle, job) = crate::runtime::executor::pack_job(async_fn);
 
         self.spawn_impl(job, spawner);
         handle
@@ -117,16 +117,18 @@ impl RuntimeContext {
     ///
     /// If the current context does not have a local executor handle (unlikely in normal operation),
     /// it falls back to `spawn_balanced`.
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub fn spawn<F, Output>(&self, async_fn: F) -> JoinHandle<Output>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: AsyncFnOnce() -> Output + Send + 'static,
+        Output: Send + 'static,
     {
-        let (join_handle, job) = crate::runtime::executor::pack_job(future);
+        let (join_handle, job) = crate::runtime::executor::pack_job(async_fn);
 
-        self.handle.injector.push(job);
+        self.handle.shared.injector.push(job);
         self.handle
+            .shared
             .injected_load
+            .0
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // We are running on this thread, so no need to wake.
@@ -194,25 +196,33 @@ impl RuntimeContext {
     /// # Panics
     /// Panics if called outside of a runtime context, if the executor registry is missing,
     /// or if the `worker_id` is invalid.
-    pub fn spawn_to<F>(&self, future: F, worker_id: usize) -> JoinHandle<F::Output>
+    pub fn spawn_to<F, Output>(&self, async_fn: F, worker_id: usize) -> JoinHandle<Output>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: AsyncFnOnce() -> Output + Send + 'static,
+        Output: Send + 'static,
     {
         let spawner = self
             .spawner
             .as_ref()
             .expect("spawn_to() called on a context without a global spawner");
 
-        let (handle, job) = crate::runtime::executor::pack_job(future);
+        let (handle, job) = crate::runtime::executor::pack_job(async_fn);
 
         // Optimization: If spawning to self, just push to local queue
         if self.handle.id() == worker_id {
+            // But Job is now a factory. We need to instantiate it.
+            // Queue expects Rc<Task> with instantiated future.
+
+            // Wait, we are in context.rs, we can't access enqueue_job directly on Executor.
+            // But we have self.queue (Weak).
             let queue = self
                 .queue
                 .upgrade()
                 .expect("executor has been dropped but context remains?");
-            let task = Task::new(job, self.queue.clone());
+
+            // Instantiate Future!
+            let future = job();
+            let task = Task::from_boxed(future, self.queue.clone());
             queue.borrow_mut().push_back(task);
             return handle;
         }
@@ -319,12 +329,12 @@ pub fn current_pool() -> Option<AnyBufPool> {
 ///
 /// Panics if called outside of a runtime context, or if the current runtime does not support
 /// global spawning (missing executor registry).
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+pub fn spawn<F, Output>(async_fn: F) -> JoinHandle<Output>
 where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: AsyncFnOnce() -> Output + Send + 'static,
+    Output: Send + 'static,
 {
-    current().spawn(future)
+    current().spawn(async_fn)
 }
 
 /// Spawns a `!Send` future on the current thread.
@@ -348,10 +358,10 @@ where
 /// # Panics
 ///
 /// Panics if called outside of a runtime context, or if the `worker_id` is invalid.
-pub fn spawn_to<F>(future: F, worker_id: usize) -> JoinHandle<F::Output>
+pub fn spawn_to<F, Output>(async_fn: F, worker_id: usize) -> JoinHandle<Output>
 where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: AsyncFnOnce() -> Output + Send + 'static,
+    Output: Send + 'static,
 {
-    current().spawn_to(future, worker_id)
+    current().spawn_to(async_fn, worker_id)
 }

@@ -129,7 +129,7 @@ impl OpenOptions {
         // ensure null termination
         let len = path_bytes.len() + 1;
 
-        let mut buf = match pool.alloc_len(len) {
+        let mut buf = match pool.alloc(len) {
             Some(buf) => buf,
             None => {
                 return Err(std::io::Error::new(
