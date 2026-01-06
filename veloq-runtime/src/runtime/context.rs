@@ -10,6 +10,7 @@ use std::rc::{Rc, Weak};
 
 use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
+use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::Task;
@@ -65,6 +66,7 @@ pub struct RuntimeContext {
     pub(crate) queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
+    pub(crate) handle: Option<ExecutorHandle>,
 }
 
 impl RuntimeContext {
@@ -74,20 +76,25 @@ impl RuntimeContext {
         queue: Weak<RefCell<VecDeque<Rc<Task>>>>,
         spawner: Option<Spawner>,
         mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
+        handle: Option<ExecutorHandle>,
     ) -> Self {
         Self {
             driver,
             queue,
             spawner,
             mesh,
+            handle,
         }
     }
 
-    /// Spawn a new task on the current executor.
+    /// Spawn a new task on the current executor using a balanced strategy (P2C).
+    ///
+    /// This will try to distribute the task to a less loaded worker using Power of Two Choices
+    /// or Mesh fabric if available.
     ///
     /// # Panics
-    /// Panics if the current executor does not have a global spawner (e.g. some local-only configurations).
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    /// Panics if the current executor does not have a global spawner.
+    pub fn spawn_balanced<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -105,6 +112,37 @@ impl RuntimeContext {
 
         self.spawn_impl(job, spawner);
         handle
+    }
+
+    /// Spawn a new task on the current executor.
+    ///
+    /// This method prioritizes putting the task into the current worker's public injector queue,
+    /// allowing it to be picked up by the current worker later or stolen by other workers.
+    ///
+    /// If the current context does not have a local executor handle (unlikely in normal operation),
+    /// it falls back to `spawn_balanced`.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        if let Some(handle) = &self.handle {
+            let (join_handle, producer) = JoinHandle::new();
+            let job = Box::pin(async move {
+                let output = future.await;
+                producer.set(output);
+            });
+
+            handle.injector.push(job);
+            handle
+                .injected_load
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // We are running on this thread, so no need to wake.
+            join_handle
+        } else {
+            self.spawn_balanced(future)
+        }
     }
 
     fn spawn_impl(&self, job: crate::runtime::executor::Job, spawner: &Spawner) {

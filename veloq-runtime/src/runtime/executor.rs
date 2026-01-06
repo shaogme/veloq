@@ -426,6 +426,7 @@ impl LocalExecutor {
             Rc::downgrade(&self.queue),
             spawner,
             mesh_weak,
+            Some(self.handle()),
         );
 
         let _guard = crate::runtime::context::enter(context);
