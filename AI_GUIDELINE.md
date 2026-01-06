@@ -17,6 +17,7 @@
 - **构建**: `cargo build`
 - **测试**: `cargo test`
 - **运行单个测试**: `cargo test test_name`
+- **运行 Loom 测试**: `cargo test -p veloq-queue --features loom --test loom --release` (推荐使用 release 模式以加快验证)
 - **Lint**: `cargo clippy`
 - **格式化**: `cargo fmt`
 
@@ -28,7 +29,7 @@
 
 ## 架构 (Architecture)
 
-本项目包含两个核心 Crate：`veloq-wheel` 和 `veloq-runtime`。
+本项目包含三个核心 Crate：`veloq-wheel`、`veloq-queue` 和 `veloq-runtime`。
 
 ### `veloq-wheel`
 高性能分层时间轮 (Hierarchical Timing Wheel)。
@@ -39,6 +40,13 @@
 - **关键机制**:
   - **惰性取消 (Lazy Cancellation)**: `cancel()` 仅将任务标记为已移除（将 `item` 设为 `None`）。任务在 `advance()` 推进到相应槽位时才会被物理移除。这避免了昂贵的链表解绑操作。
   - **级联 (Cascading)**: 随着时间推进，高层级 (L1) 的任务会被移动到 L0 或过期。
+
+### `veloq-queue`
+高性能并发队列库。
+- **MpscQueue**:
+  - 无锁、线性化、多生产者单消费者队列。
+  - 基于 Vyukov MPSC 算法。
+  - **Loom 测试**: 使用 `loom` 验证并发安全性（内存顺序、原子操作）。
 
 ### `veloq-runtime`
 高性能异步 I/O 运行时。
@@ -74,6 +82,7 @@
 
 ## 代码结构 (Code Structure)
 - `veloq-wheel/`: 核心时间轮库。
+- `veloq-queue/`: 高性能并发队列。
 - `veloq-runtime/`: 异步运行时。
   - `src/io/`: I/O 驱动和缓冲区管理。
   - `src/runtime/`: 任务执行、调度逻辑及 Mesh 网络。
@@ -92,3 +101,11 @@
     - **验证步骤**：在使用替换工具前，**必须**先使用 `view_file` 读取目标文件的最新内容和行号，严禁凭记忆或旧的 `view_file` 结果进行操作，因为文件行号可能因之前的编辑而改变。
     - **失败处理**：如果工具报错 "target content not found"，请重新 `view_file` 确认内容和行号，检查是否有隐藏字符或缩进差异。
     - **建议**: 在大面积修改文件时使用 `write_to_file`，多部分修改时使用 `multi_replace_file_content`，单部分修改时使用 `replace_file_content`。
+
+- **view_file**:
+    - **操作前必读**：执行任何修改操作前，**必须**读取文件的最新状态。严禁依赖历史读取结果。
+    - **行号确认**：确保目标行号与当前文件内容一致。
+
+- **run_command**:
+    - **后台运行**：对于耗时命令（如 Loom 测试），应合理设置 `WaitMsBeforeAsync`。若命令长时间未返回，请通过 `command_status` 检查进度。
+    - **环境隔离**：运行测试时，尽量使用 `--lib` 或具体的 test case 缩小范围，避免无关编译错误干扰。
