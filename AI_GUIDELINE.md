@@ -10,6 +10,8 @@
     *   模块 `foo` 应该定义在 `foo.rs` 中。如果 `foo` 有子模块，应创建 `foo/` 目录，但父模块代码仍保留在 `foo.rs` 中，而不是 `foo/mod.rs`。
 3.  **禁止猜测**：严禁猜测代码逻辑或文件内容。在修改或回答之前，必须先读取相关代码。
 4.  **主动报告**：在阅读代码时，主动发现并报告潜在的错误、安全漏洞或性能问题，不要等到用户询问。
+5.  **绝对路径**：在使用任何文件修改工具（如 `write_to_file`, `replace_file_content`）时，**必须**使用文件的**绝对路径**。
+6.  **Rust Edition 2024**：本项目采用 **Rust Edition 2024**。请充分利用新特性，特别是**异步闭包 (Async Closures)** 和  `AsyncFnOnce` / `AsyncFnMut` / `AsyncFn` trait 的内置支持，避免手动装箱 `Future`。
 
 ## 常用命令 (Commands)
 
@@ -46,11 +48,11 @@
   - **Runtime Core (`src/runtime/`)**:
     - **Mesh (`mesh.rs`)**: 无锁 SPSC 环形缓冲区，用于 Worker 间通信。使用 `#[repr(align(128))]` 防止伪共享。
     - **Executor (`executor.rs`)**:
-      - `LocalExecutor`: 线程局部执行器。
+      - `LocalExecutor`: 线程局部执行器。启动时会自动检测并注册当前线程绑定的 `BufPool`。
       - **调度**: 实现工作窃取 (Work Stealing) 和 P2C (Power of Two Choices)。
       - **策略**: Mesh 消息优先，使用 `BUDGET` 防止 I/O 饿死。
     - **Infrastructure**:
-      - `context.rs`: 线程局部上下文管理。
+      - `context.rs`: 线程局部上下文管理。负责维护 `RuntimeContext` 及线程绑定的 `BufPool`（通过 `bind_pool`）。
       - `task.rs`: 基于 `Rc` 的任务封装，手动实现 `RawWakerVTable`。
   - **Driver (`src/io/driver.rs`)**:
     - 平台特定 I/O 的抽象层（Linux 上使用 io_uring，Windows 上使用 IOCP）。
@@ -70,7 +72,7 @@
   - **Buffers (`src/io/buffer.rs`)**:
     - `BufPool`: 内存池 Trait。
     - `FixedBuf`: 具有稳定地址的缓冲区，用于异步 I/O（io_uring 所需）。
-    - `BuddyPool`/`HybridPool`: 具体的分配器实现。
+    - `BuddyPool`/`HybridPool`: 具体的分配器实现。**注意**：`BufPool` 现在必须通过 `context::bind_pool` 绑定到线程，否则会导致 IO 错误或 Panic。
 
 ## 代码结构 (Code Structure)
 - `veloq-wheel/`: 核心时间轮库。
@@ -81,11 +83,13 @@
 ## 工具使用说明 (Tool Usage Guidelines)
 
 - **write_to_file**:
+    - **绝对路径**：参数 `TargetFile` **必须**使用**绝对路径**。
     - 该工具默认**不会覆盖**现有文件。
     - 如果意图是**更新**或**覆盖**文件内容，必须显式将 `Overwrite` 参数设置为 `true`，否则工具会报错。
     - 修改部分代码时，优先使用 `replace_file_content` 或 `multi_replace_file_content`，仅在需要大面积修改文件或创建新文件时使用 `write_to_file`。
 
 - **replace_file_content** / **multi_replace_file_content**:
+    - **绝对路径**：参数 `TargetFile` **必须**使用**绝对路径**。
     - **精确匹配**：`TargetContent` 必须与文件内容**完全一致**，包括空格、缩进和换行符。
     - **上下文唯一性**：务必提供足够的上下文行，确保 `TargetContent` 在目标范围内是**唯一**的。如果匹配到多个实例，工具会报错。
     - **行号一致性**：`StartLine` 和 `EndLine` 必须准确包裹 `TargetContent`。如果 `TargetContent` 跨越了指定的行范围，替换将失败。

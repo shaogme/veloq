@@ -12,6 +12,7 @@ use crate::io::buffer::{AnyBufPool, BufPool};
 use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
+use crate::runtime::executor::spawner::pack_job;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::Task;
 
@@ -104,7 +105,7 @@ impl RuntimeContext {
             .as_ref()
             .expect("spawn() called on a context without a global spawner");
 
-        let (handle, job) = crate::runtime::executor::pack_job(async_fn);
+        let (handle, job) = pack_job(async_fn);
 
         self.spawn_impl(job, spawner);
         handle
@@ -122,7 +123,7 @@ impl RuntimeContext {
         F: AsyncFnOnce() -> Output + Send + 'static,
         Output: Send + 'static,
     {
-        let (join_handle, job) = crate::runtime::executor::pack_job(async_fn);
+        let (join_handle, job) = pack_job(async_fn);
 
         self.handle.shared.injector.push(job);
         self.handle
@@ -206,7 +207,7 @@ impl RuntimeContext {
             .as_ref()
             .expect("spawn_to() called on a context without a global spawner");
 
-        let (handle, job) = crate::runtime::executor::pack_job(async_fn);
+        let (handle, job) = pack_job(async_fn);
 
         // Optimization: If spawning to self, just push to local queue
         if self.handle.id() == worker_id {
