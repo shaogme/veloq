@@ -82,12 +82,12 @@ impl UringDriver {
         let mut builder = IoUring::builder();
 
         builder
-            .setup_coop_taskrun() // Reduce IPIs
-            .setup_single_issuer() // Optimized for single-threaded submission
-            .setup_defer_taskrun(); // Defer work until enter
+            .setup_coop_taskrun() // Reduce IPIs (Kernel 5.19+)
+            .setup_single_issuer() // Optimized for single-threaded submission (Kernel 6.0+)
+            .setup_defer_taskrun(); // Defer work until enter (Kernel 6.1+)
 
         if config.uring.mode == crate::config::IoMode::Polling {
-            builder.setup_sqpoll(config.uring.sqpoll_idle_ms);
+            builder.setup_sqpoll(config.uring.sqpoll_idle_ms); // Kernel 5.1+
         }
 
         let ring = builder.build(entries).or_else(|e| {
@@ -593,17 +593,12 @@ impl Driver for UringDriver {
 
     fn notify_mesh(&mut self, handle: crate::io::op::RawHandle) -> io::Result<()> {
         let fd = handle as i32;
-        // Send a MsgRing to the target ring.
+        // Send a MsgRing to the target ring. (Kernel 5.18+)
         // We set data to BACKGROUND_USER_DATA so the target treats it as a wake-up (and ignores the CQE).
         // We set our user_data to BACKGROUND_USER_DATA so we also ignore the completion of the MsgRing op itself.
-        let sqe = opcode::MsgRingData::new(
-            io_uring::types::Fd(fd),
-            0,
-            BACKGROUND_USER_DATA,
-            None,
-        )
-        .build()
-        .user_data(BACKGROUND_USER_DATA);
+        let sqe = opcode::MsgRingData::new(io_uring::types::Fd(fd), 0, BACKGROUND_USER_DATA, None)
+            .build()
+            .user_data(BACKGROUND_USER_DATA);
 
         if !self.push_entry(sqe) {
             return Err(io::Error::new(io::ErrorKind::Other, "SQ full"));

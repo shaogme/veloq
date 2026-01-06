@@ -180,63 +180,63 @@ define_uring_ops! {
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
         get_fd: submit::get_fd_read_fixed,
-    },
+    }, // Kernel 5.1+
     WriteFixed {
         field: write,
         make_sqe: submit::make_sqe_write_fixed,
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
         get_fd: submit::get_fd_write_fixed,
-    },
+    }, // Kernel 5.1+
     Recv {
         field: recv,
         make_sqe: submit::make_sqe_recv,
         on_complete: submit::on_complete_recv,
         drop: submit::drop_recv,
         get_fd: submit::get_fd_recv,
-    },
+    }, // Kernel 5.6+
     OpSend {
         field: send,
         make_sqe: submit::make_sqe_send,
         on_complete: submit::on_complete_send,
         drop: submit::drop_send,
         get_fd: submit::get_fd_send,
-    },
+    }, // Kernel 5.6+
     Connect {
         field: connect,
         make_sqe: submit::make_sqe_connect,
         on_complete: submit::on_complete_connect,
         drop: submit::drop_connect,
         get_fd: submit::get_fd_connect,
-    },
+    }, // Kernel 5.5+
     Close {
         field: close,
         make_sqe: submit::make_sqe_close,
         on_complete: submit::on_complete_close,
         drop: submit::drop_close,
         get_fd: submit::get_fd_close,
-    },
+    }, // Kernel 5.6+
     Fsync {
         field: fsync,
         make_sqe: submit::make_sqe_fsync,
         on_complete: submit::on_complete_fsync,
         drop: submit::drop_fsync,
         get_fd: submit::get_fd_fsync,
-    },
+    }, // Kernel 5.1+
     SyncFileRange {
         field: sync_range,
         make_sqe: submit::make_sqe_sync_range,
         on_complete: submit::on_complete_sync_range,
         drop: submit::drop_sync_range,
         get_fd: submit::get_fd_sync_range,
-    },
+    }, // Kernel 5.2+
     Fallocate {
         field: fallocate,
         make_sqe: submit::make_sqe_fallocate,
         on_complete: submit::on_complete_fallocate,
         drop: submit::drop_fallocate,
         get_fd: submit::get_fd_fallocate,
-    },
+    }, // Kernel 5.6+
     Accept {
         field: accept,
         payload: AcceptPayload,
@@ -246,7 +246,7 @@ define_uring_ops! {
         get_fd: submit::get_fd_accept,
         construct: |op| AcceptPayload { op },
         destruct: |p: AcceptPayload| p.op,
-    },
+    }, // Kernel 5.5+
     SendTo {
         field: send_to,
         payload: SendToPayload,
@@ -265,7 +265,7 @@ define_uring_ops! {
             }
         },
         destruct: |p: SendToPayload| p.op,
-    },
+    }, // Kernel 5.1+ (via SendMsg)
     RecvFrom {
         field: recv_from,
         payload: RecvFromPayload,
@@ -281,7 +281,7 @@ define_uring_ops! {
             msghdr: unsafe { std::mem::zeroed() },
         },
         destruct: |p: RecvFromPayload| p.op,
-    },
+    }, // Kernel 5.1+ (via RecvMsg)
     Open {
         field: open,
         payload: OpenPayload,
@@ -291,7 +291,7 @@ define_uring_ops! {
         get_fd: submit::get_fd_open,
         construct: |op| OpenPayload { op },
         destruct: |p: OpenPayload| p.op,
-    },
+    }, // Kernel 5.6+ (via OpenAt)
     Wakeup {
         field: wakeup,
         payload: WakeupPayload,
@@ -301,7 +301,7 @@ define_uring_ops! {
         get_fd: submit::get_fd_wakeup,
         construct: |op| WakeupPayload { op, buf: [0; 8] },
         destruct: |p: WakeupPayload| p.op,
-    },
+    }, // Kernel 5.6+ (via Read)
     Timeout {
         field: timeout,
         payload: TimeoutPayload,
@@ -311,5 +311,5 @@ define_uring_ops! {
         get_fd: submit::get_fd_timeout,
         construct: |op| TimeoutPayload { op, ts: [0; 2] },
         destruct: |p: TimeoutPayload| p.op,
-    },
+    }, // Kernel 5.4+
 }
