@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-veloq-queue = { path = "../veloq-queue" }
+crossbeam-queue = "0.3"
 num_cpus = "1.17.0"
 veloq-bitset = { path = "../veloq-bitset" }
 

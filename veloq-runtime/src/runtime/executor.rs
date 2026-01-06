@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use veloq_queue::MpscQueue;
+use crossbeam_queue::SegQueue;
 
 use crate::runtime::mesh::{self, Consumer, Producer};
 
@@ -83,7 +83,7 @@ impl MeshContext {
 #[derive(Clone)]
 pub struct ExecutorHandle {
     pub(crate) id: usize,
-    pub(crate) injector: Arc<MpscQueue<Job>>,
+    pub(crate) injector: Arc<SegQueue<Job>>,
     pub(crate) waker: Arc<dyn RemoteWaker>,
     pub(crate) injected_load: Arc<AtomicUsize>,
     pub(crate) local_load: Arc<AtomicUsize>,
@@ -235,7 +235,7 @@ impl LocalExecutorBuilder {
         LocalExecutor {
             driver: Rc::new(RefCell::new(driver)),
             queue,
-            injector: Arc::new(MpscQueue::new()),
+            injector: Arc::new(SegQueue::new()),
             injected_load: Arc::new(AtomicUsize::new(0)),
             local_load: Arc::new(AtomicUsize::new(0)),
             registry: None,
@@ -251,7 +251,7 @@ pub struct LocalExecutor {
     queue: Arc<Mutex<VecDeque<Arc<Task>>>>,
 
     // Always present components for task injection
-    injector: Arc<MpscQueue<Job>>,
+    injector: Arc<SegQueue<Job>>,
     injected_load: Arc<AtomicUsize>,
     local_load: Arc<AtomicUsize>,
 
@@ -473,6 +473,8 @@ impl LocalExecutor {
                                 continue;
                             }
 
+                            // Steal from injector
+                            // SegQueue is safe for concurrent pop (MPMC)
                             if let Some(job) = target.injector.pop() {
                                 target.injected_load.fetch_sub(1, Ordering::Relaxed);
                                 self.local_load.fetch_add(1, Ordering::Relaxed);
