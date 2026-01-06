@@ -179,15 +179,18 @@ impl Spawner {
         handle
     }
 
-    pub(crate) fn spawn_job(&self, job: Job) {
+    fn select_worker(&self) -> ExecutorHandle {
         let reader = self.reader.borrow();
         let workers = reader.load();
 
-        if let Some(target) = self.p2c_select(&workers) {
-            target.schedule(job);
-        } else {
-            panic!("No workers available in registry");
+        match self.p2c_select(&workers) {
+            Some(target) => target.clone(),
+            None => panic!("No workers available in registry"),
         }
+    }
+
+    pub(crate) fn spawn_job(&self, job: Job) {
+        self.select_worker().schedule(job);
     }
 
     pub(crate) fn spawn_with_mesh(
@@ -196,29 +199,24 @@ impl Spawner {
         mesh: &RefCell<MeshContext>,
         driver: &RefCell<PlatformDriver>,
     ) {
-        let reader = self.reader.borrow();
-        let workers = reader.load();
+        let target = self.select_worker();
 
-        if let Some(target) = self.p2c_select(&workers) {
-            // Try mesh first if target has ID
-            if target.id() != usize::MAX {
-                let mut mesh = mesh.borrow_mut();
-                let mut driver = driver.borrow_mut();
+        // Try mesh first if target has ID
+        if target.id() != usize::MAX {
+            let mut mesh = mesh.borrow_mut();
+            let mut driver = driver.borrow_mut();
 
-                if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
-                    // Fallback on full/error -> inject
-                    drop(mesh);
-                    drop(driver);
-                    target.schedule(returned_job);
-                }
-                return;
+            if let Err(returned_job) = mesh.send_to(target.id(), job, &mut driver) {
+                // Fallback on full/error -> inject
+                drop(mesh);
+                drop(driver);
+                target.schedule(returned_job);
             }
-
-            // No valid ID (unlikely for registered worker) -> inject
-            target.schedule(job);
-        } else {
-            panic!("No workers available in registry");
+            return;
         }
+
+        // No valid ID (unlikely for registered worker) -> inject
+        target.schedule(job);
     }
 
     fn p2c_select<'a>(&self, workers: &'a [ExecutorHandle]) -> Option<&'a ExecutorHandle> {
@@ -456,6 +454,95 @@ impl LocalExecutor {
         self.mesh = Some(Rc::new(RefCell::new(mesh)));
     }
 
+    fn enqueue_job(&self, job: Job) {
+        self.local_load.fetch_add(1, Ordering::Relaxed);
+        let task = Task::new(job, Rc::downgrade(&self.queue));
+        self.queue.borrow_mut().push_back(task);
+    }
+
+    fn try_poll_mesh(&self) -> bool {
+        if let Some(mesh_rc) = &self.mesh {
+            let mut mesh = mesh_rc.borrow_mut();
+            return mesh.poll_ingress(|job| self.enqueue_job(job));
+        }
+        false
+    }
+
+    fn try_poll_injector(&self) -> bool {
+        if let Some(job) = self.injector.pop() {
+            self.injected_load.fetch_sub(1, Ordering::Relaxed);
+            self.enqueue_job(job);
+            return true;
+        }
+        false
+    }
+
+    fn try_steal(&self, executed: usize) -> bool {
+        if let Some(reader) = &self.registry_reader {
+            let workers = reader.load();
+            let count = workers.len();
+
+            if count > 0 {
+                let seed = self as *const _ as usize;
+                let start_idx = seed.wrapping_add(executed);
+
+                for i in 0..count {
+                    let idx = (start_idx + i) % count;
+                    let target = &workers[idx];
+
+                    if Arc::ptr_eq(&target.injector, &self.injector) {
+                        continue;
+                    }
+
+                    // Steal from injector
+                    if let Some(job) = target.injector.pop() {
+                        target.injected_load.fetch_sub(1, Ordering::Relaxed);
+                        self.enqueue_job(job);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn park_and_wait(&self, main_woken: &RefCell<bool>) {
+        let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
+        let mut driver = self.driver.borrow_mut();
+
+        if has_pending_tasks {
+            driver.submit_queue().unwrap();
+            driver.process_completions();
+        } else {
+            let mut can_park = true;
+
+            if let Some(mesh_rc) = &self.mesh {
+                let mut mesh = mesh_rc.borrow_mut();
+                // 1. Set PARKING
+                mesh.state.store(mesh::PARKING, Ordering::Release);
+
+                // 2. Poll Mesh (Double check)
+                if mesh.poll_ingress(|job| self.enqueue_job(job)) {
+                    mesh.state.store(mesh::RUNNING, Ordering::Relaxed);
+                    can_park = false;
+                } else {
+                    // 3. Commit PARKED
+                    mesh.state.store(mesh::PARKED, Ordering::Release);
+                }
+            }
+
+            if can_park {
+                driver.wait().unwrap();
+            }
+
+            // Restore RUNNING
+            if let Some(mesh_rc) = &self.mesh {
+                let mesh = mesh_rc.borrow();
+                mesh.state.store(mesh::RUNNING, Ordering::Release);
+            }
+        }
+    }
+
     pub fn block_on<F>(&mut self, future: F) -> F::Output
     where
         F: Future,
@@ -466,7 +553,7 @@ impl LocalExecutor {
         let mesh_weak = self.mesh.as_ref().map(Rc::downgrade);
 
         let context = RuntimeContext::new(
-            Rc::downgrade(&self.driver),
+            self.driver_handle(),
             Rc::downgrade(&self.queue),
             spawner,
             mesh_weak,
@@ -494,29 +581,15 @@ impl LocalExecutor {
 
         const BUDGET: usize = 64;
 
-        let queue_weak = Rc::downgrade(&self.queue);
-        let local_load = self.local_load.clone();
-        let queue = self.queue.clone();
-
         loop {
             let mut executed = 0;
-
-            let mut activate_job = |job: Job| {
-                local_load.fetch_add(1, Ordering::Relaxed);
-                let task = Task::new(job, queue_weak.clone());
-                queue.borrow_mut().push_back(task);
-            };
 
             while executed < BUDGET {
                 let mut did_work = false;
 
-                // 0. Poll Mesh (Highest Priority for responsiveness)
-                if let Some(mesh_rc) = &self.mesh {
-                    // Start a scope to borrow mesh temporarily
-                    let mut mesh = mesh_rc.borrow_mut();
-                    if mesh.poll_ingress(&mut activate_job) {
-                        did_work = true;
-                    }
+                // 0. Poll Mesh (Highest Priority)
+                if self.try_poll_mesh() {
+                    did_work = true;
                 }
 
                 // 1. Poll Main Future
@@ -539,39 +612,13 @@ impl LocalExecutor {
                 }
 
                 // 3. Poll Injector
-                if let Some(job) = self.injector.pop() {
-                    self.injected_load.fetch_sub(1, Ordering::Relaxed);
-                    activate_job(job);
+                if self.try_poll_injector() {
                     continue;
                 }
 
-                // 4. Steal from Registry (Work Stealing)
-                if let Some(reader) = &self.registry_reader {
-                    let workers = reader.load();
-                    let count = workers.len();
-
-                    if count > 0 {
-                        let seed = self as *const _ as usize;
-                        let start_idx = seed.wrapping_add(executed);
-
-                        for i in 0..count {
-                            let idx = (start_idx + i) % count;
-                            let target = &workers[idx];
-
-                            if Arc::ptr_eq(&target.injector, &self.injector) {
-                                continue;
-                            }
-
-                            // Steal from injector
-                            // SegQueue is safe for concurrent pop (MPMC)
-                            if let Some(job) = target.injector.pop() {
-                                target.injected_load.fetch_sub(1, Ordering::Relaxed);
-                                activate_job(job);
-                                did_work = true;
-                                break;
-                            }
-                        }
-                    }
+                // 4. Steal from Registry
+                if self.try_steal(executed) {
+                    did_work = true;
                 }
 
                 if !did_work {
@@ -579,41 +626,8 @@ impl LocalExecutor {
                 }
             }
 
-            // 5. IO Wait
-            let has_pending_tasks = !self.queue.borrow().is_empty() || *main_woken.borrow();
-            let mut driver = self.driver.borrow_mut();
-
-            if has_pending_tasks {
-                driver.submit_queue().unwrap();
-                driver.process_completions();
-            } else {
-                let mut can_park = true;
-
-                if let Some(mesh_rc) = &self.mesh {
-                    let mut mesh = mesh_rc.borrow_mut();
-                    // 1. Set PARKING
-                    mesh.state.store(mesh::PARKING, Ordering::Release);
-
-                    // 2. Poll Mesh (Double check)
-                    if mesh.poll_ingress(&mut activate_job) {
-                        mesh.state.store(mesh::RUNNING, Ordering::Relaxed);
-                        can_park = false;
-                    } else {
-                        // 3. Commit PARKED
-                        mesh.state.store(mesh::PARKED, Ordering::Release);
-                    }
-                }
-
-                if can_park {
-                    driver.wait().unwrap();
-                }
-
-                // Restore RUNNING
-                if let Some(mesh_rc) = &self.mesh {
-                    let mesh = mesh_rc.borrow();
-                    mesh.state.store(mesh::RUNNING, Ordering::Release);
-                }
-            }
+            // 5. IO Wait & Park
+            self.park_and_wait(&main_woken);
         }
     }
 }
