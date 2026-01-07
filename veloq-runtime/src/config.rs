@@ -42,10 +42,10 @@ impl Default for IocpConfig {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct Config {
-    pub(crate) uring: UringConfig,
-    pub(crate) iocp: IocpConfig,
-    pub(crate) worker_threads: Option<usize>,
-    pub(crate) direct_io: bool,
+    pub uring: UringConfig,
+    pub iocp: IocpConfig,
+    pub worker_threads: Option<usize>,
+    pub direct_io: bool,
 }
 
 impl Config {

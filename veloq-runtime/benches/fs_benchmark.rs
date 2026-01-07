@@ -2,11 +2,12 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::BuddyPool;
-
+use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool};
+use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 
 fn benchmark_1gb_write(c: &mut Criterion) {
@@ -120,129 +121,160 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const FILE_COUNT: usize = 32;
+    const WORKER_COUNT: usize = 4;
     const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
     const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
+    const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT;
+
+    // Ensure accurate division
+    assert_eq!(FILES_PER_WORKER * WORKER_COUNT, FILE_COUNT);
 
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
+    // Initialize Runtime with 4 workers and BuddyPool
+    let runtime = Runtime::builder()
+        .config(veloq_runtime::config::Config {
+            worker_threads: Some(WORKER_COUNT),
+            ..Default::default()
+        })
+        .pool_constructor(|_| AnyBufPool::new(BuddyPool::new().unwrap()))
+        .build()
+        .unwrap();
+
     group.bench_function("write_32_files_concurrent", |b| {
-        let mut exec = LocalExecutor::default();
-        let pool = BuddyPool::new().unwrap();
-
-        let pool_for_bench = pool.clone();
-
         b.iter(|| {
-            let pool_inner = pool_for_bench.clone();
-            // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
-            exec.block_on(async move {
-                // let cx = veloq_runtime::runtime::context::current();
-                let pool = pool_inner;
-                let _ = veloq_runtime::runtime::context::try_bind_pool(pool.clone());
+            // Block on runtime to keep 'b.iter' scope valid until all done
+            runtime.block_on(async {
+                let (tx, rx) = mpsc::channel();
 
-                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-                let chunk_size = CHUNK_SIZE;
+                for i in 0..WORKER_COUNT {
+                    let tx = tx.clone();
 
-                let mut files = Vec::with_capacity(FILE_COUNT);
-                let mut file_paths = Vec::with_capacity(FILE_COUNT);
+                    // Spawn to specific worker
+                    veloq_runtime::runtime::context::spawn_to(async move || {
+                        // Get the pool bound to this worker (correctly registered)
+                        let pool = veloq_runtime::runtime::context::current_pool()
+                            .expect("Worker should have bound pool");
 
-                for i in 0..FILE_COUNT {
-                    let path_str = format!("bench_32_{}.tmp", i);
-                    let path = PathBuf::from(path_str);
+                        // Use a clone for inner loop if needed, though AnyBufPool is cheap to clone
+                        // We will need to call .alloc() on it.
 
-                    if path.exists() {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                        let chunk_size = CHUNK_SIZE;
 
-                    let file = File::options()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .buffering(BufferingMode::DirectSync)
-                        .open(&path)
-                        .await
-                        .expect("Failed to create");
-                    let file = Rc::new(file);
+                        let start_file_idx = i * FILES_PER_WORKER;
+                        let end_file_idx = start_file_idx + FILES_PER_WORKER;
 
-                    file.fallocate(0, FILE_SIZE)
-                        .await
-                        .expect("Fallocate failed");
+                        let mut files = Vec::with_capacity(FILES_PER_WORKER);
+                        let mut file_paths = Vec::with_capacity(FILES_PER_WORKER);
 
-                    files.push(file);
-                    file_paths.push(path);
-                }
+                        // 1. Open and Fallocate files
+                        for f_idx in start_file_idx..end_file_idx {
+                            let path_str = format!("bench_32_{}.tmp", f_idx);
+                            let path = PathBuf::from(path_str);
 
-                let concurrency_limit = 32;
-                let mut tasks = VecDeque::new();
-                let mut offsets = vec![0u64; FILE_COUNT];
-                let mut current_file_idx = 0;
+                            if path.exists() {
+                                let _ = std::fs::remove_file(&path);
+                            }
 
-                loop {
-                    let all_submitted = offsets.iter().all(|&o| o >= FILE_SIZE);
+                            let file = File::options()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .buffering(BufferingMode::DirectSync)
+                                .open(&path)
+                                .await
+                                .expect("Failed to create");
+                            let file = Rc::new(file);
 
-                    if all_submitted && tasks.is_empty() {
-                        break;
-                    }
+                            file.fallocate(0, FILE_SIZE)
+                                .await
+                                .expect("Fallocate failed");
 
-                    // 1. 尝试分配并在此窗口内提交任务
-                    if tasks.len() < concurrency_limit && !all_submitted {
-                        // Find next file that needs writing
-                        let mut found = None;
-                        for _ in 0..FILE_COUNT {
-                            if offsets[current_file_idx] < FILE_SIZE {
-                                found = Some(current_file_idx);
-                                current_file_idx = (current_file_idx + 1) % FILE_COUNT;
+                            files.push(file);
+                            file_paths.push(path);
+                        }
+
+                        // 2. Concurrent Write Loop for this worker's files
+                        let concurrency_limit = 8; // Maybe lower per worker? 32 total / 4 = 8.
+                        let mut tasks = VecDeque::new();
+                        let mut offsets = vec![0u64; FILES_PER_WORKER];
+                        let mut current_local_idx = 0;
+
+                        loop {
+                            let all_submitted = offsets.iter().all(|&o| o >= FILE_SIZE);
+
+                            if all_submitted && tasks.is_empty() {
                                 break;
                             }
-                            current_file_idx = (current_file_idx + 1) % FILE_COUNT;
-                        }
 
-                        if let Some(idx) = found {
-                            if let Some(buf) = pool.alloc(CHUNK_SIZE) {
-                                let remaining = FILE_SIZE - offsets[idx];
-                                let write_len =
-                                    std::cmp::min(remaining, chunk_size as u64) as usize;
+                            if tasks.len() < concurrency_limit && !all_submitted {
+                                // Find next file that needs writing
+                                let mut found = None;
+                                for _ in 0..FILES_PER_WORKER {
+                                    if offsets[current_local_idx] < FILE_SIZE {
+                                        found = Some(current_local_idx);
+                                        current_local_idx = (current_local_idx + 1) % FILES_PER_WORKER;
+                                        break;
+                                    }
+                                    current_local_idx = (current_local_idx + 1) % FILES_PER_WORKER;
+                                }
 
-                                let file_clone = files[idx].clone();
-                                let current_offset = offsets[idx];
+                                if let Some(idx) = found {
+                                    if let Some(buf) = pool.alloc(CHUNK_SIZE) {
+                                        let remaining = FILE_SIZE - offsets[idx];
+                                        let write_len = std::cmp::min(remaining, chunk_size as u64) as usize;
 
-                                let fut =
-                                    async move { file_clone.write_at(buf, current_offset).await };
+                                        let file_clone = files[idx].clone();
+                                        let current_offset = offsets[idx];
 
-                                tasks.push_back(spawn_local(fut));
-                                offsets[idx] += write_len as u64;
-                                continue;
+                                        let fut = async move { file_clone.write_at(buf, current_offset).await };
+
+                                        tasks.push_back(spawn_local(fut));
+                                        offsets[idx] += write_len as u64;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if let Some(handle) = tasks.pop_front() {
+                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                res.expect("Write failed");
+                            } else {
+                                if !all_submitted {
+                                    panic!("Deadlock in worker {}: No tasks to wait for but cannot allocate buffer", i);
+                                }
                             }
                         }
-                    }
 
-                    // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
-                    if let Some(handle) = tasks.pop_front() {
-                        let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                        res.expect("Write failed");
-                    } else {
-                        if !all_submitted {
-                            panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                        // 3. Sync and Close
+                        for file in &files {
+                            file.sync_range(0, FILE_SIZE)
+                                .wait_before(false)
+                                .write(true)
+                                .wait_after(true)
+                                .await
+                                .expect("Sync failed");
                         }
-                    }
+
+                        drop(files);
+                        for path in file_paths {
+                            let _ = std::fs::remove_file(path);
+                        }
+
+                        // Signal done
+                        tx.send(()).unwrap();
+
+                    }, i);
                 }
 
-                for file in &files {
-                    // Optimize: Skip wait_before
-                    file.sync_range(0, FILE_SIZE)
-                        .wait_before(false)
-                        .write(true)
-                        .wait_after(true)
-                        .await
-                        .expect("Sync failed");
+                // Wait for all workers to finish
+                for _ in 0..WORKER_COUNT {
+                    rx.recv().unwrap();
                 }
-
-                drop(files);
-                for path in file_paths {
-                    let _ = std::fs::remove_file(path);
-                }
-            });
+            })
         })
     });
     group.finish();
