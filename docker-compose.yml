@@ -7,9 +7,9 @@ services:
     image: veloq-dev
     pull_policy: never
     environment:
-      - ROOT_PASSWORD=root # Change this securely or use .env file
+      - ROOT_PASSWORD=root # Set your secure password here
     security_opt:
-      - seccomp:unconfined
+      - seccomp:unconfined # Required for some low-level operations
     cap_add:
       - SYS_PTRACE
       - NET_ADMIN
@@ -27,33 +27,24 @@ services:
     ports:
       # SSH port mapping: connect via `ssh root@localhost -p 2222`
       - "2222:22"
-      # Reserve ports for application usage
-      - "8080:8080"
-      - "8081:8081"
-      - "9000:9000"
 
   # Standalone mode: Uses code copied into the image (No host mounting)
   standalone:
     <<: *app-base
     container_name: veloq-standalone
     volumes:
-      # Still mount SSH key for convenience
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro # Mount entrypoint script (optional, can also be baked in via COPY)
+      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
       - ./docker/entrypoint.sh:/entrypoint.sh
     ports:
-      # Using different ports to allow running alongside dev, or same if exclusive
-      # Here we use same ports assuming exclusive usage for simplicity, 
-      # or you can change them if you want to run both.
-      - "2222:22"
-      - "8080:8080"
-      - "8081:8081"
-      - "9000:9000"
+      - "2223:22"
     profiles:
       - standalone
 
   # Helper service to update flake.lock on the host
   # Usage: docker-compose run --rm flake-update
   flake-update:
+    profiles:
+      - tools
     image: nixos/nix:latest
     volumes:
       - ./docker:/work

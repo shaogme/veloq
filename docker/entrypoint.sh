@@ -1,55 +1,58 @@
 #!/usr/bin/env bash
 set -e
 
-# Load Nix environment variables (generated during build)
+# ==========================================
+# Veloq Development Container Entrypoint
+# ==========================================
+
+# 1. Load Nix Environment
+# This sources the environment variables generated during build time.
 if [ -f /etc/profile.d/nix-env.sh ]; then
     source /etc/profile.d/nix-env.sh
 fi
 
-# Generate SSH host keys if they don't exist
+# 2. Initialize SSH Host Keys
+# Only generate if they don't exist (prevents regeneration on container restart if volume persisted)
 if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-    echo "Generating RSA host key..."
-    ssh-keygen -f /etc/ssh/ssh_host_rsa_key -N '' -t rsa
+    ssh-keygen -f /etc/ssh/ssh_host_rsa_key -N '' -t rsa >/dev/null 2>&1
 fi
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-    echo "Generating ED25519 host key..."
-    ssh-keygen -f /etc/ssh/ssh_host_ed25519_key -N '' -t ed25519
+    ssh-keygen -f /etc/ssh/ssh_host_ed25519_key -N '' -t ed25519 >/dev/null 2>&1
 fi
 
-# Setup root password
+# 3. Setup Root Password
+# Uses environment variable $ROOT_PASSWORD or defaults to 'root'
 if [ -n "$ROOT_PASSWORD" ]; then
-    echo "Setting root password from environment variable..."
-    echo "root:$ROOT_PASSWORD" | chpasswd
+    PASS_HASH=$(openssl passwd -6 "$ROOT_PASSWORD")
 else
-    echo "Warning: ROOT_PASSWORD not set. Defaulting to 'root'"
-    echo "root:root" | chpasswd
+    PASS_HASH=$(openssl passwd -6 "root")
 fi
+sed -i "s|^root:[^:]*|root:$PASS_HASH|" /etc/shadow
 
-# Setup SSH authorized_keys if public key is mounted
+# 4. Setup Authorized Keys
+# Installs the host's public key for seamless SSH access
 if [ -f "/tmp/id_ed25519.pub" ]; then
     mkdir -p /root/.ssh
-    cp -f /tmp/id_ed25519.pub /root/.ssh/authorized_keys
+    cp /tmp/id_ed25519.pub /root/.ssh/authorized_keys
     chmod 700 /root/.ssh
     chmod 600 /root/.ssh/authorized_keys
-    echo "SSH public key installed/updated."
 fi
 
-# If arguments are provided, execute them
+# 5. Export Environment for SSH Sessions
+# CRITICAL: Captures current environment (Nix paths, Rust vars) and saves it to ~/.ssh/environment.
+# This allows 'PermitUserEnvironment yes' in sshd_config to load these vars for SSH sessions.
+# This fixes 'scp', 'sftp', and VS Code Remote connection issues.
+env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
+
+# 6. Prepare Runtime Directories
+mkdir -p /run/sshd
+
+# 7. Execute Command
+# If arguments are provided (e.g., docker run ... bash), execute them.
 if [ $# -gt 0 ]; then
     exec "$@"
 fi
 
-# Start SSH daemon
-# -D: Do not detach and does not become a daemon
+# Default: Start SSH Server
 echo "Starting SSH server..."
-# Ensure /var/run/sshd exists
-mkdir -p /var/run/sshd
-
-# Find sshd in path
-SSHD_BIN=$(which sshd)
-if [ -z "$SSHD_BIN" ]; then
-    echo "Error: sshd not found in PATH"
-    exit 1
-fi
-
-exec "$SSHD_BIN" -D -e
+exec $(which sshd) -D -e
