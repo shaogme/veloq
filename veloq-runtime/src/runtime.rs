@@ -107,6 +107,15 @@ impl RuntimeBuilder {
     pub fn build(self) -> std::io::Result<Runtime> {
         let worker_count = self.config.worker_threads.unwrap_or_else(num_cpus::get);
 
+        // Default Pool Constructor
+        let pool_constructor = self.pool_constructor.unwrap_or_else(|| {
+            Arc::new(|_| {
+                let pool = crate::io::buffer::BuddyPool::new()
+                    .expect("Failed to create default BuddyPool");
+                crate::io::buffer::AnyBufPool::new(pool)
+            })
+        });
+
         let mut states = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
@@ -130,7 +139,7 @@ impl RuntimeBuilder {
             let registry = registry.clone();
             let peer_handles_clone = peer_handles.clone();
             let config_clone = self.config.clone();
-            let pool_constructor = self.pool_constructor.clone();
+            let pool_constructor = pool_constructor.clone();
 
             // Take ownership of the specific mesh components for this worker
             let (ingress, egress) = mesh_matrix.take_worker_channels(worker_id);
@@ -146,15 +155,10 @@ impl RuntimeBuilder {
                 // Attach Mesh
                 executor.attach_mesh(worker_id, state, ingress, egress, peer_handles_clone);
 
-                // Bind Buffer Pool if provided
-                if let Some(ctor) = pool_constructor {
-                    let pool = ctor(worker_id);
-                    // This binds to TLS and since run() enters context, it will register buffers.
-                    // Wait, bind_pool registers if context is set.
-                    // Here we are not in context yet.
-                    // But run() will check `current_pool()` and register.
-                    crate::runtime::context::bind_pool(pool);
-                }
+                // Bind Buffer Pool
+                let pool = pool_constructor(worker_id);
+                // This binds to TLS and since run() enters context, it will register buffers.
+                crate::runtime::context::bind_pool(pool);
 
                 // Register executor to registry
                 // Note: We register BEFORE running the loop so it's visible.
