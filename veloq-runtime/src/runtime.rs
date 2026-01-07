@@ -8,8 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::io::buffer::AnyBufPool;
-use crate::runtime::executor::{ExecutorRegistry, Spawner};
+use crate::runtime::executor::spawner::LateBoundWaker;
+use crate::runtime::executor::{
+    CachePadded, ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner,
+};
 use crate::runtime::mesh::{Consumer, Producer};
+use crossbeam_queue::SegQueue;
 
 pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
@@ -130,7 +134,24 @@ impl RuntimeBuilder {
         }
         let peer_handles = Arc::new(peer_handles_storage);
 
-        let registry = Arc::new(ExecutorRegistry::new());
+        // Pre-allocate Shared State and Handles
+        let mut shared_states = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for i in 0..worker_count {
+            let shared = Arc::new(ExecutorShared {
+                injector: SegQueue::new(),
+                pinned: SegQueue::new(),
+                waker: LateBoundWaker::new(),
+                injected_load: CachePadded(AtomicUsize::new(0)),
+                local_load: CachePadded(AtomicUsize::new(0)),
+            });
+            shared_states.push(shared.clone());
+
+            handles.push(ExecutorHandle { id: i, shared });
+        }
+
+        let registry = Arc::new(ExecutorRegistry::new(handles));
         let mut thread_handles = Vec::with_capacity(worker_count);
         let barrier = Arc::new(std::sync::Barrier::new(worker_count + 1));
 
@@ -145,12 +166,18 @@ impl RuntimeBuilder {
             let (ingress, egress) = mesh_matrix.take_worker_channels(worker_id);
             let state = states[worker_id].clone();
 
+            let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
+
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
 
             let handle = builder.spawn(move || {
-                let mut executor = LocalExecutor::new_with_config(config_clone);
-                executor = executor.with_registry(registry.clone());
+                let mut executor = LocalExecutor::builder()
+                    .config(config_clone)
+                    .with_shared(shared) // Inject shared state
+                    .build();
+
+                executor = executor.with_registry(registry.clone()); // Inject registry
 
                 // Attach Mesh
                 executor.attach_mesh(worker_id, state, ingress, egress, peer_handles_clone);
@@ -160,11 +187,7 @@ impl RuntimeBuilder {
                 // This binds to TLS and since run() enters context, it will register buffers.
                 crate::runtime::context::bind_pool(pool);
 
-                // Register executor to registry
-                // Note: We register BEFORE running the loop so it's visible.
-                registry.register(executor.handle());
-
-                // Wait for all workers to register
+                // Wait for all workers to be ready
                 barrier.wait();
 
                 // Run Loop

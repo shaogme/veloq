@@ -1,11 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
-use smr_swap::{LocalReader, SmrReader, SmrSwap};
 
 use crate::io::driver::{Driver, RemoteWaker};
 use crate::runtime::mesh::{self, Consumer, Producer};
@@ -38,9 +37,43 @@ pub(crate) struct CachePadded<T>(pub(crate) T);
 pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: SegQueue<Job>,
-    pub(crate) waker: Arc<dyn RemoteWaker>,
+    pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,
+}
+
+pub(crate) struct LateBoundWaker {
+    waker: std::cell::UnsafeCell<Option<Arc<dyn RemoteWaker>>>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for LateBoundWaker {}
+unsafe impl Sync for LateBoundWaker {}
+
+impl LateBoundWaker {
+    pub fn new() -> Self {
+        Self {
+            waker: std::cell::UnsafeCell::new(None),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn set(&self, waker: Arc<dyn RemoteWaker>) {
+        unsafe { *self.waker.get() = Some(waker) };
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl RemoteWaker for LateBoundWaker {
+    fn wake(&self) -> std::io::Result<()> {
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            let w = unsafe { &*self.waker.get() };
+            if let Some(w) = w {
+                return w.wake();
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct MeshContext {
@@ -127,62 +160,43 @@ impl ExecutorHandle {
 
 // --- Spawner & Registry ---
 
-/// A registry that maintains the set of all active executors.
-/// Used for global task spawning (P2C) and work stealing.
+/// A static registry that maintains the set of all active executors.
+/// Workers are pre-allocated at runtime startup.
 pub struct ExecutorRegistry {
-    writer: Mutex<SmrSwap<Vec<ExecutorHandle>>>,
-    reader_factory: SmrReader<Vec<ExecutorHandle>>,
-    epoch: AtomicUsize, // Incremented whenever a new worker is added
-    next: AtomicUsize,  // Source of randomness for P2C
+    handles: Arc<Vec<ExecutorHandle>>,
 }
 
 impl Default for ExecutorRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new(Vec::new())
     }
 }
 
 impl ExecutorRegistry {
-    pub fn new() -> Self {
-        let swap = SmrSwap::new(Vec::new());
-        let reader_factory = swap.reader();
+    pub fn new(handles: Vec<ExecutorHandle>) -> Self {
         Self {
-            writer: Mutex::new(swap),
-            reader_factory,
-            epoch: AtomicUsize::new(0),
-            next: AtomicUsize::new(0),
+            handles: Arc::new(handles),
         }
     }
 
-    pub fn register(&self, handle: ExecutorHandle) {
-        let mut guard = self.writer.lock().unwrap();
-        guard.update(|current| {
-            let mut new = current.clone();
-            new.push(handle.clone());
-            new.sort_by_key(|h| h.id);
-            new
-        });
-        self.epoch.fetch_add(1, Ordering::Release);
-    }
-
-    pub fn reader(&self) -> SmrReader<Vec<ExecutorHandle>> {
-        self.reader_factory.clone()
+    pub fn all(&self) -> &[ExecutorHandle] {
+        &self.handles
     }
 }
 
 /// Global spawner that acts as a frontend to the Registry.
 #[derive(Clone)]
 pub struct Spawner {
-    reader: RefCell<LocalReader<Vec<ExecutorHandle>>>,
+    registry: Arc<ExecutorRegistry>,
     seed: Cell<usize>,
 }
 
 impl Spawner {
     pub fn new(registry: Arc<ExecutorRegistry>) -> Self {
-        let reader = registry.reader().local();
-        let seed = registry.next.fetch_add(1, Ordering::Relaxed);
+        // Random seed init
+        let seed = Box::into_raw(Box::new(0)) as usize;
         Self {
-            reader: RefCell::new(reader),
+            registry,
             seed: Cell::new(seed),
         }
     }
@@ -198,10 +212,9 @@ impl Spawner {
     }
 
     fn select_worker(&self) -> ExecutorHandle {
-        let reader = self.reader.borrow();
-        let workers = reader.load();
+        let workers = self.registry.all();
 
-        match self.p2c_select(&workers) {
+        match self.p2c_select(workers) {
             Some(target) => target.clone(),
             None => panic!("No workers available in registry"),
         }
@@ -277,8 +290,7 @@ impl Spawner {
     }
 
     pub(crate) fn spawn_job_to(&self, job: Job, worker_id: usize) {
-        let reader = self.reader.borrow();
-        let workers = reader.load();
+        let workers = self.registry.all();
 
         if let Some(target) = workers.get(worker_id) {
             target.schedule_pinned(job);

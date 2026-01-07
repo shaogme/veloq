@@ -443,35 +443,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smr-swap"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1456ada05a20e8d97d8e0b1390973b0705dc7dad107bc9e329cdb498b919a977"
-dependencies = [
- "swmr-cell",
-]
-
-[[package]]
-name = "swmr-barrier"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e1e9daf765af178a33ff5c13f9bc0c9f53e1520aed44fa0c8ae5dc3c355aeee"
-dependencies = [
- "cfg-if",
- "libc",
- "windows-sys",
-]
-
-[[package]]
-name = "swmr-cell"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c74dc78fb28570f71ce4cd952f362da913e6d7e4271960891aed58cb32eb8e73"
-dependencies = [
- "swmr-barrier",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -511,7 +482,6 @@ dependencies = [
  "io-uring",
  "libc",
  "num_cpus",
- "smr-swap",
  "veloq-bitset",
  "veloq-wheel",
  "windows-sys",

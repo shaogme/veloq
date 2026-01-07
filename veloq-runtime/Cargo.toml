@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 crossbeam-queue = "0.3"
 num_cpus = "1.17.0"
-smr-swap = { version = "0.9.0", features = ["read-preferred"] }
 veloq-bitset = { path = "../veloq-bitset" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
-use smr_swap::LocalReader;
 
 use crate::io::buffer::BufPool;
 use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
@@ -26,6 +25,7 @@ pub mod spawner;
 
 pub struct LocalExecutorBuilder {
     config: crate::config::Config,
+    shared: Option<Arc<ExecutorShared>>,
 }
 
 impl Default for LocalExecutorBuilder {
@@ -38,7 +38,13 @@ impl LocalExecutorBuilder {
     pub fn new() -> Self {
         Self {
             config: crate::config::Config::default(),
+            shared: None,
         }
+    }
+
+    pub(crate) fn with_shared(mut self, shared: Arc<ExecutorShared>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     pub fn config(mut self, config: crate::config::Config) -> Self {
@@ -55,20 +61,24 @@ impl LocalExecutorBuilder {
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let waker = driver.create_waker();
 
-        let shared = Arc::new(ExecutorShared {
-            injector: SegQueue::new(),
-            pinned: SegQueue::new(),
-            waker,
-            injected_load: CachePadded(AtomicUsize::new(0)),
-            local_load: CachePadded(AtomicUsize::new(0)),
+        let shared = self.shared.unwrap_or_else(|| {
+            Arc::new(ExecutorShared {
+                injector: SegQueue::new(),
+                pinned: SegQueue::new(),
+                waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
+                injected_load: CachePadded(AtomicUsize::new(0)),
+                local_load: CachePadded(AtomicUsize::new(0)),
+            })
         });
+
+        // Bind the driver's waker to the shared state (Late Binding)
+        shared.waker.set(waker);
 
         LocalExecutor {
             driver: Rc::new(RefCell::new(driver)),
             queue,
             shared,
             registry: None,
-            registry_reader: None,
             mesh: None,
         }
     }
@@ -83,7 +93,6 @@ pub struct LocalExecutor {
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
-    registry_reader: Option<LocalReader<Vec<ExecutorHandle>>>,
 
     // Mesh Networking
     mesh: Option<Rc<RefCell<MeshContext>>>,
@@ -114,9 +123,7 @@ impl LocalExecutor {
     /// Attach this executor to a registry.
     /// This enables the executor to steal tasks from others in the registry.
     pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
-        let reader = registry.reader().local();
         self.registry = Some(registry);
-        self.registry_reader = Some(reader);
         self
     }
 
@@ -219,8 +226,8 @@ impl LocalExecutor {
     }
 
     fn try_steal(&self, executed: usize) -> bool {
-        if let Some(reader) = &self.registry_reader {
-            let workers = reader.load();
+        if let Some(registry) = &self.registry {
+            let workers = registry.all();
             let count = workers.len();
 
             if count > 0 {
