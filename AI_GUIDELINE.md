@@ -27,6 +27,7 @@
 - **运行容器**: `docker run -it veloq`
 - **直接运行检查**: `docker-compose run --rm dev cargo check`
 - **直接运行测试**: `docker-compose run --rm dev cargo test`
+- **更新 nix 依赖**: `docker-compose run --rm flake-update`
 
 ## 架构 (Architecture)
 

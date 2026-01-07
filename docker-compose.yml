@@ -1,25 +1,13 @@
 services:
-  dev:
+  # Base configuration for the application
+  app-base: &app-base
     build:
       context: .
       dockerfile: docker/Dockerfile
     image: veloq-dev
-    container_name: veloq-dev
-    volumes:
-      - .:/root/workspace
-      # Mount host SSH public key to temporary location
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
-      - ./docker/entrypoint.sh:/entrypoint.sh
-      # Optional: Cache cargo registry/target to speed up rebuilds across containers
-      # - cargo_cache:/usr/local/cargo
-      # - target_cache:/workspace/target
-    ports:
-      # SSH port mapping: connect via `ssh root@localhost -p 2222`
-      - "2222:22"
-      # Reserve ports for application usage
-      - "8080:8080"
-      - "8081:8081"
-      - "9000:9000"
+    pull_policy: never
+    environment:
+      - ROOT_PASSWORD=root # Change this securely or use .env file
     security_opt:
       - seccomp:unconfined
     cap_add:
@@ -27,6 +15,47 @@ services:
       - NET_ADMIN
     tty: true
 
-# volumes:
-#   cargo_cache:
-#   target_cache:
+  # Develop mode: Mounts local directory for hot-reloading (Default)
+  dev:
+    <<: *app-base
+    container_name: veloq-dev
+    volumes:
+      - .:/root/workspace
+      # Mount host SSH public key to temporary location
+      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
+      - ./docker/entrypoint.sh:/entrypoint.sh
+    ports:
+      # SSH port mapping: connect via `ssh root@localhost -p 2222`
+      - "2222:22"
+      # Reserve ports for application usage
+      - "8080:8080"
+      - "8081:8081"
+      - "9000:9000"
+
+  # Standalone mode: Uses code copied into the image (No host mounting)
+  standalone:
+    <<: *app-base
+    container_name: veloq-standalone
+    volumes:
+      # Still mount SSH key for convenience
+      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro # Mount entrypoint script (optional, can also be baked in via COPY)
+      - ./docker/entrypoint.sh:/entrypoint.sh
+    ports:
+      # Using different ports to allow running alongside dev, or same if exclusive
+      # Here we use same ports assuming exclusive usage for simplicity, 
+      # or you can change them if you want to run both.
+      - "2222:22"
+      - "8080:8080"
+      - "8081:8081"
+      - "9000:9000"
+    profiles:
+      - standalone
+
+  # Helper service to update flake.lock on the host
+  # Usage: docker-compose run --rm flake-update
+  flake-update:
+    image: nixos/nix:latest
+    volumes:
+      - ./docker:/work
+    working_dir: /work
+    entrypoint: /bin/sh -c "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && nix flake update && chmod 666 flake.lock"

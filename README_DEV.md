@@ -1,21 +1,44 @@
 # Docker Development Environment
 
-This directory contains the configuration for a Docker-based Linux development environment.
+This directory contains the configuration for a Docker-based Linux development environment, powered by **Nix Flakes** for reproducible builds.
+
+## 0. Initial Setup (One-time)
+
+Before building the image for the first time, you must generate the `flake.lock` file to pin your dependencies. We provide a helper container for this:
+
+```bash
+# Generate docker/flake.lock
+docker-compose run --rm flake-update
+```
+
+If you ever need to update your dependencies (e.g., to get a newer Rust version), simply run this command again and rebuild.
 
 ## 1. Prerequisites
 
 - Docker Desktop installed and running.
-- (Optional) VSCode with "Remote - SSH" extension installed.
+- **Nix Support**: The environment now uses Nix flakes for reproducible builds.
+- **Windows Users**: You can run this setup directly from PowerShell or WSL2. No need to install Nix on the host unless you want to use the `flake-update` command natively.
+
 
 ## 2. Start the Environment
 
-Run the following command in the project root:
+### Option A: Development Mode (Recommended)
+Use this for active development. Your local source code is mounted into the container, allowing hot-reloading/live-editing.
 
 ```bash
-docker-compose up -d --build
+docker-compose up -d --build dev
 ```
 
-This will build the image and start the container `veloq-dev`.
+### Option B: Standalone Mode
+Use this to test the self-contained image. The source code is copied into the image at build time and is isolated from your local file system changes.
+
+```bash
+docker-compose up -d --build standalone
+```
+
+**Note**: Both modes use the same ports (SSH 2222, App 8080+), so stop one before starting the other.
+
+This will build the image and start the container (`veloq-dev` or `veloq-standalone`).
 
 ## 3. Connecting via SSH
 
@@ -31,9 +54,11 @@ Alternatively, add the following to your `~/.ssh/config` file for easier access:
 ```ssh
 Host veloq-dev
     HostName localhost
-    User root
     Port 2222
-    ForwardAgent yes
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile ~/.ssh/id_ed25519
 ```
 
 Then you can simply run: `ssh veloq-dev`
