@@ -180,6 +180,12 @@ impl<T> StableSlab<T> {
             (ptr, len)
         })
     }
+
+    #[cfg(target_os = "windows")]
+    #[inline(always)]
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
 }
 
 impl<T> Index<usize> for StableSlab<T> {

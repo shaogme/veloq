@@ -8,6 +8,7 @@
 use crate::io::driver::PlatformOp;
 use crate::io::driver::iocp::IocpDriver;
 use crate::io::driver::iocp::ext::Extensions;
+use crate::io::driver::iocp::rio::RioState;
 use crate::io::driver::iocp::submit::{self, SubmissionResult};
 use crate::io::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
@@ -42,14 +43,6 @@ impl OverlappedEntry {
 }
 
 // ============================================================================
-// VTable Definition
-// ============================================================================
-
-use crate::io::driver::iocp::RioBufferInfo;
-use std::collections::HashMap;
-use windows_sys::Win32::Networking::WinSock::{RIO_BUFFERID, RIO_CQ, RIO_RQ};
-
-// ============================================================================
 // SubmitContext Definition
 // ============================================================================
 
@@ -60,11 +53,7 @@ pub struct SubmitContext<'a> {
     pub registered_files: &'a [Option<HANDLE>],
 
     // RIO Support
-    pub rio_rqs: &'a mut HashMap<HANDLE, RIO_RQ>,
-    pub registered_rio_rqs: &'a mut [Option<RIO_RQ>],
-    pub rio_cq: Option<RIO_CQ>,
-    pub registered_bufs: &'a [RioBufferInfo],
-    pub slab_rio_pages: &'a [Option<(RIO_BUFFERID, usize)>],
+    pub rio: Option<&'a mut RioState>,
 }
 
 // ============================================================================

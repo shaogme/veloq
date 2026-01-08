@@ -3,7 +3,7 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
-use crate::io::buffer::{FixedBuf, NO_REGISTRATION_INDEX};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::iocp::blocking::{BlockingTask, CompletionInfo};
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::op::{IocpOp, SubmitContext};
@@ -14,9 +14,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, RIO_RQ, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError,
-    WSARecvFrom, WSASendTo, bind, getsockname, setsockopt,
+    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, WSARecvFrom,
+    WSASendTo, bind, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::CreateIoCompletionPort;
@@ -221,8 +221,6 @@ submit_io_op!(
 );
 impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
 
-// Note: Recv/Send for IOCP usually use ReadFile/WriteFile for streams?
-// The original code used ReadFile for Recv and WriteFile for Send.
 pub(crate) unsafe fn submit_recv(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
@@ -234,44 +232,11 @@ pub(crate) unsafe fn submit_recv(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // Try RIO upgrade
-    if let Some(_) = ctx.rio_cq {
-        if val.buf.buf_index() != NO_REGISTRATION_INDEX {
-            let (idx, offset) = val.buf.resolve_region_info();
-            if let Some(info) = ctx.registered_bufs.get(idx) {
-                let buf_id = info.id;
-                let buf_len = val.buf.capacity();
-                // RIO Offset is relative to the registered buffer start
-                let offset = offset as u32;
-
-                // Check/Create RQ
-                if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
-                    // RIO Path
-                    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                        BufferId: buf_id,
-                        Offset: offset,
-                        Length: buf_len as u32,
-                    };
-
-                    let table = ctx.ext.rio_table.as_ref().unwrap();
-                    let recv_fn = table.RIOReceive.unwrap();
-                    let request_context = op.header.user_data as *mut std::ffi::c_void;
-
-                    let ret = unsafe {
-                        recv_fn(
-                            rq,
-                            &rio_buf,
-                            1,
-                            0, // flags
-                            request_context,
-                        )
-                    };
-
-                    if ret == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    return Ok(SubmissionResult::Pending);
-                }
-            }
+    if let Some(rio) = &mut ctx.rio {
+        if let Some(res) =
+            rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data, ctx.ext)?
+        {
+            return Ok(res);
         }
     }
 
@@ -314,33 +279,11 @@ pub(crate) unsafe fn submit_send(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // Try RIO upgrade
-    if let Some(_) = ctx.rio_cq {
-        if val.buf.buf_index() != NO_REGISTRATION_INDEX {
-            let (idx, offset) = val.buf.resolve_region_info();
-            if let Some(info) = ctx.registered_bufs.get(idx) {
-                let buf_id = info.id;
-                let buf_len = val.buf.len();
-                let offset = offset as u32;
-
-                if let Ok(rq) = ensure_rio_rq(ctx, val.fd, handle) {
-                    let rio_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                        BufferId: buf_id,
-                        Offset: offset,
-                        Length: buf_len as u32,
-                    };
-
-                    let table = ctx.ext.rio_table.as_ref().unwrap();
-                    let send_fn = table.RIOSend.unwrap();
-                    let request_context = op.header.user_data as *mut std::ffi::c_void;
-
-                    let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
-
-                    if ret == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    return Ok(SubmissionResult::Pending);
-                }
-            }
+    if let Some(rio) = &mut ctx.rio {
+        if let Some(res) =
+            rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data, ctx.ext)?
+        {
+            return Ok(res);
         }
     }
 
@@ -603,74 +546,17 @@ pub(crate) unsafe fn submit_send_to(
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
 
     // Try RIO upgrade logic
-    // Only attempt if the user provided a buffer that supports RIO (has a pool index)
-    if let Some(_) = ctx.rio_cq {
-        if payload.op.buf.buf_index() != NO_REGISTRATION_INDEX {
-            let (idx, offset) = payload.op.buf.resolve_region_info();
-            if let Some(info) = ctx.registered_bufs.get(idx) {
-                // Check if our own slab page is registered (for the address)
-                // Use the constant from StableSlab instead of hardcoding
-                let page_idx = op.header.user_data
-                    >> crate::io::driver::stable_slab::StableSlab::<IocpOp>::PAGE_SHIFT;
-
-                if let Some(Some((addr_buf_id, base_addr))) = ctx.slab_rio_pages.get(page_idx) {
-                    // Create RQ if needed
-                    if let Ok(rq) = ensure_rio_rq(ctx, payload.op.fd, handle) {
-                        // 1. Data Buffer
-                        let data_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                            BufferId: info.id,
-                            Offset: offset as u32,
-                            Length: payload.op.buf.len() as u32,
-                        };
-
-                        // 2. Address Buffer (Remote)
-                        // Calculate offset of payload.addr within the slab page
-                        let addr_ptr = &payload.addr as *const _ as usize;
-                        let addr_offset = (addr_ptr - *base_addr) as u32;
-
-                        let addr_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                            BufferId: *addr_buf_id,
-                            Offset: addr_offset,
-                            Length: payload.addr_len as u32,
-                        };
-
-                        let table = ctx.ext.rio_table.as_ref().unwrap();
-                        let send_ex_fn = table.RIOSendEx.unwrap();
-                        let request_context = op.header.user_data as *mut std::ffi::c_void;
-
-                        let ret = unsafe {
-                            send_ex_fn(
-                                rq,
-                                &data_buf,
-                                1,
-                                std::ptr::null(), // local addr
-                                &addr_buf,        // remote addr
-                                std::ptr::null(), // control context
-                                std::ptr::null(), // flags buf
-                                0,                // flags
-                                request_context,
-                            )
-                        };
-
-                        if ret == 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        return Ok(SubmissionResult::Pending);
-                    } else {
-                        eprintln!("RIO: Failed to create/get RQ for socket (send_to)");
-                    }
-                } else {
-                    // Slab page not registered
-                    // This can happen if RIORegisterBuffer failed in iocp.rs due to system limits.
-                    // Warn slightly.
-                    eprintln!("RIO: Slab page for op not registered, fallback to legacy");
-                }
-            } else {
-                eprintln!(
-                    "RIO: Buffer index {} not found in registered_bufs (send_to)",
-                    idx
-                );
-            }
+    if let Some(rio) = &mut ctx.rio {
+        if let Some(res) = rio.try_submit_send_to(
+            payload.op.fd,
+            handle,
+            &payload.op.buf,
+            &payload.addr as *const _ as *const std::ffi::c_void,
+            payload.addr_len,
+            op.header.user_data,
+            ctx.ext,
+        )? {
+            return Ok(res);
         }
     }
 
@@ -718,78 +604,18 @@ pub(crate) unsafe fn submit_recv_from(
     let payload = unsafe { &mut *op.payload.recv_from };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade logic
-    if let Some(_) = ctx.rio_cq {
-        if payload.op.buf.buf_index() != NO_REGISTRATION_INDEX {
-            let (idx, offset) = payload.op.buf.resolve_region_info();
-            if let Some(info) = ctx.registered_bufs.get(idx) {
-                // Check if our own slab page is registered (for the address & len)
-                let page_idx = op.header.user_data
-                    >> crate::io::driver::stable_slab::StableSlab::<IocpOp>::PAGE_SHIFT;
-                if let Some(Some((addr_buf_id, base_addr))) = ctx.slab_rio_pages.get(page_idx) {
-                    if let Ok(rq) = ensure_rio_rq(ctx, payload.op.fd, handle) {
-                        // 1. Data Buffer
-                        let data_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                            BufferId: info.id,
-                            Offset: offset as u32,
-                            Length: payload.op.buf.capacity() as u32,
-                        };
-
-                        // 2. Address Buffer (Remote)
-                        let addr_ptr = &payload.addr as *const _ as usize;
-                        let addr_offset = (addr_ptr - *base_addr) as u32;
-                        let addr_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                            BufferId: *addr_buf_id,
-                            Offset: addr_offset,
-                            Length: std::mem::size_of::<crate::io::socket::SockAddrStorage>()
-                                as u32,
-                        };
-
-                        // 3. Address Length Buffer
-                        // RIOReceiveEx writes the length here. It needs a buffer.
-                        // We use &payload.addr_len
-                        let len_ptr = &payload.addr_len as *const _ as usize;
-                        let len_offset = (len_ptr - *base_addr) as u32;
-                        let len_buf = windows_sys::Win32::Networking::WinSock::RIO_BUF {
-                            BufferId: *addr_buf_id,
-                            Offset: len_offset,
-                            Length: 4, // i32
-                        };
-
-                        let table = ctx.ext.rio_table.as_ref().unwrap();
-                        let recv_ex_fn = table.RIOReceiveEx.unwrap();
-                        let request_context = op.header.user_data as *mut std::ffi::c_void;
-
-                        let ret = unsafe {
-                            recv_ex_fn(
-                                rq,
-                                &data_buf,
-                                1,
-                                std::ptr::null(), // local addr
-                                &addr_buf,        // remote addr
-                                &len_buf,         // addr length
-                                std::ptr::null(), // flags
-                                0, // impl flags? or payload.flags? existing RIO recv uses 0
-                                request_context,
-                            )
-                        };
-
-                        if ret == 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        return Ok(SubmissionResult::Pending);
-                    } else {
-                        eprintln!("RIO: Failed to create/get RQ for socket (recv_from)");
-                    }
-                } else {
-                    eprintln!("RIO: Slab page for op not registered, fallback to legacy");
-                }
-            } else {
-                eprintln!(
-                    "RIO: Buffer index {} not found in registered_bufs (recv_from)",
-                    idx
-                );
-            }
+    // Try RIO upgrade
+    if let Some(rio) = &mut ctx.rio {
+        if let Some(res) = rio.try_submit_recv_from(
+            payload.op.fd,
+            handle,
+            &mut payload.op.buf,
+            &payload.addr as *const _ as *const std::ffi::c_void,
+            &payload.addr_len,
+            op.header.user_data,
+            ctx.ext,
+        )? {
+            return Ok(res);
         }
     }
 
@@ -935,68 +761,3 @@ pub(crate) unsafe fn submit_timeout(
 }
 
 impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);
-
-// ============================================================================
-// RIO Support (Stubs/Impl)
-// ============================================================================
-
-fn ensure_rio_rq(ctx: &mut SubmitContext, fd: IoFd, handle: HANDLE) -> io::Result<RIO_RQ> {
-    // fast path for registered files
-    if let IoFd::Fixed(idx) = fd {
-        let idx = idx as usize;
-        if let Some(Some(rq)) = ctx.registered_rio_rqs.get(idx) {
-            return Ok(*rq);
-        }
-        // Not created yet, create it below and store in vector
-    } else {
-        // Fallback for raw handles
-        if let Some(&rq) = ctx.rio_rqs.get(&handle) {
-            return Ok(rq);
-        }
-    }
-
-    if let Some(cq) = ctx.rio_cq {
-        let table = ctx.ext.rio_table.as_ref().ok_or(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "RIO not initialized",
-        ))?;
-
-        let create_fn = table.RIOCreateRequestQueue.unwrap();
-
-        // Queue sizes
-        const MAX_OUTSTANDING_RECVS: u32 = 1024;
-        const MAX_OUTSTANDING_SENDS: u32 = 1024;
-
-        let rq = unsafe {
-            create_fn(
-                handle as _,
-                MAX_OUTSTANDING_RECVS,
-                1, // Max Receive Data Buffers
-                MAX_OUTSTANDING_SENDS,
-                1, // Max Send Data Buffers
-                cq,
-                cq,
-                std::ptr::null_mut(),
-            )
-        };
-
-        if rq == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if let IoFd::Fixed(idx) = fd {
-            let idx = idx as usize;
-            if idx < ctx.registered_rio_rqs.len() {
-                ctx.registered_rio_rqs[idx] = Some(rq);
-            }
-        } else {
-            ctx.rio_rqs.insert(handle, rq);
-        }
-        Ok(rq)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "RIO not initialized",
-        ))
-    }
-}

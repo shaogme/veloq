@@ -1,6 +1,7 @@
 mod blocking;
 mod ext;
 pub mod op;
+pub mod rio;
 mod submit;
 #[cfg(test)]
 mod tests;
@@ -10,24 +11,19 @@ use crate::io::driver::{Driver, RemoteWaker};
 use blocking::ThreadPool;
 use ext::Extensions;
 use op::{IocpOp, OverlappedEntry};
+use rio::RioState;
 use std::io;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use submit::SubmissionResult;
 
 const WAKEUP_USER_DATA: usize = usize::MAX;
-const RIO_EVENT_KEY: usize = usize::MAX - 1;
+pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Networking::WinSock::{
-    RIO_BUFFERID, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
-};
-const RIO_NOTIFICATION_COMPLETION_TYPE_IOCP: u32 = 1;
-const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0;
-
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
@@ -41,12 +37,6 @@ pub enum PlatformData {
     None,
 }
 
-// Helper to store registration details
-#[derive(Debug, Clone, Copy)]
-pub struct RioBufferInfo {
-    pub(crate) id: RIO_BUFFERID,
-}
-
 pub struct IocpDriver {
     pub(crate) port: HANDLE,
     pub(crate) ops: OpRegistry<IocpOp, PlatformData>,
@@ -56,16 +46,8 @@ pub struct IocpDriver {
     pub(crate) free_slots: Vec<usize>,
     pub(crate) pool: ThreadPool,
 
-    // RIO Support
-    pub(crate) rio_cq: Option<RIO_CQ>,
-    pub(crate) registered_bufs: Vec<RioBufferInfo>,
-    // RIO Request Queues per socket
-    pub(crate) rio_rqs: std::collections::HashMap<HANDLE, RIO_RQ>,
-    // RIO Request Queues for registered files (O(1) lookup)
-    pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
-    // RIO Registration for Slab Pages (for Address Buffers)
-    // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
-    pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
+    // RIO Support (Decoupled)
+    pub(crate) rio_state: Option<RioState>,
 }
 
 struct IocpWaker(HANDLE);
@@ -105,49 +87,29 @@ impl IocpDriver {
 
         // Load extensions
         let extensions = Extensions::new()?;
-
         let entries = config.iocp.entries;
 
-        // Initialize RIO CQ if available
-        let rio_cq = if let Some(table) = extensions.rio_table.as_ref() {
-            let notification = RIO_NOTIFICATION_COMPLETION {
-                Type: RIO_NOTIFICATION_COMPLETION_TYPE_IOCP as i32,
-                Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
-                    Iocp:
-                        windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
-                            IocpHandle: port,
-                            CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
-                            Overlapped: std::ptr::null_mut(),
-                        },
-                },
-            };
+        // Initialize RIO State
+        let mut rio_state = RioState::new(port, entries, &extensions)?;
 
-            // Size: use entries count or reasonable default
-            let queue_size = entries.max(1024);
-            // Function pointer might be Option
-            if let Some(create_fn) = table.RIOCreateCompletionQueue {
-                let cq = unsafe { create_fn(queue_size, &notification as *const _) };
-                if cq == 0 { None } else { Some(cq) }
-            } else {
-                None
+        let ops = OpRegistry::with_capacity(entries as usize);
+
+        // Pre-register existing pages (created by with_capacity)
+        if let Some(rio) = &mut rio_state {
+            for i in 0..ops.page_count() {
+                rio.ensure_slab_page_registration(i, &ops, &extensions);
             }
-        } else {
-            None
-        };
+        }
 
         Ok(Self {
             port,
-            ops: OpRegistry::with_capacity(entries as usize),
+            ops,
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             pool: ThreadPool::new(16, 128, 1024, Duration::from_secs(30)),
-            rio_cq,
-            registered_bufs: Vec::new(),
-            rio_rqs: std::collections::HashMap::new(),
-            registered_rio_rqs: Vec::new(),
-            slab_rio_pages: Vec::new(),
+            rio_state,
         })
     }
 
@@ -206,7 +168,12 @@ impl IocpDriver {
             }
             if completion_key == RIO_EVENT_KEY {
                 // RIO event is triggered. Process RIO CQ.
-                return self.process_rio_completions();
+                if let Some(rio) = &mut self.rio_state {
+                    return rio.process_completions(&mut self.ops, &self.extensions);
+                } else {
+                    // Should not happen if RIO_EVENT_KEY triggered but state disappeared?
+                    return Ok(());
+                }
             }
             completion_key
         };
@@ -261,108 +228,9 @@ impl IocpDriver {
         Ok(())
     }
 
-    fn process_rio_completions(&mut self) -> io::Result<()> {
-        if let Some(cq) = self.rio_cq {
-            let dequeue_fn = self
-                .extensions
-                .rio_table
-                .as_ref()
-                .unwrap()
-                .RIODequeueCompletion
-                .unwrap();
-
-            // Stack buffer for completions
-            const MAX_RIO_RESULTS: usize = 128;
-            let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
-
-            loop {
-                // Dequeue completions
-                let count = unsafe { dequeue_fn(cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32) };
-
-                if count == windows_sys::Win32::Networking::WinSock::RIO_CORRUPT_CQ {
-                    return Err(io::Error::from_raw_os_error(
-                        windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
-                    ));
-                }
-
-                if count == 0 {
-                    break;
-                }
-
-                // Process completions
-                for i in 0..count as usize {
-                    let res = &results[i];
-                    // RequestContext stored the user_data (OpRegistry index)
-                    let user_data = res.RequestContext as usize;
-
-                    if self.ops.contains(user_data) {
-                        let op = &mut self.ops[user_data];
-                        if op.cancelled {
-                            // Already cancelled, just ignore (or remove if needed, but cancel_op handles removal usually)
-                        } else {
-                            // Status check
-                            let result = if res.Status == 0 {
-                                Ok(res.BytesTransferred as usize)
-                            } else {
-                                Err(io::Error::from_raw_os_error(res.Status as i32))
-                            };
-
-                            op.result = Some(result);
-                            op.platform_data = PlatformData::None;
-                            if let Some(waker) = op.waker.take() {
-                                waker.wake();
-                            }
-                        }
-                    }
-                }
-
-                // If we filled the buffer, there might be more, continue loop.
-                if count < MAX_RIO_RESULTS as u32 {
-                    break;
-                }
-            }
-
-            // Re-arm notification (RIONotify)
-            // This is critical for Edge-Triggered-like behavior of RIO IOCP notification
-            let notify_fn = self
-                .extensions
-                .rio_table
-                .as_ref()
-                .unwrap()
-                .RIONotify
-                .unwrap();
-            let ret = unsafe { notify_fn(cq) };
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret as i32));
-            }
-        }
-        Ok(())
-    }
-
     pub fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
-        // If RIO is not available, this is a no-op (or maybe we should return error if user expects it?)
-        // For now, we assume graceful fallback, so just return Ok if no RIO.
-        let register_fn = match &self.extensions.rio_table {
-            Some(table) if self.rio_cq.is_some() => table.RIORegisterBuffer,
-            _ => return Ok(()),
-        };
-
-        if let Some(reg_fn) = register_fn {
-            let regions = pool.get_memory_regions();
-            self.registered_bufs.clear();
-            self.registered_bufs.reserve(regions.len());
-
-            for region in regions {
-                let len = region.len;
-                // Register buffer with RIO
-                let id = unsafe { reg_fn(region.ptr.as_ptr() as *const u8, len as u32) };
-
-                if id == RIO_INVALID_BUFFERID {
-                    return Err(io::Error::last_os_error());
-                }
-
-                self.registered_bufs.push(RioBufferInfo { id });
-            }
+        if let Some(rio) = &mut self.rio_state {
+            rio.register_buffers(pool, &self.extensions)?;
         }
         Ok(())
     }
@@ -372,7 +240,17 @@ impl Driver for IocpDriver {
     type Op = IocpOp;
 
     fn reserve_op(&mut self) -> usize {
-        self.ops.insert(OpEntry::new(None, PlatformData::None))
+        let old_pages = self.ops.page_count();
+        let user_data = self.ops.insert(OpEntry::new(None, PlatformData::None));
+
+        if self.ops.page_count() > old_pages {
+            // New page allocated, register it immediately
+            if let Some(rio) = &mut self.rio_state {
+                let new_page_idx = self.ops.page_count() - 1;
+                rio.ensure_slab_page_registration(new_page_idx, &self.ops, &self.extensions);
+            }
+        }
+        user_data
     }
 
     fn submit(
@@ -380,25 +258,9 @@ impl Driver for IocpDriver {
         user_data: usize,
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
-        // Ensure RIO registration for address buffers if needed
-        if self.rio_cq.is_some() {
-            let page_idx = user_data >> OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
-            if page_idx >= self.slab_rio_pages.len() {
-                self.slab_rio_pages.resize(page_idx + 1, None);
-            }
-            if self.slab_rio_pages[page_idx].is_none() {
-                if let Some((ptr, len)) = self.ops.get_page_slice(page_idx) {
-                    if let Some(table) = &self.extensions.rio_table
-                        && let Some(reg_fn) = table.RIORegisterBuffer
-                    {
-                        let id = unsafe { reg_fn(ptr, len as u32) };
-                        if id != RIO_INVALID_BUFFERID {
-                            self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
-                        }
-                    }
-                }
-            }
-        }
+        // Since RIO slab registration is handled eagerly in reserve_op (and new),
+        // we no longer need to check/register it here.
+        // This resolves the borrow checker conflict.
 
         if let Some(op_entry) = self.ops.get_mut(user_data) {
             // Important: we must pin the op in resources first, then get pointers
@@ -413,11 +275,8 @@ impl Driver for IocpDriver {
                 overlapped: &mut op_ref.header.inner as *mut OVERLAPPED,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
-                rio_rqs: &mut self.rio_rqs,
-                registered_rio_rqs: &mut self.registered_rio_rqs,
-                rio_cq: self.rio_cq,
-                registered_bufs: &self.registered_bufs,
-                slab_rio_pages: &self.slab_rio_pages,
+                rio: self.rio_state.as_mut(),
+                // ops removed from context
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
@@ -458,25 +317,8 @@ impl Driver for IocpDriver {
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         let user_data = self.reserve_op();
 
-        // Ensure RIO registration for address buffers if needed
-        if self.rio_cq.is_some() {
-            let page_idx = user_data >> OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
-            if page_idx >= self.slab_rio_pages.len() {
-                self.slab_rio_pages.resize(page_idx + 1, None);
-            }
-            if self.slab_rio_pages[page_idx].is_none() {
-                if let Some((ptr, len)) = self.ops.get_page_slice(page_idx) {
-                    if let Some(table) = &self.extensions.rio_table
-                        && let Some(reg_fn) = table.RIORegisterBuffer
-                    {
-                        let id = unsafe { reg_fn(ptr, len as u32) };
-                        if id != RIO_INVALID_BUFFERID {
-                            self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
-                        }
-                    }
-                }
-            }
-        }
+        // Same RIO registration logic for background ops (though usually used for file ops, safety check doesn't hurt)
+        // Eager registration handles this now.
 
         if let Some(op_entry) = self.ops.get_mut(user_data) {
             op_entry.platform_data = PlatformData::Background;
@@ -489,11 +331,8 @@ impl Driver for IocpDriver {
                 overlapped: &mut op_ref.header.inner as *mut OVERLAPPED,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
-                rio_rqs: &mut self.rio_rqs,
-                registered_rio_rqs: &mut self.registered_rio_rqs,
-                rio_cq: self.rio_cq,
-                registered_bufs: &self.registered_bufs,
-                slab_rio_pages: &self.slab_rio_pages,
+                rio: self.rio_state.as_mut(),
+                // ops removed
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
@@ -596,14 +435,15 @@ impl Driver for IocpDriver {
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
                 self.registered_files[idx] = Some(handle as HANDLE);
-                // Ensure corresponding RIO RQ slot is cleared (initially None)
-                if idx < self.registered_rio_rqs.len() {
-                    self.registered_rio_rqs[idx] = None;
+                if let Some(rio) = &mut self.rio_state {
+                    rio.clear_registered_rq(idx);
                 }
                 idx
             } else {
                 self.registered_files.push(Some(handle as HANDLE));
-                self.registered_rio_rqs.push(None);
+                if let Some(rio) = &mut self.rio_state {
+                    rio.resize_registered_rqs(self.registered_files.len());
+                }
                 self.registered_files.len() - 1
             };
             registered.push(crate::io::op::IoFd::Fixed(idx as u32));
@@ -617,9 +457,8 @@ impl Driver for IocpDriver {
                 let idx = idx as usize;
                 if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
                     self.registered_files[idx] = None;
-                    self.registered_files[idx] = None;
-                    if idx < self.registered_rio_rqs.len() {
-                        self.registered_rio_rqs[idx] = None;
+                    if let Some(rio) = &mut self.rio_state {
+                        rio.clear_registered_rq(idx);
                     }
                     self.free_slots.push(idx);
                 }

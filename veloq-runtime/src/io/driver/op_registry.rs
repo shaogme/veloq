@@ -68,6 +68,10 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.get_page_slice(page_idx)
     }
 
+    pub fn page_count(&self) -> usize {
+        self.slab.page_count()
+    }
+
     pub const PAGE_SHIFT: usize = StableSlab::<OpEntry<Op, P>>::PAGE_SHIFT;
 
     pub fn poll_op(
