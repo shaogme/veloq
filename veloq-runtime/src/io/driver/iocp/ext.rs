@@ -1,19 +1,11 @@
 use std::io;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCK_STREAM, SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED,
-    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_GETACCEPTEXSOCKADDRS, WSAIoctl, WSASocketW, closesocket,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
+    SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED, WSAID_ACCEPTEX, WSAID_CONNECTEX,
+    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW, closesocket,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
-
-// Manually define RIO GUID if missing from windows-sys
-// 8509e081-96dd-4005-9cae-1123a3c2002f
-pub const WSAID_RIO_EXTENSION_FUNCTION_TABLE: windows_sys::core::GUID = windows_sys::core::GUID {
-    data1: 0x8509e081,
-    data2: 0x96dd,
-    data3: 0x4005,
-    data4: [0x9c, 0xae, 0x11, 0x23, 0xa3, 0xc2, 0x00, 0x2f],
-};
 
 // Function pointer types for WinSock extensions
 pub(crate) type LpfnAcceptEx = unsafe extern "system" fn(
@@ -58,8 +50,8 @@ pub struct Extensions {
 
 impl Extensions {
     pub(crate) fn new() -> io::Result<Self> {
-        unsafe {
-            let socket = WSASocketW(
+        let socket = unsafe {
+            let s = WSASocketW(
                 AF_INET as i32,
                 SOCK_STREAM,
                 IPPROTO_TCP,
@@ -67,37 +59,76 @@ impl Extensions {
                 0,
                 WSA_FLAG_OVERLAPPED,
             );
-            if socket == INVALID_SOCKET {
+            if s == INVALID_SOCKET {
                 return Err(io::Error::last_os_error());
             }
+            s
+        };
 
-            let accept_ex = Self::get_extension(socket, WSAID_ACCEPTEX)?;
-            let connect_ex = Self::get_extension(socket, WSAID_CONNECTEX)?;
-            let get_accept_ex_sockaddrs = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
+        let traditional = Self::load_traditional(socket);
+        let rio = Self::load_rio(socket);
 
-            // Try to load RIO table. If it fails (e.g. strict Windows 7 without updates?), we can continue without RIO.
-            // But RIO was introduced in Win8/Server2012.
-            let rio_table = match Self::get_extension_struct::<RIO_EXTENSION_FUNCTION_TABLE>(
+        unsafe { closesocket(socket) };
+
+        let (accept_ex, connect_ex, get_accept_ex_sockaddrs) = traditional?;
+
+        Ok(Self {
+            accept_ex,
+            connect_ex,
+            get_accept_ex_sockaddrs,
+            rio_table: rio,
+        })
+    }
+
+    fn load_traditional(
+        socket: SOCKET,
+    ) -> io::Result<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
+        unsafe {
+            let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
+            let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
+            let get_accept_ex_sockaddrs_ptr =
+                Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
+
+            let accept_ex =
+                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr);
+            let connect_ex =
+                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr);
+            let get_accept_ex_sockaddrs = std::mem::transmute::<
+                *const std::ffi::c_void,
+                LpfnGetAcceptExSockaddrs,
+            >(get_accept_ex_sockaddrs_ptr);
+
+            Ok((accept_ex, connect_ex, get_accept_ex_sockaddrs))
+        }
+    }
+
+    fn load_rio(socket: SOCKET) -> Option<RIO_EXTENSION_FUNCTION_TABLE> {
+        unsafe {
+            let mut guid = WSAID_MULTIPLE_RIO;
+            let mut table: RIO_EXTENSION_FUNCTION_TABLE = std::mem::zeroed();
+            // RIO_EXTENSION_FUNCTION_TABLE must have cbSize initialized
+            table.cbSize = std::mem::size_of::<RIO_EXTENSION_FUNCTION_TABLE>() as u32;
+
+            let mut bytes_returned = 0;
+            let ret = WSAIoctl(
                 socket,
-                WSAID_RIO_EXTENSION_FUNCTION_TABLE,
-            ) {
-                Ok(table) => Some(table),
-                Err(_) => None,
-            };
+                SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
+                &mut guid as *mut _ as *mut _,
+                std::mem::size_of_val(&guid) as u32,
+                &mut table as *mut _ as *mut _,
+                std::mem::size_of_val(&table) as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            );
 
-            closesocket(socket);
-
-            Ok(Self {
-                accept_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex),
-                connect_ex: std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(
-                    connect_ex,
-                ),
-                get_accept_ex_sockaddrs: std::mem::transmute::<
-                    *const std::ffi::c_void,
-                    LpfnGetAcceptExSockaddrs,
-                >(get_accept_ex_sockaddrs),
-                rio_table,
-            })
+            if ret == 0 {
+                Some(table)
+            } else {
+                let err = io::Error::last_os_error();
+                eprintln!("Failed to load RIO extension table: {:?}", err);
+                None
+            }
         }
     }
 
@@ -128,34 +159,5 @@ impl Extensions {
         }
 
         Ok(ptr as *const _)
-    }
-
-    unsafe fn get_extension_struct<T>(
-        socket: SOCKET,
-        guid: windows_sys::core::GUID,
-    ) -> io::Result<T> {
-        let mut guid = guid;
-        let mut output: T = unsafe { std::mem::zeroed() };
-        let mut bytes_returned = 0;
-
-        let ret = unsafe {
-            WSAIoctl(
-                socket,
-                SIO_GET_EXTENSION_FUNCTION_POINTER,
-                &mut guid as *mut _ as *mut _,
-                std::mem::size_of_val(&guid) as u32,
-                &mut output as *mut _ as *mut _,
-                std::mem::size_of_val(&output) as u32,
-                &mut bytes_returned,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(output)
     }
 }

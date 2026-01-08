@@ -70,7 +70,7 @@ src/io/driver/iocp/
 Windows 的高性能扩展 API 需要在运行时加载。`Extensions::new()` 负责：
 - 创建临时 Socket。
 - 使用 `WSAIoctl` 加载 `AcceptEx`, `ConnectEx`, `GetAcceptExSockaddrs`。
-- 尝试加载 `RIO_EXTENSION_FUNCTION_TABLE`。如果系统不支持（如 Win7），则无缝降级，`rio_table` 为 `None`。
+- 尝试加载 `RIO_EXTENSION_FUNCTION_TABLE`。注意：这需要使用专门的 GUID (`WSAID_MULTIPLE_RIO`) 和 Opcode (`SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER`)，而不是标准的扩展加载方式。如果系统不支持（如 Win7），则无缝降级，`rio_table` 为 `None`。
 
 ### 4.3 智能提交 (`submit.rs`)
 该模块定义了所有操作的提交逻辑。宏 `submit_io_op!` 和 `impl_lifecycle!` 大简化了代码。

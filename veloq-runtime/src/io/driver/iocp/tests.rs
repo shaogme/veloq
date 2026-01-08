@@ -245,3 +245,13 @@ fn test_iocp_recv_with_buffer_pool() {
     }
     client_thread.join().unwrap();
 }
+
+#[test]
+fn test_rio_extensions_load() {
+    let ext = Extensions::new().expect("Extensions failed to load");
+    if ext.rio_table.is_some() {
+        println!("RIO Extensions loaded successfully");
+    } else {
+        eprintln!("RIO Extensions not available (this is expected on Windows 7 or older)");
+    }
+}
