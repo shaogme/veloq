@@ -33,13 +33,14 @@ Windows 的文件 I/O 即使使用 `OVERLAPPED`，在某些元数据操作（如
 目录结构如下：
 
 ```
-src/io/driver/iocp/
-├── mod.rs          // 驱动入口，IocpDriver 结构体定义，主循环逻辑
-├── op.rs           // IocpOp 定义，VTable 定义，Union Payload 宏
-├── submit.rs       // 各个 Op 的具体提交逻辑 (submit_*) 和辅助函数
-├── blocking.rs     // 阻塞任务线程池 (ThreadPool) 用于文件 Open/Close 等
-├── ext.rs          // Winsock 扩展函数加载 (ConnectEx, AcceptEx)
-└── tests/          // 测试用例
+src/io/driver/
+├── iocp.rs         // 驱动入口，IocpDriver 结构体定义，主循环逻辑
+└── iocp/
+    ├── op.rs       // IocpOp 定义，VTable 定义，Union Payload 宏
+    ├── submit.rs   // 各个 Op 的具体提交逻辑 (submit_*) 和辅助函数
+    ├── blocking.rs // 阻塞任务线程池 (ThreadPool) 用于文件 Open/Close 等
+    ├── ext.rs      // Winsock 扩展函数加载 (ConnectEx, AcceptEx)
+    └── tests.rs    // 测试用例
 ```
 
 外部辅助模块：
