@@ -160,9 +160,25 @@ impl<T> StableSlab<T> {
         self.free_head = start_idx;
     }
 
+    pub const PAGE_SHIFT: usize = PAGE_SHIFT;
+
     #[inline(always)]
     fn unpack_key(key: usize) -> (usize, usize) {
         (key >> PAGE_SHIFT, key & PAGE_MASK)
+    }
+
+    /// Returns the raw memory slice for a given page index.
+    /// This is useful for systems like RIO that need to register backing memory.
+    ///
+    /// # Safety
+    /// The pointer is valid as long as the slab is not dropped.
+    /// The length implies the total size of the allocated page in bytes.
+    pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
+        self.pages.get(page_idx).map(|page| {
+            let ptr = page.as_ptr() as *const u8;
+            let len = std::mem::size_of_val(&**page);
+            (ptr, len)
+        })
     }
 }
 

@@ -63,6 +63,13 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.iter_mut()
     }
 
+    /// Helper for RIO registration: access underlying slab pages
+    pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
+        self.slab.get_page_slice(page_idx)
+    }
+
+    pub const PAGE_SHIFT: usize = StableSlab::<OpEntry<Op, P>>::PAGE_SHIFT;
+
     pub fn poll_op(
         &mut self,
         user_data: usize,

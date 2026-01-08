@@ -47,7 +47,7 @@ impl OverlappedEntry {
 
 use crate::io::driver::iocp::RioBufferInfo;
 use std::collections::HashMap;
-use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
+use windows_sys::Win32::Networking::WinSock::{RIO_BUFFERID, RIO_CQ, RIO_RQ};
 
 // ============================================================================
 // SubmitContext Definition
@@ -64,6 +64,7 @@ pub struct SubmitContext<'a> {
     pub registered_rio_rqs: &'a mut [Option<RIO_RQ>],
     pub rio_cq: Option<RIO_CQ>,
     pub registered_bufs: &'a [RioBufferInfo],
+    pub slab_rio_pages: &'a [Option<(RIO_BUFFERID, usize)>],
 }
 
 // ============================================================================

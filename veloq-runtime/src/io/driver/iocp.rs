@@ -63,6 +63,9 @@ pub struct IocpDriver {
     pub(crate) rio_rqs: std::collections::HashMap<HANDLE, RIO_RQ>,
     // RIO Request Queues for registered files (O(1) lookup)
     pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
+    // RIO Registration for Slab Pages (for Address Buffers)
+    // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
+    pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
 }
 
 struct IocpWaker(HANDLE);
@@ -144,6 +147,7 @@ impl IocpDriver {
             registered_bufs: Vec::new(),
             rio_rqs: std::collections::HashMap::new(),
             registered_rio_rqs: Vec::new(),
+            slab_rio_pages: Vec::new(),
         })
     }
 
@@ -376,6 +380,26 @@ impl Driver for IocpDriver {
         user_data: usize,
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
+        // Ensure RIO registration for address buffers if needed
+        if self.rio_cq.is_some() {
+            let page_idx = user_data >> OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
+            if page_idx >= self.slab_rio_pages.len() {
+                self.slab_rio_pages.resize(page_idx + 1, None);
+            }
+            if self.slab_rio_pages[page_idx].is_none() {
+                if let Some((ptr, len)) = self.ops.get_page_slice(page_idx) {
+                    if let Some(table) = &self.extensions.rio_table
+                        && let Some(reg_fn) = table.RIORegisterBuffer
+                    {
+                        let id = unsafe { reg_fn(ptr, len as u32) };
+                        if id != RIO_INVALID_BUFFERID {
+                            self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(op_entry) = self.ops.get_mut(user_data) {
             // Important: we must pin the op in resources first, then get pointers
             op_entry.resources = Some(op);
@@ -393,6 +417,7 @@ impl Driver for IocpDriver {
                 registered_rio_rqs: &mut self.registered_rio_rqs,
                 rio_cq: self.rio_cq,
                 registered_bufs: &self.registered_bufs,
+                slab_rio_pages: &self.slab_rio_pages,
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
@@ -432,6 +457,27 @@ impl Driver for IocpDriver {
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         let user_data = self.reserve_op();
+
+        // Ensure RIO registration for address buffers if needed
+        if self.rio_cq.is_some() {
+            let page_idx = user_data >> OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
+            if page_idx >= self.slab_rio_pages.len() {
+                self.slab_rio_pages.resize(page_idx + 1, None);
+            }
+            if self.slab_rio_pages[page_idx].is_none() {
+                if let Some((ptr, len)) = self.ops.get_page_slice(page_idx) {
+                    if let Some(table) = &self.extensions.rio_table
+                        && let Some(reg_fn) = table.RIORegisterBuffer
+                    {
+                        let id = unsafe { reg_fn(ptr, len as u32) };
+                        if id != RIO_INVALID_BUFFERID {
+                            self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(op_entry) = self.ops.get_mut(user_data) {
             op_entry.platform_data = PlatformData::Background;
             op_entry.resources = Some(op);
@@ -447,6 +493,7 @@ impl Driver for IocpDriver {
                 registered_rio_rqs: &mut self.registered_rio_rqs,
                 rio_cq: self.rio_cq,
                 registered_bufs: &self.registered_bufs,
+                slab_rio_pages: &self.slab_rio_pages,
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
