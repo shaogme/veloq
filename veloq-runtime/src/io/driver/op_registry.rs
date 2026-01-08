@@ -64,16 +64,20 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
     }
 
     /// Helper for RIO registration: access underlying slab pages
+    #[cfg(target_os = "windows")]
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         self.slab.get_page_slice(page_idx)
     }
 
+    #[cfg(target_os = "windows")]
     pub fn page_count(&self) -> usize {
         self.slab.page_count()
     }
 
     // Expose mask to drivers
+    #[cfg(target_os = "windows")]
     pub const INDEX_MASK: usize = StableSlab::<OpEntry<Op, P>>::index_mask();
+    #[cfg(target_os = "windows")]
     pub const PAGE_SHIFT: usize = StableSlab::<OpEntry<Op, P>>::PAGE_SHIFT;
 
     pub fn poll_op(

@@ -173,10 +173,12 @@ impl<T> StableSlab<T> {
         self.free_head = start_idx;
     }
 
+    #[cfg(target_os = "windows")]
     pub const PAGE_SHIFT: usize = PAGE_SHIFT;
 
     // Returns raw index only.
     #[inline(always)]
+    #[cfg(target_os = "windows")]
     pub const fn index_mask() -> usize {
         INDEX_MASK
     }
@@ -197,6 +199,7 @@ impl<T> StableSlab<T> {
     }
 
     /// Returns the raw memory slice for a given page index.
+    #[cfg(target_os = "windows")]
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         self.pages.get(page_idx).map(|page| {
             let ptr = page.as_ptr() as *const u8;
