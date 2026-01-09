@@ -115,7 +115,7 @@ fn wake_task(task: &Arc<Task>) {
                     queue.borrow_mut().push_back(task.clone());
                 }
             } else {
-                shared.remote_queue.push(task.clone());
+                let _ = shared.remote_queue.send(task.clone());
                 let _ = shared.waker.wake();
             }
         }

@@ -139,17 +139,20 @@ impl RuntimeBuilder {
         // Pre-allocate Shared State and Handles
         let mut shared_states = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
+        let mut remote_receivers = Vec::with_capacity(worker_count);
 
         for i in 0..worker_count {
+            let (tx, rx) = std::sync::mpsc::channel();
             let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: SegQueue::new(),
-                remote_queue: SegQueue::new(),
+                remote_queue: tx,
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded(AtomicUsize::new(0)),
                 local_load: CachePadded(AtomicUsize::new(0)),
             });
             shared_states.push(shared.clone());
+            remote_receivers.push(Some(rx));
 
             handles.push(ExecutorHandle { id: i, shared });
         }
@@ -170,6 +173,9 @@ impl RuntimeBuilder {
             let state = states[worker_id].clone();
 
             let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
+            let remote_receiver = remote_receivers[worker_id]
+                .take()
+                .expect(" Receiver already taken");
 
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
@@ -178,6 +184,7 @@ impl RuntimeBuilder {
                 let mut executor = LocalExecutor::builder()
                     .config(config_clone)
                     .with_shared(shared) // Inject shared state
+                    .with_remote_receiver(remote_receiver) // Inject remote receiver
                     .build();
 
                 executor = executor.with_registry(registry.clone()); // Inject registry

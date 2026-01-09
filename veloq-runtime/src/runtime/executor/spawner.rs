@@ -39,7 +39,7 @@ use crate::runtime::task::Task;
 pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: SegQueue<Job>,
-    pub(crate) remote_queue: SegQueue<Arc<Task>>,
+    pub(crate) remote_queue: std::sync::mpsc::Sender<Arc<Task>>,
     pub(crate) waker: LateBoundWaker,
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,

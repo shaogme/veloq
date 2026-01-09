@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
@@ -26,6 +26,7 @@ pub mod spawner;
 pub struct LocalExecutorBuilder {
     config: crate::config::Config,
     shared: Option<Arc<ExecutorShared>>,
+    remote_receiver: Option<mpsc::Receiver<Arc<Task>>>,
 }
 
 impl Default for LocalExecutorBuilder {
@@ -39,11 +40,17 @@ impl LocalExecutorBuilder {
         Self {
             config: crate::config::Config::default(),
             shared: None,
+            remote_receiver: None,
         }
     }
 
     pub(crate) fn with_shared(mut self, shared: Arc<ExecutorShared>) -> Self {
         self.shared = Some(shared);
+        self
+    }
+
+    pub(crate) fn with_remote_receiver(mut self, receiver: mpsc::Receiver<Arc<Task>>) -> Self {
+        self.remote_receiver = Some(receiver);
         self
     }
 
@@ -61,16 +68,23 @@ impl LocalExecutorBuilder {
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let waker = driver.create_waker();
 
-        let shared = self.shared.unwrap_or_else(|| {
-            Arc::new(ExecutorShared {
+        let (shared, remote_receiver) = if let Some(shared) = self.shared {
+            let receiver = self
+                .remote_receiver
+                .expect("Shared state provided without remote receiver");
+            (shared, receiver)
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let shared = Arc::new(ExecutorShared {
                 injector: SegQueue::new(),
                 pinned: SegQueue::new(),
-                remote_queue: SegQueue::new(),
+                remote_queue: tx,
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded(AtomicUsize::new(0)),
                 local_load: CachePadded(AtomicUsize::new(0)),
-            })
-        });
+            });
+            (shared, rx)
+        };
 
         // Bind the driver's waker to the shared state (Late Binding)
         shared.waker.set(waker);
@@ -79,6 +93,7 @@ impl LocalExecutorBuilder {
             driver: Rc::new(RefCell::new(driver)),
             queue,
             shared,
+            remote_receiver,
             registry: None,
             mesh: None,
         }
@@ -91,6 +106,7 @@ pub struct LocalExecutor {
 
     // Shared components
     shared: Arc<ExecutorShared>,
+    remote_receiver: mpsc::Receiver<Arc<Task>>,
 
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
@@ -213,7 +229,7 @@ impl LocalExecutor {
         }
 
         // Check remote queue (Woken tasks from other threads)
-        if let Some(task) = self.shared.remote_queue.pop() {
+        if let Ok(task) = self.remote_receiver.try_recv() {
             self.queue.borrow_mut().push_back(task);
             return true;
         }
