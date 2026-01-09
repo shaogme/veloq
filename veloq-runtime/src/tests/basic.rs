@@ -198,7 +198,7 @@ fn test_local_channel() {
     let mut exec = LocalExecutor::default();
 
     exec.block_on(async move {
-        let (tx, mut rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded();
 
         // Spawn a local task to send messages
         let tx1 = tx.clone();
@@ -233,7 +233,7 @@ fn test_local_channel_disconnect() {
     let mut exec = LocalExecutor::default();
 
     exec.block_on(async move {
-        let (tx, mut rx) = mpsc::channel::<i32>();
+        let (tx, mut rx) = mpsc::unbounded::<i32>();
 
         // Drop sender immediately
         drop(tx);

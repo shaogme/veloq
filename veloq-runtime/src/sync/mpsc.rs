@@ -1,6 +1,7 @@
 use atomic_waker::AtomicWaker;
 use crossbeam_queue::SegQueue;
 use futures_core::stream::Stream;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,25 +13,51 @@ use std::task::{Context, Poll};
 ///
 /// This implementation uses `crossbeam_queue::SegQueue` for efficient lock-free queuing
 /// and `atomic_waker` for async notification.
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: SegQueue::new(),
-        waker: AtomicWaker::new(),
-        sender_count: AtomicUsize::new(1),
-        receiver_active: AtomicBool::new(true),
+        state: ChannelState::new(),
+        strategy: UnboundedStrategy,
     });
 
     (
-        Sender {
+        GenericSender {
             shared: shared.clone(),
         },
-        Receiver { shared },
+        GenericReceiver { shared },
     )
 }
 
-struct Shared<T> {
-    queue: SegQueue<T>,
-    waker: AtomicWaker,
+/// A bounded multi-producer, single-consumer channel.
+///
+/// This implementation uses `crossbeam_queue::SegQueue` and explicitly tracks capacity.
+/// Senders wait asynchronously if the channel is full.
+pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+    assert!(capacity > 0, "capacity must be > 0");
+    let shared = Arc::new(Shared {
+        queue: SegQueue::new(),
+        state: ChannelState::new(),
+        strategy: BoundedStrategy::new(capacity),
+    });
+
+    (
+        GenericSender {
+            shared: shared.clone(),
+        },
+        GenericReceiver { shared },
+    )
+}
+
+// Type Aliases to maintain API compatibility
+pub type Sender<T> = GenericSender<T, UnboundedStrategy>;
+pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy>;
+pub type BoundedSender<T> = GenericSender<T, BoundedStrategy>;
+pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy>;
+
+// --- Core State Logic ---
+
+struct ChannelState {
+    rx_waker: AtomicWaker,
     /// Number of active senders. Used to determine when to wake the receiver
     /// upon the last sender disconnecting.
     sender_count: AtomicUsize,
@@ -38,56 +65,244 @@ struct Shared<T> {
     receiver_active: AtomicBool,
 }
 
-pub struct Sender<T> {
-    shared: Arc<Shared<T>>,
+impl ChannelState {
+    fn new() -> Self {
+        Self {
+            rx_waker: AtomicWaker::new(),
+            sender_count: AtomicUsize::new(1),
+            receiver_active: AtomicBool::new(true),
+        }
+    }
+
+    fn inc_sender(&self) {
+        self.sender_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dec_sender(&self) -> bool {
+        self.sender_count.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    fn is_rx_active(&self) -> bool {
+        self.receiver_active.load(Ordering::Relaxed)
+    }
+
+    fn set_rx_inactive(&self) {
+        self.receiver_active.store(false, Ordering::Release);
+    }
+
+    fn wake_rx(&self) {
+        self.rx_waker.wake();
+    }
 }
 
-impl<T> Clone for Sender<T> {
+// --- Strategies ---
+
+pub trait ChannelStrategy: Send + Sync + 'static {
+    fn on_rx_drop(&self);
+    fn on_msg_recv(&self);
+}
+
+pub struct UnboundedStrategy;
+
+impl ChannelStrategy for UnboundedStrategy {
+    fn on_rx_drop(&self) {}
+    fn on_msg_recv(&self) {}
+}
+
+pub struct BoundedStrategy {
+    capacity: usize,
+    size: AtomicUsize,
+    send_waiters: SegQueue<Arc<WakerState>>,
+}
+
+struct WakerState {
+    waker: AtomicWaker,
+    waiting: AtomicBool,
+}
+
+impl BoundedStrategy {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            size: AtomicUsize::new(0),
+            send_waiters: SegQueue::new(),
+        }
+    }
+
+    fn wake_one_sender(&self) {
+        while let Some(ws) = self.send_waiters.pop() {
+            if ws.waiting.swap(false, Ordering::AcqRel) {
+                ws.waker.wake();
+                break;
+            }
+        }
+    }
+}
+
+impl ChannelStrategy for BoundedStrategy {
+    fn on_rx_drop(&self) {
+        while let Some(ws) = self.send_waiters.pop() {
+            ws.waker.wake();
+        }
+    }
+
+    fn on_msg_recv(&self) {
+        self.size.fetch_sub(1, Ordering::Release);
+        self.wake_one_sender();
+    }
+}
+
+// --- Shared Structure ---
+
+struct Shared<T, S> {
+    queue: SegQueue<T>,
+    state: ChannelState,
+    strategy: S,
+}
+
+// --- Generic Structures ---
+
+pub struct GenericSender<T, S: ChannelStrategy> {
+    shared: Arc<Shared<T, S>>,
+}
+
+pub struct GenericReceiver<T, S: ChannelStrategy> {
+    shared: Arc<Shared<T, S>>,
+}
+
+// --- Implementations ---
+
+impl<T, S: ChannelStrategy> Clone for GenericSender<T, S> {
     fn clone(&self) -> Self {
-        self.shared.sender_count.fetch_add(1, Ordering::Relaxed);
+        self.shared.state.inc_sender();
         Self {
             shared: self.shared.clone(),
         }
     }
 }
 
-impl<T> Drop for Sender<T> {
+impl<T, S: ChannelStrategy> Drop for GenericSender<T, S> {
     fn drop(&mut self) {
-        // Decrement count. If we were the last sender (count went from 1 to 0),
-        // wake the receiver so it can see the closed state.
-        if self.shared.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.waker.wake();
+        if self.shared.state.dec_sender() {
+            self.shared.state.wake_rx();
         }
     }
 }
 
-impl<T> Sender<T> {
+impl<T, S: ChannelStrategy> Drop for GenericReceiver<T, S> {
+    fn drop(&mut self) {
+        self.shared.state.set_rx_inactive();
+        self.shared.strategy.on_rx_drop();
+    }
+}
+
+// Unbounded Specifics
+impl<T> GenericSender<T, UnboundedStrategy> {
     /// Sends a value to the channel.
     ///
     /// Returns an error if the receiver has been dropped.
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
-        // Check if receiver is active
-        if !self.shared.receiver_active.load(Ordering::Relaxed) {
+        if !self.shared.state.is_rx_active() {
             return Err(SendError(val));
         }
 
         self.shared.queue.push(val);
-        self.shared.waker.wake();
+        self.shared.state.wake_rx();
         Ok(())
     }
 }
 
-pub struct Receiver<T> {
-    shared: Arc<Shared<T>>,
-}
-
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        self.shared.receiver_active.store(false, Ordering::Release);
+// Bounded Specifics
+impl<T> GenericSender<T, BoundedStrategy> {
+    /// Sends a value to the channel.
+    ///
+    /// Waits if the channel is full. Returns an error if the receiver is dropped.
+    pub async fn send(&self, val: T) -> Result<(), SendError<T>> {
+        BoundedSendFuture {
+            sender: self,
+            val: Some(val),
+            waker_state: None,
+        }
+        .await
     }
 }
 
-impl<T> Receiver<T> {
+struct BoundedSendFuture<'a, T> {
+    sender: &'a GenericSender<T, BoundedStrategy>,
+    val: Option<T>,
+    waker_state: Option<Arc<WakerState>>,
+}
+
+impl<'a, T> Drop for BoundedSendFuture<'a, T> {
+    fn drop(&mut self) {
+        if let Some(ws) = &self.waker_state {
+            ws.waiting.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl<'a, T> Future for BoundedSendFuture<'a, T> {
+    type Output = Result<(), SendError<T>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let shared = &this.sender.shared;
+        let strategy = &shared.strategy;
+
+        // Check Rx active
+        if !shared.state.is_rx_active() {
+            return Poll::Ready(Err(SendError(this.val.take().unwrap())));
+        }
+
+        // Try acquire capacity
+        let mut size = strategy.size.load(Ordering::Relaxed);
+        loop {
+            if size >= strategy.capacity {
+                break;
+            }
+            match strategy.size.compare_exchange_weak(
+                size,
+                size + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    shared.queue.push(this.val.take().unwrap());
+                    shared.state.wake_rx();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(s) => size = s,
+            }
+        }
+
+        // Register waiter
+        if this.waker_state.is_none() {
+            this.waker_state = Some(Arc::new(WakerState {
+                waker: AtomicWaker::new(),
+                waiting: AtomicBool::new(false),
+            }));
+        }
+        let ws = this.waker_state.as_ref().unwrap();
+        ws.waker.register(cx.waker());
+
+        if !ws.waiting.swap(true, Ordering::AcqRel) {
+            strategy.send_waiters.push(ws.clone());
+        }
+
+        // Re-check
+        if !shared.state.is_rx_active() {
+            return Poll::Ready(Err(SendError(this.val.take().unwrap())));
+        }
+        if strategy.size.load(Ordering::Acquire) < strategy.capacity {
+            ws.waker.wake();
+        }
+
+        Poll::Pending
+    }
+}
+
+// Receiver Methods (Unified)
+impl<T, S: ChannelStrategy> GenericReceiver<T, S> {
     /// Async receive method.
     ///
     /// Returns `None` if the channel is closed (all senders dropped).
@@ -98,8 +313,9 @@ impl<T> Receiver<T> {
     /// Try to receive a value without waiting.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         if let Some(msg) = self.shared.queue.pop() {
+            self.shared.strategy.on_msg_recv();
             Ok(msg)
-        } else if self.shared.sender_count.load(Ordering::Acquire) == 0 {
+        } else if self.shared.state.sender_count.load(Ordering::Acquire) == 0 {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
@@ -107,11 +323,11 @@ impl<T> Receiver<T> {
     }
 }
 
-struct RecvFuture<'a, T> {
-    receiver: &'a mut Receiver<T>,
+struct RecvFuture<'a, T, S: ChannelStrategy> {
+    receiver: &'a mut GenericReceiver<T, S>,
 }
 
-impl<'a, T> Future for RecvFuture<'a, T> {
+impl<'a, T, S: ChannelStrategy> Future for RecvFuture<'a, T, S> {
     type Output = Option<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -119,20 +335,18 @@ impl<'a, T> Future for RecvFuture<'a, T> {
     }
 }
 
-impl<T> Stream for Receiver<T> {
+impl<T, S: ChannelStrategy> Stream for GenericReceiver<T, S> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Register waker using AtomicWaker.
-        self.shared.waker.register(cx.waker());
+        self.shared.state.rx_waker.register(cx.waker());
 
-        // Check the queue
         if let Some(val) = self.shared.queue.pop() {
+            self.shared.strategy.on_msg_recv();
             return Poll::Ready(Some(val));
         }
 
-        // If queue is empty, check if all senders are disconnected
-        if self.shared.sender_count.load(Ordering::Acquire) == 0 {
+        if self.shared.state.sender_count.load(Ordering::Acquire) == 0 {
             return Poll::Ready(None);
         }
 
@@ -148,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_simple_send_recv() {
-        let (tx, mut rx) = channel();
+        let (tx, mut rx) = unbounded();
         tx.send(1).unwrap();
         tx.send(2).unwrap();
 
@@ -159,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_threaded_send() {
-        let (tx, mut rx) = channel();
+        let (tx, mut rx) = unbounded();
         let tx = Arc::new(tx);
 
         let mut handles = vec![];
@@ -183,5 +397,44 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn test_bounded_async() {
+        let (tx, mut rx) = bounded(1);
+
+        let mut send_fut = Box::pin(tx.send(1));
+        let waker = dummy_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // First send succeeds
+        assert!(send_fut.as_mut().poll(&mut cx).is_ready());
+
+        let mut send_fut2 = Box::pin(tx.send(2));
+        // Second send blocks
+        assert!(send_fut2.as_mut().poll(&mut cx).is_pending());
+
+        // Recv frees space
+        assert_eq!(rx.try_recv(), Ok(1));
+
+        // Second send succeeds now (after re-poll)
+        assert!(send_fut2.as_mut().poll(&mut cx).is_ready());
+
+        assert_eq!(rx.try_recv(), Ok(2));
+    }
+
+    fn dummy_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            dummy_raw_waker()
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        fn dummy_raw_waker() -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe { std::task::Waker::from_raw(dummy_raw_waker()) }
     }
 }
