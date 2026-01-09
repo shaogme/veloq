@@ -29,12 +29,13 @@ IOCP 是原生的 Proactor 模型。应用程序“投递”一个 I/O 请求（
 - 线程池任务完成后，手动调用 `PostQueuedCompletionStatus` 向 IOCP 端口发送完成通知，使其在主循环中表现为普通的异步事件。
 
 ### 2.5 Registered I/O (RIO) 集成
-为了追求极致的网络性能，驱动集成了 Windows RIO 扩展。
+为了追求极致的网络性能，驱动集成了 Windows RIO 扩展，并实现了多项优化：
+
 - **缓冲区注册**: 通过 `register_buffers` 接口，预先将内存注册到内核。
-- **逻辑区域映射 (Logical Region Mapping)**: Veloq 引入了创新的缓冲区管理设计。`BufferPool` 负责将内存划分为若干“逻辑区域”，每个区域对应一个索引。Windows 驱动将这些索引直接映射到 RIO Buffer ID，避免了在提交路径进行二分查找 (O(logN))，实现了 O(1) 的超高速缓冲区解析。
-- **请求队列 (RQ)**: 为每个 Socket 创建 RIO Request Queue。
-- **完成队列 (CQ)**: 全局使用一个 RIO Completion Queue，并将其完成通知绑定到 IOCP 端口。
-- **自动降级**: 在提交操作时 (`submit.rs`)，驱动会通过 `resolve_region_info` 快速判断 Buffer 是否已注册。如果环境支持 RIO 且 Buffer 有效，则走 RIO 路径；否则回退到普通 `ReadFile`/`WSARecv`。
+- **逻辑区域映射 (Logical Region Mapping)**: Veloq 引入了创新的缓冲区管理设计。Windows 驱动将逻辑区域索引直接映射到 RIO Buffer ID，实现了 O(1) 的缓冲区解析。
+- **O(1) 请求队列 (RQ) 查找**: 对于注册文件 (`IoFd::Fixed`)，驱动在 `RioState` 中维护了一个直接映射表 `registered_rio_rqs`。这消除了哈希表查找的开销，使得获取 Request Queue 的操作也是 O(1) 的。
+- **Slab 页注册**: 为了支持 `SendTo`/`RecvFrom` 等操作中的地址结构体（`SOCKADDR`），驱动会自动将 Slab 分配器的内存页注册到 RIO。这允许内部元数据结构也通过 RIO 零拷贝地传递。
+- **自动降级**: 在提交操作时 (`submit.rs`)，驱动会自动检测是否满足 RIO 条件（Buffer 已注册、RQ 获取成功）。如果满足则走 RIO 路径；否则无缝回退到普通 IOCP。
 
 ## 3. 模块内结构 (Internal Structure)
 
@@ -44,67 +45,60 @@ src/io/driver/iocp/
 ├── submit.rs   // 核心提交逻辑，包含各 Op 的 submit_* 函数及 RIO 升级检查
 ├── blocking.rs // 阻塞任务线程池
 ├── ext.rs      // Winsock 扩展加载 (ConnectEx, AcceptEx, RIO Table)
+├── rio.rs      // RIO 状态管理 (RioState), Buffer 注册, RQ 管理
 └── tests.rs    // 单元测试
 ```
 
 外部交互：
-- `iocp.rs`: 驱动入口，包含 `IocpDriver` 结构体和主 `Poll` 循环。
+- `iocp.rs`: 驱动入口，包含 `IocpDriver` 结构体，持有 `RioState` 并运行主 `Poll` 循环。
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
 ### 4.1 IocpDriver (`iocp.rs`)
-`IocpDriver` 是整个驱动的核心，它管理着 IOCP 端口和 RIO 资源：
+`IocpDriver` 是整个驱动的核心，它负责协调 IOCP 和 RIO：
 - **资源管理**:
     - `port`: IOCP 句柄。
-    - `rio_cq`: 全局 RIO 完成队列（如果可用）。
-    - `rio_rqs`: 句柄到 RIO 请求队列的映射。
-    - `registered_bufs`: 已注册的 RIO 缓冲区信息。
+    - `rio_state`: `Option<RioState>`，封装了所有 RIO 相关资源。
+    - `ops`: 存储所有在途操作的 Slab。
+- **文件注册**: `register_files` 不仅更新 IOCP 的文件表，还会通知 `RioState` 调整其内部映射表，确保存储 RQ 的 vector 足够大。
 - **主循环 (`get_completion`)**:
     1. 计算定时器超时。
     2. 调用 `GetQueuedCompletionStatus` 等待事件。
-    3. 如果收到 `RIO_EVENT_KEY`，则进入 `process_rio_completions` 处理 RIO 完成事件。
+    3. 如果收到 `RIO_EVENT_KEY`，则调用 `rio_state.process_completions` 处理 RIO 完成事件。
     4. 如果是普通 IOCP 事件或阻塞池任务，直接处理 `OVERLAPPED` 关联的 `user_data`。
-    5. 处理时间轮（Wheel）超时。
 
-### 4.2 扩展加载 (`ext.rs`)
-Windows 的高性能扩展 API 需要在运行时加载。`Extensions::new()` 负责：
-- 创建临时 Socket。
-- 使用 `WSAIoctl` 加载 `AcceptEx`, `ConnectEx`, `GetAcceptExSockaddrs`。
-- 尝试加载 `RIO_EXTENSION_FUNCTION_TABLE`。注意：这需要使用专门的 GUID (`WSAID_MULTIPLE_RIO`) 和 Opcode (`SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER`)，而不是标准的扩展加载方式。如果系统不支持（如 Win7），则无缝降级，`rio_table` 为 `None`。
+### 4.2 RIO 状态管理 (`rio.rs`)
+`RioState` 集中管理 RIO 资源：
+- **RQ 管理**: 
+    - `rio_rqs`: `HashMap<HANDLE, RIO_RQ>` 用于原始句柄。
+    - `registered_rio_rqs`: `Vec<Option<RIO_RQ>>` 用于注册文件，提供 O(1) 访问。
+- **Buffer 管理**: 维护 `registered_bufs` 以及 `slab_rio_pages`（用于内部地址缓冲区的 RIO 注册）。
+- **完成处理**: `process_completions` 使用 `RIODequeueCompletion` 批量获取完成结果，并更新对应 Op 的状态。
 
 ### 4.3 智能提交 (`submit.rs`)
-该模块定义了所有操作的提交逻辑。宏 `submit_io_op!` 和 `impl_lifecycle!` 大简化了代码。
-- **Recv/Send 的双路径**:
-    以 `submit_recv` 为例：
-    1. 检查 `ctx.rio_cq` 是否存在（RIO 可用）。
-    2. **O(1) 缓冲区解析**: 调用 `val.buf.resolve_region_info()` 获取区域索引。直接使用该索引访问 `registered_bufs` 数组获取 RIO Buffer ID，不再需要昂贵的二分查找。
-    3. 检查/创建 Socket 对应的 Request Queue (`ensure_rio_rq`)。
-    4. 若条件满足，调用 `RIOReceive`；否则调用 `ReadFile` / `WSARecv`。
-    这种设计对上层透明，用户只需使用 `register_buffers` 即可享受 RIO 加速。
+该模块定义了所有操作的提交逻辑。宏 `submit_io_op!` 和 `impl_lifecycle!` 简化了代码。
+- **Recv/Send**:
+    检查 `ctx.rio` 是否存在。如果存在，尝试调用 `rio.try_submit_recv/send`。这些函数会尝试进行 O(1) 的 Buffer 和 RQ 查找。
+- **UDP 支持 (`SendTo/RecvFrom`)**:
+    驱动实现了 `try_submit_send_to` 和 `try_submit_recv_from`。利用 `RIOSendEx` 和 `RIOReceiveEx`，以及预先注册的 Slab 页面（用于存放地址信息），实现了全路径的 RIO UDP 支持。
 
 ### 4.4 操作定义 (`op.rs`)
 通过 `define_iocp_ops!` 宏定义了如 `Accept`, `SendTo`, `Wakeup` 等操作。
-- 对于复杂操作（如 `Accept` 需要预分配 buffer，`SendTo` 需要地址结构），宏支持自定义 `contruct` 和 `destruct` 闭包来管理 `Payload` 中的附加数据。
-- `SubmitContext` 结构体在提交时被借用传递，包含了 `ext` (扩展表), `rio_rqs`, `registered_files` 等所有提交所需的上下文。
+- **SubmitContext**: 包含 `rio: Option<&'a mut RioState>`，使得提交逻辑可以访问 RIO 状态。
+- **复杂 Payload**: 如 `SendToPayload` 包含了 `WSABUF` 和地址存储。对于 RIO 路径，这些结构体在 Slab 中的位置已被注册，可直接作为 `RIO_BUF` 使用。
 
 ## 5. 存在的问题和 TODO
 
 1.  **SyncFileRange 语义**:
     - Windows 缺乏对应 Linux `sync_file_range` 的细粒度刷新 API。目前实现为全文件 Flush，性能可能低于预期。
 
-2.  **RIO 覆盖范围**:
-    - 目前 RIO 路径主要覆盖了 `Recv` 和 `Send`。`SendTo`/`RecvFrom` (UDP) 的 RIO 路径尚未完全实现或测试。
-
-3.  **线程池策略**:
+2.  **线程池策略**:
     - `blocking.rs` 中的线程池虽然支持动态伸缩，但缺乏基于负载的精细化调度，海量阻塞文件操作可能导致线程数抖动。
 
 ## 6. 未来的方向 (Future Directions)
 
-1.  **UDP RIO 优化**:
-    - 完善 `submit_send_to`和 `submit_recv_from` 的 RIO 分支，使 UDP 应用也能利用 RIO 的高性能。
+1.  **完成通知批处理**:
+    - 目前 `GetQueuedCompletionStatus` 是一次处理一个。可以引入 `GetQueuedCompletionStatusEx` 批量获取，减少系统调用。注：RIO 的 `process_completions` 已经实现了批量出队 (MAX 128)。
 
-2.  **完成通知批处理**:
-    - 目前 `GetQueuedCompletionStatus` 是一次处理一个。可以引入 `GetQueuedCompletionStatusEx` 批量获取，减少系统调用。`process_rio_completions` 已经实现了批量出队。
-
-3.  **错误码标准化**:
+2.  **错误码标准化**:
     - 进一步完善 WSA Error 到 `std::io::Error` 的映射，提供更跨平台一致的错误语义。
