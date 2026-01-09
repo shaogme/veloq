@@ -8,7 +8,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
 
-use crate::io::buffer::BufPool;
+use crate::io::buffer::{BufferRegion, BufferRegistrar};
 use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
 use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::{CachePadded, ExecutorShared};
@@ -139,11 +139,10 @@ impl LocalExecutor {
         }
     }
 
-    pub fn register_buffers(&self, pool: &dyn BufPool) {
-        let weak = Rc::downgrade(&self.driver);
-        let registrar = crate::io::driver::PlatformDriver::create_registrar(weak);
-        pool.bind_registrar(registrar)
-            .expect("Failed to bind registrar");
+    pub fn registrar(&self) -> Box<dyn BufferRegistrar> {
+        Box::new(ExecutorRegistrar {
+            driver: Rc::downgrade(&self.driver),
+        })
     }
 
     pub fn spawn_local<F, T>(&self, future: F) -> LocalJoinHandle<T>
@@ -302,10 +301,7 @@ impl LocalExecutor {
 
         let _guard = crate::runtime::context::enter(context);
 
-        // Auto-Register (Passive Scan)
-        if let Some(pool) = crate::runtime::context::current_pool() {
-            crate::runtime::context::current().register_buffers(&pool);
-        }
+        // Auto-Register removed: Pools should be pre-registered (Scheme 1).
 
         // Register Mesh Handle
         if let Some(mesh_rc) = &self.mesh {
@@ -379,10 +375,7 @@ impl LocalExecutor {
 
         let _guard = crate::runtime::context::enter(context);
 
-        // Auto-Register (Passive Scan)
-        if let Some(pool) = crate::runtime::context::current_pool() {
-            crate::runtime::context::current().register_buffers(&pool);
-        }
+        // Auto-Register removed.
 
         // Register Mesh Handle
         if let Some(mesh_rc) = &self.mesh {
@@ -514,4 +507,20 @@ unsafe fn atomic_wake_by_ref(ptr: *const ()) {
 
 unsafe fn atomic_drop(ptr: *const ()) {
     let _ = unsafe { Arc::from_raw(ptr as *const AtomicWakerState) };
+}
+
+#[derive(Debug, Clone)]
+struct ExecutorRegistrar<D: Driver> {
+    driver: std::rc::Weak<RefCell<D>>,
+}
+
+impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
+    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+        let driver_rc = self
+            .driver
+            .upgrade()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Driver dropped"))?;
+        let mut driver = driver_rc.borrow_mut();
+        driver.register_buffer_regions(regions)
+    }
 }

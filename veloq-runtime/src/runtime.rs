@@ -7,7 +7,7 @@ pub mod task;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 
-use crate::io::buffer::AnyBufPool;
+use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{
     CachePadded, ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner,
@@ -80,7 +80,7 @@ impl<T: Send> MeshMatrix<T> {
     }
 }
 
-pub type PoolConstructor = Arc<dyn Fn(usize) -> AnyBufPool + Send + Sync>;
+pub type PoolConstructor = Arc<dyn Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync>;
 
 pub struct RuntimeBuilder {
     config: crate::config::Config,
@@ -102,7 +102,7 @@ impl RuntimeBuilder {
 
     pub fn pool_constructor<F>(mut self, f: F) -> Self
     where
-        F: Fn(usize) -> AnyBufPool + Send + Sync + 'static,
+        F: Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync + 'static,
     {
         self.pool_constructor = Some(Arc::new(f));
         self
@@ -113,10 +113,12 @@ impl RuntimeBuilder {
 
         // Default Pool Constructor
         let pool_constructor = self.pool_constructor.unwrap_or_else(|| {
-            Arc::new(|_| {
+            Arc::new(|_, registrar| {
                 let pool = crate::io::buffer::BuddyPool::new()
                     .expect("Failed to create default BuddyPool");
-                crate::io::buffer::AnyBufPool::new(pool)
+                let reg_pool =
+                    RegisteredPool::new(pool, registrar).expect("Failed to create RegisteredPool");
+                AnyBufPool::new(reg_pool)
             })
         });
 
@@ -183,7 +185,8 @@ impl RuntimeBuilder {
                 executor.attach_mesh(worker_id, state, ingress, egress, peer_handles_clone);
 
                 // Bind Buffer Pool
-                let pool = pool_constructor(worker_id);
+                let registrar = executor.registrar();
+                let pool = pool_constructor(worker_id, registrar);
                 // This binds to TLS and since run() enters context, it will register buffers.
                 crate::runtime::context::bind_pool(pool);
 

@@ -1,6 +1,6 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool};
+use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf, HybridPool, RegisteredPool};
 use crate::net::udp::UdpSocket;
 use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 // ============ Helper Functions ============
 
 /// Helper function to allocate a buffer from a pool
-fn alloc_buf(pool: &HybridPool, size: usize) -> FixedBuf {
+fn alloc_buf(pool: &impl BufPool, size: usize) -> FixedBuf {
     pool.alloc(size)
         .expect("Failed to allocate buffer from pool")
 }
@@ -38,13 +38,15 @@ fn test_udp_bind() {
 
 /// Test UDP send and receive
 #[test]
-fn test_udp_send_recv() {
-    let pool = HybridPool::new().unwrap();
+fn test_udp_send_receive() {
+    let mut exec = LocalExecutor::default();
+    let registrar = exec.registrar();
+    let backing_pool = HybridPool::new().unwrap();
+    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
     crate::runtime::context::bind_pool(pool.clone());
+
     for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
-        let mut exec = LocalExecutor::default();
-
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -90,12 +92,14 @@ fn test_udp_send_recv() {
 /// Test UDP echo (send and receive response)
 #[test]
 fn test_udp_echo() {
-    let pool = HybridPool::new().unwrap();
+    let mut exec = LocalExecutor::default();
+    let registrar = exec.registrar();
+    let backing_pool = HybridPool::new().unwrap();
+    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
     crate::runtime::context::bind_pool(pool.clone());
+
     for size in [8192, 16384] {
         println!("Testing with BufferSize: {:?}", size);
-        let mut exec = LocalExecutor::default();
-
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -164,10 +168,13 @@ fn test_udp_echo() {
 /// Test multiple UDP messages
 #[test]
 fn test_udp_multiple_messages() {
-    let pool = HybridPool::new().unwrap();
+    let mut exec = LocalExecutor::default();
+    let registrar = exec.registrar();
+    let backing_pool = HybridPool::new().unwrap();
+    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
     crate::runtime::context::bind_pool(pool.clone());
+
     for size in [8192, 16384] {
-        let mut exec = LocalExecutor::default();
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -217,10 +224,13 @@ fn test_udp_multiple_messages() {
 /// Test UDP with large data
 #[test]
 fn test_udp_large_data() {
-    let pool = HybridPool::new().unwrap();
+    let mut exec = LocalExecutor::default();
+    let registrar = exec.registrar();
+    let backing_pool = HybridPool::new().unwrap();
+    let pool = RegisteredPool::new(backing_pool.clone(), registrar).unwrap();
     crate::runtime::context::bind_pool(pool.clone());
+
     for size in [8192, 16384] {
-        let mut exec = LocalExecutor::default();
         let pool_clone = pool.clone();
 
         exec.block_on(async move {
@@ -305,7 +315,11 @@ fn test_multithread_udp() {
                 worker_threads: Some(NUM_WORKERS),
                 ..Default::default()
             })
-            .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+            .pool_constructor(|_, registrar| {
+                let pool = HybridPool::new().unwrap();
+                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                AnyBufPool::new(reg_pool)
+            })
             .build()
             .unwrap();
 
@@ -384,7 +398,11 @@ fn test_multithread_udp_echo() {
         let addr_rx = Arc::new(Mutex::new(addr_rx));
         let runtime = Runtime::builder()
             .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
-            .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+            .pool_constructor(|_, registrar| {
+                let pool = HybridPool::new().unwrap();
+                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                AnyBufPool::new(reg_pool)
+            })
             .build()
             .unwrap();
 
@@ -495,7 +513,11 @@ fn test_multithread_concurrent_udp_clients() {
                 worker_threads: Some(NUM_WORKERS),
                 ..Default::default()
             })
-            .pool_constructor(|_| AnyBufPool::new(HybridPool::new().unwrap()))
+            .pool_constructor(|_, registrar| {
+                let pool = HybridPool::new().unwrap();
+                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                AnyBufPool::new(reg_pool)
+            })
             .build()
             .unwrap();
 

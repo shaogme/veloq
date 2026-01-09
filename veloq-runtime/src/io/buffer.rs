@@ -82,6 +82,30 @@ pub enum AllocResult {
     Failed,
 }
 
+impl AllocResult {
+    #[inline]
+    pub fn into_buf(self, pool: &dyn BackingPool) -> Option<FixedBuf> {
+        match self {
+            AllocResult::Allocated {
+                ptr,
+                cap,
+                global_index,
+                context,
+            } => unsafe {
+                Some(FixedBuf::new(
+                    ptr,
+                    cap,
+                    global_index,
+                    pool.pool_data(),
+                    pool.vtable(),
+                    context,
+                ))
+            },
+            AllocResult::Failed => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRegion {
     pub ptr: NonNull<u8>,
@@ -92,56 +116,32 @@ unsafe impl Send for BufferRegion {}
 unsafe impl Sync for BufferRegion {}
 
 /// Trait abstraction for driver-specific buffer registration
-pub trait BufferRegistrar: std::fmt::Debug {
+pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
     fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
 }
 
-/// Trait for memory pool implementation allows custom memory management
-pub trait BufPool: std::fmt::Debug + 'static {
-    /// Allocate memory with specific length.
-    fn alloc(&self, len: usize) -> Option<FixedBuf> {
-        match self.alloc_mem(len) {
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index,
-                context,
-            } => unsafe {
-                let mut buf = FixedBuf::new(
-                    ptr,
-                    cap,
-                    global_index,
-                    self.pool_data(),
-                    self.vtable(),
-                    context,
-                );
-                buf.set_len(len);
-                Some(buf)
-            },
-            AllocResult::Failed => None,
-        }
-    }
-
-    /// Allocate memory of at least `size` bytes (Low level).
+/// Memory pool implementation providing raw memory allocation.
+/// This trait manages memory layout, allocation algorithms, and deallocation.
+/// It does NOT handle driver registration.
+pub trait BackingPool: std::fmt::Debug + 'static {
+    /// Allocate memory without registration context.
+    /// Returns allocation result containing ptr, capacity, and header context.
+    /// The `global_index` in the result should be ignored or 0.
     fn alloc_mem(&self, size: usize) -> AllocResult;
 
     /// Get all memory regions managed by this pool.
-    /// Used for registering buffers with kernel (Fixed Buffers / RIO).
     fn get_memory_regions(&self) -> Vec<BufferRegion>;
 
-    /// Get the VTable for this pool.
+    /// Get the VTable for this pool (used by FixedBuf for deallocation).
     fn vtable(&self) -> &'static PoolVTable;
 
-    /// Get the raw pool data pointer (e.g. Rc<RefCell<Allocator>> as void ptr).
+    /// Get the raw pool data pointer.
     fn pool_data(&self) -> NonNull<()>;
 
-    /// Resolve Buffer to Region Index and Offset
-    /// Returns (region_index, offset_in_region)
-    /// Used for RIO IO submissions.
-    /// By default scans get_memory_regions (slow). Overridable.
+    /// Resolve Buffer to Region Index and Offset relative to the pool.
     fn resolve_region_info(&self, buf: &FixedBuf) -> (usize, usize) {
         let ptr = buf.as_ptr() as usize;
         let regions = self.get_memory_regions();
@@ -153,8 +153,80 @@ pub trait BufPool: std::fmt::Debug + 'static {
         }
         panic!("Buffer not found in pool regions");
     }
-    /// Bind a registrar to this pool to enable internal registration.
-    fn bind_registrar(&self, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<()>;
+}
+
+/// High-level Buffer Pool trait.
+/// Represents a pool that is ready for I/O operations (registered if necessary).
+pub trait BufPool: std::fmt::Debug + 'static {
+    /// Allocate a buffer ready for I/O.
+    fn alloc(&self, len: usize) -> Option<FixedBuf>;
+}
+
+// 组合注册池
+
+/// A wrapper that binds a backing pool with a registrar.
+/// This is the bridge between raw memory and driver-aware buffers.
+#[derive(Clone)]
+pub struct RegisteredPool<P> {
+    pool: P,
+    // Rc is required to satisfy Clone for AnyBufPool
+    #[allow(dead_code)]
+    registrar: std::rc::Rc<dyn BufferRegistrar>,
+    registration_ids: std::rc::Rc<Vec<usize>>,
+}
+
+impl<P: BackingPool> RegisteredPool<P> {
+    pub fn new(pool: P, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<Self> {
+        let regions = pool.get_memory_regions();
+        let ids = registrar.register(&regions)?;
+        Ok(Self {
+            pool,
+            registrar: std::rc::Rc::from(registrar),
+            registration_ids: std::rc::Rc::new(ids),
+        })
+    }
+}
+
+impl<P: BackingPool> std::fmt::Debug for RegisteredPool<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredPool")
+            .field("pool", &self.pool)
+            .field("registration_ids", &self.registration_ids)
+            .finish()
+    }
+}
+
+impl<P: BackingPool> BufPool for RegisteredPool<P> {
+    fn alloc(&self, len: usize) -> Option<FixedBuf> {
+        match self.pool.alloc_mem(len) {
+            AllocResult::Allocated {
+                ptr, cap, context, ..
+            } => {
+                // Use the first registration ID as the global index.
+                // For complex multi-region pools, we might need mapping logic,
+                // but currently Buddy/Hybrid are single-region arenas.
+                let global_index =
+                    self.registration_ids
+                        .first()
+                        .copied()
+                        .unwrap_or(NO_REGISTRATION_INDEX as usize) as u16;
+
+                unsafe {
+                    let mut buf = FixedBuf::new(
+                        ptr,
+                        cap,
+                        global_index,
+                        self.pool.pool_data(),
+                        self.pool.vtable(),
+                        context,
+                    );
+                    buf.set_len(len);
+                    Some(buf)
+                }
+            }
+            AllocResult::Failed => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -327,19 +399,13 @@ impl Drop for AlignedMemory {
 
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
-    pub alloc_mem: unsafe fn(*const (), usize) -> AllocResult,
-    pub get_memory_regions: unsafe fn(*const ()) -> Vec<BufferRegion>,
-    pub resolve_region_info: unsafe fn(*const (), &FixedBuf) -> (usize, usize),
-    pub vtable: unsafe fn(*const ()) -> &'static PoolVTable,
-    pub pool_data: unsafe fn(*const ()) -> NonNull<()>,
+    pub alloc: unsafe fn(*const (), usize) -> Option<FixedBuf>,
     pub clone: unsafe fn(*const ()) -> *mut (),
     pub drop: unsafe fn(*mut ()),
     pub fmt: unsafe fn(*const (), &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
-    pub bind_registrar: unsafe fn(*const (), Box<dyn BufferRegistrar>) -> std::io::Result<()>,
 }
 
-/// 类型擦除的 Pool 句柄，可存储在 TLS 中。
-/// 类似于 `Box<dyn BufPool + Clone>`，但使用手写 VTable 避免了 dyn 限制和对象安全问题。
+/// A type-erased handle to any `BufPool`.
 pub struct AnyBufPool {
     data: *mut (),
     vtable: &'static BufPoolVTable,
@@ -348,41 +414,10 @@ pub struct AnyBufPool {
 impl AnyBufPool {
     /// 从任意实现了 `BufPool + Clone` 的类型构造 `AnyBufPool`。
     pub fn new<P: BufPool + Clone + 'static>(pool: P) -> Self {
-        unsafe fn alloc_mem_shim<P: BufPool>(ptr: *const (), size: usize) -> AllocResult {
+        unsafe fn alloc_shim<P: BufPool>(ptr: *const (), size: usize) -> Option<FixedBuf> {
             unsafe {
                 let pool = &*(ptr as *const P);
-                pool.alloc_mem(size)
-            }
-        }
-
-        unsafe fn get_memory_regions_shim<P: BufPool>(ptr: *const ()) -> Vec<BufferRegion> {
-            unsafe {
-                let pool = &*(ptr as *const P);
-                pool.get_memory_regions()
-            }
-        }
-
-        unsafe fn resolve_region_info_shim<P: BufPool>(
-            ptr: *const (),
-            buf: &FixedBuf,
-        ) -> (usize, usize) {
-            unsafe {
-                let pool = &*(ptr as *const P);
-                pool.resolve_region_info(buf)
-            }
-        }
-
-        unsafe fn vtable_shim<P: BufPool>(ptr: *const ()) -> &'static PoolVTable {
-            unsafe {
-                let pool = &*(ptr as *const P);
-                pool.vtable()
-            }
-        }
-
-        unsafe fn pool_data_shim<P: BufPool>(ptr: *const ()) -> NonNull<()> {
-            unsafe {
-                let pool = &*(ptr as *const P);
-                pool.pool_data()
+                pool.alloc(size)
             }
         }
 
@@ -410,29 +445,14 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn bind_registrar_shim<P: BufPool>(
-            ptr: *const (),
-            registrar: Box<dyn BufferRegistrar>,
-        ) -> std::io::Result<()> {
-            unsafe {
-                let pool = &*(ptr as *const P);
-                pool.bind_registrar(registrar)
-            }
-        }
-
         struct VTableGen<P>(std::marker::PhantomData<P>);
 
         impl<P: BufPool + Clone + 'static> VTableGen<P> {
             const VTABLE: BufPoolVTable = BufPoolVTable {
-                alloc_mem: alloc_mem_shim::<P>,
-                get_memory_regions: get_memory_regions_shim::<P>,
-                resolve_region_info: resolve_region_info_shim::<P>,
-                vtable: vtable_shim::<P>,
-                pool_data: pool_data_shim::<P>,
+                alloc: alloc_shim::<P>,
                 clone: clone_shim::<P>,
                 drop: drop_shim::<P>,
                 fmt: fmt_shim::<P>,
-                bind_registrar: bind_registrar_shim::<P>,
             };
         }
 
@@ -444,32 +464,8 @@ impl AnyBufPool {
 }
 
 impl BufPool for AnyBufPool {
-    fn alloc_mem(&self, size: usize) -> AllocResult {
-        unsafe { (self.vtable.alloc_mem)(self.data, size) }
-    }
-
-    fn get_memory_regions(&self) -> Vec<BufferRegion> {
-        unsafe { (self.vtable.get_memory_regions)(self.data) }
-    }
-
-    fn resolve_region_info(&self, buf: &FixedBuf) -> (usize, usize) {
-        unsafe { (self.vtable.resolve_region_info)(self.data, buf) }
-    }
-
-    // For non-Linux, generic trait impl doesn't require this method inside the impl
-    // unless defined in the trait. The trait def has `#[cfg(target_os = "linux")]`
-    // so `AnyBufPool` implementation must match.
-
-    fn vtable(&self) -> &'static PoolVTable {
-        unsafe { (self.vtable.vtable)(self.data) }
-    }
-
-    fn pool_data(&self) -> NonNull<()> {
-        unsafe { (self.vtable.pool_data)(self.data) }
-    }
-
-    fn bind_registrar(&self, registrar: Box<dyn BufferRegistrar>) -> std::io::Result<()> {
-        unsafe { (self.vtable.bind_registrar)(self.data, registrar) }
+    fn alloc(&self, len: usize) -> Option<FixedBuf> {
+        unsafe { (self.vtable.alloc)(self.data, len) }
     }
 }
 

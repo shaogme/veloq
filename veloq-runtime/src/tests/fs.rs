@@ -1,5 +1,5 @@
 use crate::fs::File;
-use crate::io::buffer::HybridPool;
+use crate::io::buffer::{BufPool, HybridPool, RegisteredPool};
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
 use std::path::Path;
@@ -11,6 +11,9 @@ fn test_file_integrity() {
             println!("Testing with BufferSize: {:?}", size);
             let mut exec = LocalExecutor::default();
             let pool = HybridPool::new().unwrap();
+
+            let registrar = exec.registrar();
+            let pool = RegisteredPool::new(pool, registrar).unwrap();
 
             crate::runtime::context::bind_pool(pool.clone());
             let pool_clone = pool.clone();

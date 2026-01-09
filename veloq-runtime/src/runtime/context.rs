@@ -176,16 +176,6 @@ impl RuntimeContext {
         self.driver.clone()
     }
 
-    /// Register buffers with the underlying driver.
-    pub fn register_buffers(&self, pool: &dyn BufPool) {
-        if let Some(driver) = self.driver.upgrade() {
-            driver
-                .borrow_mut()
-                .register_buffers(pool)
-                .expect("Failed to register buffer pool");
-        }
-    }
-
     /// Spawn a new task on a specific worker thread.
     ///
     /// # Panics
@@ -295,13 +285,7 @@ pub fn try_bind_pool<P: BufPool + Clone + 'static>(pool: P) -> Result<(), PoolAl
     // 1. Set TLS
     CURRENT_POOL.with(|cell| cell.set(any_pool).map_err(|_| PoolAlreadyBound))?;
 
-    // 2. Try Auto-Register (Active Hook)
-    // If we are already running inside a RuntimeContext, register immediately.
-    if let Some(ctx) = try_current()
-        && let Some(pool) = current_pool()
-    {
-        ctx.register_buffers(&pool);
-    }
+    // Auto-Register removed (Scheme 1). Pool must be registered before binding.
 
     Ok(())
 }

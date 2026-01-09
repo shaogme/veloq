@@ -40,9 +40,13 @@ pub trait Driver {
     /// Cancel an operation.
     fn cancel_op(&mut self, user_data: usize);
 
-    /// Register a buffer pool with the driver.
-    /// This allows the driver to optimize buffer access (e.g. fixed buffers in io_uring).
-    fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()>;
+    /// Register memory regions with the driver.
+    /// Returns a list of handles (tokens) corresponding to the regions.
+    /// Replaces `register_buffers`.
+    fn register_buffer_regions(
+        &mut self,
+        regions: &[crate::io::buffer::BufferRegion],
+    ) -> io::Result<Vec<usize>>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.

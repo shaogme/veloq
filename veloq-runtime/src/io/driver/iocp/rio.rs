@@ -89,7 +89,7 @@ impl RioState {
 
     pub fn register_buffers(
         &mut self,
-        pool: &dyn crate::io::buffer::BufPool,
+        regions: &[crate::io::buffer::BufferRegion],
         ext: &Extensions,
     ) -> io::Result<()> {
         let reg_fn = match &ext.rio_table {
@@ -98,7 +98,6 @@ impl RioState {
         };
 
         if let Some(reg_fn) = reg_fn {
-            let regions = pool.get_memory_regions();
             self.registered_bufs.clear();
             self.registered_bufs.reserve(regions.len());
 

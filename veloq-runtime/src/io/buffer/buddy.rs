@@ -1,4 +1,6 @@
-use super::{AlignedMemory, AllocError, AllocResult, BufPool, DeallocParams, FixedBuf, PoolVTable};
+use super::{
+    AlignedMemory, AllocError, AllocResult, BackingPool, DeallocParams, FixedBuf, PoolVTable,
+};
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -329,11 +331,6 @@ struct BuddyAllocator {
 
     // Slab 缓存：存储常用 Order 的空闲块 (Order 0..=MAX_SLAB_ORDER)
     slabs: [Vec<NonNull<u8>>; MAX_SLAB_ORDER + 1],
-
-    // Optional registrar for driver integration
-    registrar: Option<Box<dyn crate::io::buffer::BufferRegistrar>>,
-    // Registration ID (e.g. RIO Buffer ID) if registered
-    registration_id: Option<usize>,
 }
 
 impl BuddyAllocator {
@@ -341,8 +338,6 @@ impl BuddyAllocator {
         Ok(Self {
             raw: RawBuddyAllocator::new()?,
             slabs: Default::default(),
-            registrar: None,
-            registration_id: None,
         })
     }
 
@@ -472,32 +467,9 @@ impl BuddyPool {
             inner: Rc::new(RefCell::new(BuddyAllocator::new()?)),
         })
     }
-
-    pub fn alloc(&self, len: usize) -> Option<FixedBuf> {
-        let mut inner = self.inner.borrow_mut();
-
-        if let Some((block_ptr, order)) = inner.alloc(len) {
-            let capacity = MIN_BLOCK_SIZE << order;
-
-            unsafe {
-                let mut buf = FixedBuf::new(
-                    block_ptr,
-                    capacity,
-                    inner.registration_id.map(|id| id as u16).unwrap_or(0),
-                    self.pool_data(),
-                    self.vtable(),
-                    order, // Use order as context
-                );
-                buf.set_len(len);
-                Some(buf)
-            }
-        } else {
-            None
-        }
-    }
 }
 
-impl BufPool for BuddyPool {
+impl BackingPool for BuddyPool {
     fn alloc_mem(&self, size: usize) -> AllocResult {
         let mut inner = self.inner.borrow_mut();
 
@@ -509,7 +481,8 @@ impl BufPool for BuddyPool {
                 AllocResult::Allocated {
                     ptr: block_ptr,
                     cap: capacity,
-                    global_index: inner.registration_id.map(|id| id as u16).unwrap_or(0),
+                    // BackingPool doesn't know about registration
+                    global_index: 0,
                     context: order,
                 }
             }
@@ -534,23 +507,6 @@ impl BufPool for BuddyPool {
             let raw = Rc::into_raw(self.inner.clone());
             NonNull::new_unchecked(raw as *mut ())
         }
-    }
-    fn bind_registrar(
-        &self,
-        registrar: Box<dyn crate::io::buffer::BufferRegistrar>,
-    ) -> std::io::Result<()> {
-        let mut inner = self.inner.borrow_mut();
-        // Register the single arena region
-        let region = crate::io::buffer::BufferRegion {
-            ptr: unsafe { NonNull::new_unchecked(inner.base_ptr() as *mut _) },
-            len: ARENA_SIZE,
-        };
-        let ids = registrar.register(&[region])?;
-        if let Some(&id) = ids.first() {
-            inner.registration_id = Some(id);
-        }
-        inner.registrar = Some(registrar);
-        Ok(())
     }
 }
 
@@ -588,17 +544,5 @@ mod tests {
         assert_eq!(order2, 0);
         assert_eq!(ptr2, ptr1); // 应该复用 Slab 里的
         assert_eq!(allocator.count_slab(0), 0);
-    }
-
-    #[test]
-    fn test_pool_integration() {
-        let pool = BuddyPool::new().unwrap();
-        // With 4KB alignment, a 4K block has 4096 capacity.
-        // Minimal usable block is 4K.
-        let buf = pool.alloc(4096).unwrap();
-        // Capacity should be 4096
-        assert_eq!(buf.capacity(), 4096);
-        drop(buf);
-        // Ensure no panic on drop and proper rc cleanup
     }
 }

@@ -54,46 +54,6 @@ impl Drop for UringWaker {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct UringRegistrar {
-    driver: Weak<RefCell<UringDriver>>,
-}
-
-impl BufferRegistrar for UringRegistrar {
-    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
-        let driver_rc = self
-            .driver
-            .upgrade()
-            .ok_or(io::Error::new(io::ErrorKind::Other, "Driver dropped"))?;
-        let mut driver = driver_rc.borrow_mut();
-
-        // io_uring requires registering all buffers at once.
-        let iovecs: Vec<libc::iovec> = regions
-            .iter()
-            .map(|region| libc::iovec {
-                iov_base: region.ptr.as_ptr() as *mut _,
-                iov_len: region.len,
-            })
-            .collect();
-
-        match unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
-            Ok(_) => {
-                driver.buffers_registered = true;
-            }
-            Err(e) => {
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    driver.buffers_registered = true;
-                    // Already registered.
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok((0..regions.len()).collect())
-    }
-}
-
 /// Special user_data value for cancel operations.
 /// We use u64::MAX - 1 because u64::MAX is already reserved.
 /// CQEs with this user_data are ignored (they're just confirmations that cancel was submitted).
@@ -449,11 +409,18 @@ impl UringDriver {
         Some(head)
     }
 
-    pub fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
+    pub fn register_buffer_regions(
+        &mut self,
+        regions: &[crate::io::buffer::BufferRegion],
+    ) -> io::Result<Vec<usize>> {
         if self.buffers_registered {
-            return Ok(());
+            // Assume existing registration matches?
+            // Since we return indices, and they are usually 0..N, we return based on input length.
+            // Ideally we shouldn't registering twice unless regions are different?
+            // For now, simple behavior.
+            return Ok((0..regions.len()).collect());
         }
-        let regions = pool.get_memory_regions();
+
         let iovecs: Vec<libc::iovec> = regions
             .iter()
             .map(|region| libc::iovec {
@@ -465,14 +432,12 @@ impl UringDriver {
         match unsafe { self.ring.submitter().register_buffers(&iovecs) } {
             Ok(_) => {
                 self.buffers_registered = true;
-                Ok(())
+                Ok((0..regions.len()).collect())
             }
             Err(e) => {
-                // If the kernel says it's busy, it usually means buffers are already registered.
-                // We treat this as success to support driver reuse.
                 if e.raw_os_error() == Some(libc::EBUSY) {
                     self.buffers_registered = true;
-                    Ok(())
+                    Ok((0..regions.len()).collect())
                 } else {
                     Err(e)
                 }
@@ -496,10 +461,6 @@ impl UringDriver {
         }
         // Remove from backlog if present? O(N).
         // We let flush_backlog handle it (it checks cancelled).
-    }
-
-    pub fn create_registrar(weak: Weak<RefCell<Self>>) -> Box<dyn BufferRegistrar> {
-        Box::new(UringRegistrar { driver: weak })
     }
 }
 
@@ -607,8 +568,11 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffers(&mut self, pool: &dyn crate::io::buffer::BufPool) -> io::Result<()> {
-        self.register_buffers(pool)
+    fn register_buffer_regions(
+        &mut self,
+        regions: &[crate::io::buffer::BufferRegion],
+    ) -> io::Result<Vec<usize>> {
+        self.register_buffer_regions(regions)
     }
 
     fn register_files(

@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool};
+use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, RegisteredPool};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 
@@ -15,8 +15,9 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
-    let pool = BuddyPool::new().unwrap();
-    veloq_runtime::runtime::context::bind_pool(pool.clone());
+    // Pool setup moved inside bench_function to share executor
+    // let pool = BuddyPool::new().unwrap();
+    // veloq_runtime::runtime::context::bind_pool(pool.clone());
 
     // 设置吞吐量统计单位
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
@@ -26,6 +27,11 @@ fn benchmark_1gb_write(c: &mut Criterion) {
 
     group.bench_function("write_1gb_concurrent", |b| {
         let mut exec = LocalExecutor::default();
+        let registrar = exec.registrar();
+        let backing_pool = BuddyPool::new().unwrap();
+        let pool = RegisteredPool::new(backing_pool, registrar).unwrap();
+
+        veloq_runtime::runtime::context::bind_pool(pool.clone());
 
         b.iter(|| {
             let pool = pool.clone();
@@ -139,7 +145,11 @@ fn benchmark_32_files_write(c: &mut Criterion) {
             worker_threads: Some(WORKER_COUNT),
             ..Default::default()
         })
-        .pool_constructor(|_| AnyBufPool::new(BuddyPool::new().unwrap()))
+        .pool_constructor(|_, registrar| {
+            let pool = BuddyPool::new().unwrap();
+            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+            AnyBufPool::new(reg_pool)
+        })
         .build()
         .unwrap();
 

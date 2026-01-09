@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool};
+use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, RegisteredPool};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 
@@ -146,8 +146,10 @@ fn main() {
             worker_threads: Some(args.threads),
             ..Default::default()
         })
-        .pool_constructor(|_| {
-            AnyBufPool::new(BuddyPool::new().expect("Failed to create BuddyPool"))
+        .pool_constructor(|_, registrar| {
+            let pool = BuddyPool::new().expect("Failed to create BuddyPool");
+            let reg_pool = RegisteredPool::new(pool, registrar).expect("Failed to register pool");
+            AnyBufPool::new(reg_pool)
         })
         .build()
         .expect("Failed to build Runtime");
