@@ -197,7 +197,7 @@ impl RuntimeContext {
     /// # Panics
     /// Panics if called outside of a runtime context, if the executor registry is missing,
     /// or if the `worker_id` is invalid.
-    pub fn spawn_to<F, Output>(&self, async_fn: F, worker_id: usize) -> JoinHandle<Output>
+    pub fn spawn_to<F, Output>(&self, worker_id: usize, async_fn: F) -> JoinHandle<Output>
     where
         F: AsyncFnOnce() -> Output + Send + 'static,
         Output: Send + 'static,
@@ -353,10 +353,10 @@ where
 /// # Panics
 ///
 /// Panics if called outside of a runtime context, or if the `worker_id` is invalid.
-pub fn spawn_to<F, Output>(async_fn: F, worker_id: usize) -> JoinHandle<Output>
+pub fn spawn_to<F, Output>(worker_id: usize, async_fn: F) -> JoinHandle<Output>
 where
     F: AsyncFnOnce() -> Output + Send + 'static,
     Output: Send + 'static,
 {
-    current().spawn_to(async_fn, worker_id)
+    current().spawn_to(worker_id, async_fn)
 }

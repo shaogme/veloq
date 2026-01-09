@@ -167,15 +167,12 @@ fn main() {
             // Spawn worker task to specific thread
             // Note: spawn_to logic ensures it runs on worker `i` if configured that way,
             // but `spawn_to` API in veloq_runtime takes closure + ID.
-            veloq_runtime::runtime::context::spawn_to(
-                async move || {
-                    let bytes = run_worker(i, mode, qdepth)
-                        .await
-                        .expect("Worker execution failed");
-                    tx.send(bytes).unwrap();
-                },
-                i,
-            );
+            veloq_runtime::runtime::context::spawn_to(i, async move || {
+                let bytes = run_worker(i, mode, qdepth)
+                    .await
+                    .expect("Worker execution failed");
+                tx.send(bytes).unwrap();
+            });
         }
 
         // Aggregate results

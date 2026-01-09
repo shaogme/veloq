@@ -281,8 +281,8 @@ impl Spawner {
 
     pub fn spawn_to<F, Output>(
         &self,
-        async_fn: F,
         worker_id: usize,
+        async_fn: F,
     ) -> crate::runtime::join::JoinHandle<Output>
     where
         F: AsyncFnOnce() -> Output + Send + 'static,

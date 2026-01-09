@@ -163,7 +163,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                     let tx = tx.clone();
 
                     // Spawn to specific worker
-                    veloq_runtime::runtime::context::spawn_to(async move || {
+                    veloq_runtime::runtime::context::spawn_to(i, async move || {
                         // Get the pool bound to this worker (correctly registered)
                         let pool = veloq_runtime::runtime::context::current_pool()
                             .expect("Worker should have bound pool");
@@ -277,7 +277,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         // Signal done
                         tx.send(()).unwrap();
 
-                    }, i);
+                    });
                 }
 
                 // Wait for all workers to finish
