@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossbeam-queue = "0.3"
+crossbeam-utils = { version = "0.8", default-features = false }
 num_cpus = "1.17.0"
 veloq-bitset = { path = "../veloq-bitset" }
 

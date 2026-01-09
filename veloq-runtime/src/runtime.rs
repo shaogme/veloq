@@ -9,13 +9,12 @@ use std::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
 use crate::runtime::executor::spawner::LateBoundWaker;
-use crate::runtime::executor::{
-    CachePadded, ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner,
-};
+use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::mesh::{Consumer, Producer};
 use crossbeam_queue::SegQueue;
 
 pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
+use crossbeam_utils::CachePadded;
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
@@ -148,8 +147,8 @@ impl RuntimeBuilder {
                 pinned: SegQueue::new(),
                 remote_queue: tx,
                 waker: LateBoundWaker::new(),
-                injected_load: CachePadded(AtomicUsize::new(0)),
-                local_load: CachePadded(AtomicUsize::new(0)),
+                injected_load: CachePadded::new(AtomicUsize::new(0)),
+                local_load: CachePadded::new(AtomicUsize::new(0)),
             });
             shared_states.push(shared.clone());
             remote_receivers.push(Some(rx));

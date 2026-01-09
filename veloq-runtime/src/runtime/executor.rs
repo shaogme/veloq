@@ -7,11 +7,12 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
+use crossbeam_utils::CachePadded;
 
 use crate::io::buffer::{BufferRegion, BufferRegistrar};
 use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
 use crate::runtime::context::RuntimeContext;
-pub(crate) use crate::runtime::executor::spawner::{CachePadded, ExecutorShared};
+pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::mesh::{self, Consumer, Producer};
 use crate::runtime::task::Task;
@@ -80,8 +81,8 @@ impl LocalExecutorBuilder {
                 pinned: SegQueue::new(),
                 remote_queue: tx,
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
-                injected_load: CachePadded(AtomicUsize::new(0)),
-                local_load: CachePadded(AtomicUsize::new(0)),
+                injected_load: CachePadded::new(AtomicUsize::new(0)),
+                local_load: CachePadded::new(AtomicUsize::new(0)),
             });
             (shared, rx)
         };
@@ -178,7 +179,7 @@ impl LocalExecutor {
             self.shared.clone(),
         );
         self.queue.borrow_mut().push_back(task);
-        self.shared.local_load.0.fetch_add(1, Ordering::Relaxed);
+        self.shared.local_load.fetch_add(1, Ordering::Relaxed);
         handle
     }
 
@@ -201,7 +202,7 @@ impl LocalExecutor {
     }
 
     fn enqueue_job(&self, job_factory: Job) {
-        self.shared.local_load.0.fetch_add(1, Ordering::Relaxed);
+        self.shared.local_load.fetch_add(1, Ordering::Relaxed);
         let future = job_factory();
         let task = Task::from_boxed(
             future,
@@ -223,7 +224,7 @@ impl LocalExecutor {
     fn try_poll_injector(&self) -> bool {
         // Check pinned first (strictly specific to this worker)
         if let Some(job) = self.shared.pinned.pop() {
-            self.shared.injected_load.0.fetch_sub(1, Ordering::Relaxed);
+            self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
             self.enqueue_job(job);
             return true;
         }
@@ -235,7 +236,7 @@ impl LocalExecutor {
         }
 
         if let Some(job) = self.shared.injector.pop() {
-            self.shared.injected_load.0.fetch_sub(1, Ordering::Relaxed);
+            self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
             self.enqueue_job(job);
             return true;
         }
@@ -261,11 +262,7 @@ impl LocalExecutor {
 
                     // Steal from injector
                     if let Some(job) = target.shared.injector.pop() {
-                        target
-                            .shared
-                            .injected_load
-                            .0
-                            .fetch_sub(1, Ordering::Relaxed);
+                        target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
                         self.enqueue_job(job);
                         return true;
                     }
@@ -360,7 +357,7 @@ impl LocalExecutor {
                 // 2. Poll Local Queue
                 let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
-                    self.shared.local_load.0.fetch_sub(1, Ordering::Relaxed);
+                    self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                     task.run();
                     executed += 1;
                     continue;
@@ -448,7 +445,7 @@ impl LocalExecutor {
                 // 2. Poll Local Queue
                 let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
-                    self.shared.local_load.0.fetch_sub(1, Ordering::Relaxed);
+                    self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                     // task is Arc<Task>, run() takes self: Arc<Task>
                     task.run();
                     executed += 1;

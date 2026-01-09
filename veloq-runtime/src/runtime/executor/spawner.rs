@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_queue::SegQueue;
+use crossbeam_utils::CachePadded;
 
 use crate::io::driver::{Driver, RemoteWaker};
 use crate::runtime::mesh::{self, Consumer, Producer};
@@ -30,9 +31,6 @@ where
 }
 
 // --- Shared State ---
-
-#[repr(align(128))]
-pub(crate) struct CachePadded<T>(pub(crate) T);
 
 use crate::runtime::task::Task;
 
@@ -141,19 +139,19 @@ pub struct ExecutorHandle {
 impl ExecutorHandle {
     pub(crate) fn schedule(&self, job: Job) {
         self.shared.injector.push(job);
-        self.shared.injected_load.0.fetch_add(1, Ordering::Relaxed);
-        self.shared.waker.wake().expect("Failed to wake worker");
+        self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
+        self.shared.waker.wake().expect("Failed to wake executor");
     }
 
     pub(crate) fn schedule_pinned(&self, job: Job) {
         self.shared.pinned.push(job);
-        self.shared.injected_load.0.fetch_add(1, Ordering::Relaxed);
-        self.shared.waker.wake().expect("Failed to wake worker");
+        self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
+        self.shared.waker.wake().expect("Failed to wake executor");
     }
 
     pub fn total_load(&self) -> usize {
-        self.shared.injected_load.0.load(Ordering::Relaxed)
-            + self.shared.local_load.0.load(Ordering::Relaxed)
+        self.shared.injected_load.load(Ordering::Relaxed)
+            + self.shared.local_load.load(Ordering::Relaxed)
     }
 
     pub fn id(&self) -> usize {

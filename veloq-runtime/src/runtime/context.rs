@@ -139,7 +139,6 @@ impl RuntimeContext {
         self.handle
             .shared
             .injected_load
-            .0
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // We are running on this thread, so no need to wake.
