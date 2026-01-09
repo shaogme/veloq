@@ -15,7 +15,7 @@ use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
 use crate::runtime::mesh::{self, Consumer, Producer};
-use crate::runtime::task::Task;
+use crate::runtime::task::{SpawnedTask, Task};
 
 // Re-export common types from spawner which acts as the definition source for these
 pub use self::spawner::{ExecutorHandle, ExecutorRegistry, Job, MeshContext, Spawner};
@@ -169,15 +169,20 @@ impl LocalExecutor {
         T: 'static,
     {
         let (handle, producer) = LocalJoinHandle::new();
-        let task = Task::new(
-            async move {
+        // SAFETY: This is spawn_local, so we can use new_local (!Send future).
+        let task = unsafe {
+            SpawnedTask::new_local(async move {
                 let output = future.await;
                 producer.set(output);
-            },
-            self.handle().id,
-            Rc::downgrade(&self.queue),
-            self.shared.clone(),
-        );
+            })
+        };
+        let task = unsafe {
+            task.bind(
+                self.handle().id,
+                Rc::downgrade(&self.queue),
+                self.shared.clone(),
+            )
+        };
         self.queue.borrow_mut().push_back(task);
         self.shared.local_load.fetch_add(1, Ordering::Relaxed);
         handle
@@ -201,15 +206,15 @@ impl LocalExecutor {
         self.mesh = Some(Rc::new(RefCell::new(mesh)));
     }
 
-    fn enqueue_job(&self, job_factory: Job) {
+    fn enqueue_job(&self, task: Job) {
         self.shared.local_load.fetch_add(1, Ordering::Relaxed);
-        let future = job_factory();
-        let task = Task::from_boxed(
-            future,
-            self.handle().id,
-            Rc::downgrade(&self.queue),
-            self.shared.clone(),
-        );
+        let task = unsafe {
+            task.bind(
+                self.handle().id,
+                Rc::downgrade(&self.queue),
+                self.shared.clone(),
+            )
+        };
         self.queue.borrow_mut().push_back(task);
     }
 

@@ -14,7 +14,7 @@ use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
 use crate::runtime::executor::spawner::pack_job;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
-use crate::runtime::task::Task;
+use crate::runtime::task::{SpawnedTask, Task};
 
 use std::cell::OnceCell;
 
@@ -169,15 +169,20 @@ impl RuntimeContext {
         let queue = self.queue.upgrade().expect("executor has been dropped");
 
         let (handle, producer) = LocalJoinHandle::new();
-        let task = Task::new(
-            async move {
+        // SAFETY: This is spawn_local, so we can use new_local (!Send future).
+        let task = unsafe {
+            SpawnedTask::new_local(async move {
                 let output = future.await;
                 producer.set(output);
-            },
-            self.handle.id,
-            self.queue.clone(),
-            self.handle.shared.clone(),
-        );
+            })
+        };
+        let task = unsafe {
+            task.bind(
+                self.handle.id,
+                self.queue.clone(),
+                self.handle.shared.clone(),
+            )
+        };
         queue.borrow_mut().push_back(task);
         handle
     }
@@ -206,25 +211,20 @@ impl RuntimeContext {
 
         // Optimization: If spawning to self, just push to local queue
         if self.handle.id() == worker_id {
-            // But Job is now a factory. We need to instantiate it.
-            // Queue expects Rc<Task> with instantiated future.
-
-            // Wait, we are in context.rs, we can't access enqueue_job directly on Executor.
-            // But we have self.queue (Weak).
             let queue = self
                 .queue
                 .upgrade()
                 .expect("executor has been dropped but context remains?");
 
-            // Instantiate Future!
-            let future = job();
-            let task = Task::from_boxed(
-                future,
-                self.handle.id,
-                self.queue.clone(),
-                self.handle.shared.clone(),
-            );
-            queue.borrow_mut().push_back(task);
+            // Bind it
+            let job = unsafe {
+                job.bind(
+                    self.handle.id,
+                    self.queue.clone(),
+                    self.handle.shared.clone(),
+                )
+            };
+            queue.borrow_mut().push_back(job);
             return handle;
         }
 

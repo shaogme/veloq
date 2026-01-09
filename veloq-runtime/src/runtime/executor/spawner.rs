@@ -1,6 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9,10 +7,11 @@ use crossbeam_utils::CachePadded;
 
 use crate::io::driver::{Driver, RemoteWaker};
 use crate::runtime::mesh::{self, Consumer, Producer};
+use crate::runtime::task::{SpawnedTask, Task};
 
 // --- Job Definition ---
 
-pub type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
+pub type Job = SpawnedTask;
 
 pub(crate) fn pack_job<F, Output>(async_fn: F) -> (crate::runtime::join::JoinHandle<Output>, Job)
 where
@@ -20,20 +19,21 @@ where
     Output: Send + 'static,
 {
     let (handle, producer) = crate::runtime::join::JoinHandle::new();
-    let job = Box::new(move || {
-        let future = async_fn();
-        Box::pin(async move {
-            let output = future.await;
-            producer.set(output);
-        }) as Pin<Box<dyn Future<Output = ()>>>
-    });
-    (handle, job)
+    let task = unsafe {
+        // SAFETY: The task is not Send, but it is only scheduled on the local executor.
+        SpawnedTask::new_unchecked(async move {
+            let output = async_fn();
+            let future = async move {
+                let output = output.await;
+                producer.set(output);
+            };
+            future.await
+        })
+    };
+    (handle, task)
 }
 
 // --- Shared State ---
-
-use crate::runtime::task::Task;
-
 pub(crate) struct ExecutorShared {
     pub(crate) injector: SegQueue<Job>,
     pub(crate) pinned: SegQueue<Job>,
