@@ -57,12 +57,14 @@ const SLABS: [SlabConfig; 5] = [
 ];
 
 const GLOBAL_ALLOC_CONTEXT: usize = usize::MAX;
+const NEXT_NONE: usize = usize::MAX;
 
 struct Slab {
     config: SlabConfig,
-    memory: AlignedMemory,
-    free_indices: Vec<usize>,
+    base_offset: usize,
+    free_head: usize,
     allocated: BitSet,
+    free_count: usize,
 }
 
 /// Raw allocation result from HybridAllocator
@@ -76,6 +78,8 @@ pub struct RawAlloc {
 /// Core allocator logic, managing slabs and global fallback
 /// Independent of BufPool trait for easier testing
 pub struct HybridAllocator {
+    memory: AlignedMemory,
+    total_size: usize,
     slabs: Vec<Slab>,
 }
 
@@ -87,27 +91,53 @@ impl Default for HybridAllocator {
 
 impl HybridAllocator {
     pub fn new() -> Result<Self, AllocError> {
+        let mut total_arena_size = 0;
+        for config in SLABS.iter() {
+            total_arena_size += config.block_size * config.count;
+        }
+
+        let memory = AlignedMemory::new(total_arena_size, PAGE_SIZE)?;
+        let arena_base_ptr = memory.as_ptr();
+
         let mut slabs = Vec::with_capacity(SLABS.len());
+        let mut current_offset = 0;
 
         for config in SLABS.iter() {
-            let total_size = config.block_size * config.count;
-            let memory = AlignedMemory::new(total_size, PAGE_SIZE)?;
+            // Intrusive list initialization
+            let slab_base_ptr = unsafe { arena_base_ptr.add(current_offset) };
 
-            // Free indices stack: initially all indices 0..count
-            let free_indices: Vec<usize> = (0..config.count).collect();
+            for i in 0..config.count {
+                let offset = i * config.block_size;
+                let next_idx = if i < config.count - 1 {
+                    i + 1
+                } else {
+                    NEXT_NONE
+                };
+                unsafe {
+                    let ptr = slab_base_ptr.add(offset) as *mut usize;
+                    *ptr = next_idx;
+                }
+            }
 
             slabs.push(Slab {
                 config: SlabConfig {
                     block_size: config.block_size,
                     count: config.count,
                 },
-                memory,
-                free_indices,
+                base_offset: current_offset,
+                free_head: 0,
                 allocated: BitSet::new(config.count),
+                free_count: config.count,
             });
+
+            current_offset += config.block_size * config.count;
         }
 
-        Ok(Self { slabs })
+        Ok(Self {
+            memory,
+            total_size: total_arena_size,
+            slabs,
+        })
     }
 
     /// Allocate memory. `size` is the total size requirement including header.
@@ -131,9 +161,15 @@ impl HybridAllocator {
             let slab = &mut self.slabs[idx];
 
             if slab.config.block_size >= needed_total {
-                if let Some(index) = slab.free_indices.pop() {
-                    let block_ptr =
-                        unsafe { slab.memory.as_ptr().add(index * slab.config.block_size) };
+                if slab.free_head != NEXT_NONE {
+                    let index = slab.free_head;
+                    let block_offset = slab.base_offset + index * slab.config.block_size;
+                    let block_ptr = unsafe { self.memory.as_ptr().add(block_offset) };
+
+                    // Read next free index embedded in the block
+                    let next_free = unsafe { *(block_ptr as *const usize) };
+                    slab.free_head = next_free;
+                    slab.free_count -= 1;
 
                     // Encode slab_idx (0-3) and index (0-512) into usize context
                     let context = (idx << 16) | index;
@@ -145,7 +181,7 @@ impl HybridAllocator {
                     return Some(RawAlloc {
                         ptr: unsafe { NonNull::new_unchecked(block_ptr) },
                         cap: slab.config.block_size,
-                        global_index: idx as u16,
+                        global_index: 0, // All slabs are in the single region 0
                         context,
                     });
                 }
@@ -226,7 +262,15 @@ impl HybridAllocator {
                 return Err(format!("BitSet clear error: {}", e));
             }
 
-            slab.free_indices.push(index);
+            // Return to free list (push to head)
+            let offset = slab.base_offset + index * slab.config.block_size;
+            let block_ptr = unsafe { self.memory.as_ptr().add(offset) };
+            unsafe {
+                *(block_ptr as *mut usize) = slab.free_head;
+            }
+            slab.free_head = index;
+            slab.free_count += 1;
+
             Ok(())
         } else {
             Err(format!("Invalid slab index: {}", slab_idx))
@@ -235,7 +279,7 @@ impl HybridAllocator {
 
     #[cfg(test)]
     pub fn count_free(&self, slab_idx: usize) -> usize {
-        self.slabs[slab_idx].free_indices.len()
+        self.slabs[slab_idx].free_count
     }
 }
 
@@ -286,11 +330,14 @@ unsafe fn hybrid_resolve_region_info_shim(
     }
 
     let inner = rc.borrow();
-    let slab = &inner.slabs[idx as usize];
-    let base = slab.memory.as_ptr() as usize;
-    let ptr = buf.as_ptr() as usize;
+    // For slab allocations, they are all in region 0 (memory)
+    // The provided buf.buf_index() should be 0 if it came from alloc.
+    // However, if we support multiple pools or something dynamic later, we might need checking.
+    // For now, assume single region 0.
 
-    (idx as usize, ptr - base)
+    let base = inner.memory.as_ptr() as usize;
+    let ptr = buf.as_ptr() as usize;
+    (0, ptr - base)
 }
 
 impl HybridPool {
@@ -351,16 +398,10 @@ impl BufPool for HybridPool {
 
     fn get_memory_regions(&self) -> Vec<crate::io::buffer::BufferRegion> {
         let inner = self.inner.borrow();
-        let mut regions = Vec::with_capacity(inner.slabs.len());
-
-        for slab in &inner.slabs {
-            // Register the entire slab memory as a single buffer
-            regions.push(crate::io::buffer::BufferRegion {
-                ptr: unsafe { NonNull::new_unchecked(slab.memory.as_ptr() as *mut _) },
-                len: slab.config.block_size * slab.config.count,
-            });
-        }
-        regions
+        vec![crate::io::buffer::BufferRegion {
+            ptr: unsafe { NonNull::new_unchecked(inner.memory.as_ptr() as *mut _) },
+            len: inner.total_size,
+        }]
     }
 
     fn vtable(&self) -> &'static PoolVTable {
@@ -392,7 +433,8 @@ mod tests {
         // Alloc 4K (fits in 4K slab)
         let raw = allocator.alloc(4096).unwrap();
         assert_eq!(raw.cap, SIZE_4K);
-        assert_eq!(raw.context >> 16, 0); // Slab index 0
+        // All slab allocations should be in region 0
+        assert_eq!(raw.global_index, 0);
         assert_eq!(allocator.count_free(0), 1023);
         assert_eq!(allocator.count_free(1), 512);
 
@@ -407,7 +449,7 @@ mod tests {
         let raw = allocator.alloc(100).unwrap();
         // best_fit(100) -> Size4K
         assert_eq!(raw.cap, SIZE_4K);
-        assert_eq!(raw.context >> 16, 0); // Slab 0
+        assert_eq!(raw.global_index, 0);
         assert_eq!(allocator.count_free(0), 1023);
         unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context).unwrap() };
     }
@@ -431,7 +473,8 @@ mod tests {
         // Size4K request implies 4096 block.
         assert!(buf.capacity() >= 4096);
         let idx = buf.buf_index();
-        // Should be valid index
+        // Should be valid index (0)
+        assert_eq!(idx, 0);
         assert_ne!(idx, NO_REGISTRATION_INDEX);
 
         drop(buf);
