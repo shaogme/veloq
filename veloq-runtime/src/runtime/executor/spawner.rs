@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
@@ -42,6 +42,7 @@ pub(crate) struct ExecutorShared {
     pub(crate) injected_load: CachePadded<AtomicUsize>,
     pub(crate) local_load: CachePadded<AtomicUsize>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
+    pub(crate) shutdown: AtomicBool,
 }
 
 pub(crate) struct LateBoundWaker {

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
 
+use crate::io::driver::RemoteWaker;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::mesh::{Consumer, Producer};
@@ -171,6 +172,7 @@ impl RuntimeBuilder {
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
                 state: states[i].clone(),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
             });
             shared_states.push(shared.clone());
             remote_receivers.push(Some(rx));
@@ -274,6 +276,25 @@ pub struct Runtime {
     #[allow(dead_code)]
     worker_count: usize,
     worker_0_prep: Option<WorkerPrep>,
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // 1. Notify all workers to stop
+        for handle in self.registry.all() {
+            handle
+                .shared
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Wake them up so they see the shutdown signal
+            let _ = handle.shared.waker.wake();
+        }
+
+        // 2. Wait for worker threads to finish
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Runtime {

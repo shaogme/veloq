@@ -99,6 +99,7 @@ impl LocalExecutorBuilder {
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
                 local_load: CachePadded::new(AtomicUsize::new(0)),
                 state,
+                shutdown: AtomicBool::new(false),
             });
             (shared, remote_rx, pinned_rx)
         };
@@ -396,6 +397,10 @@ impl LocalExecutor {
         const BUDGET: usize = 64;
 
         loop {
+            if self.shared.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
             let mut executed = 0;
 
             while executed < BUDGET {
