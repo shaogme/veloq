@@ -10,9 +10,6 @@ use std::sync::Arc;
 
 pub mod op;
 pub mod submit;
-use crate::io::buffer::{BufferRegion, BufferRegistrar};
-use std::cell::RefCell;
-use std::rc::Weak;
 
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;

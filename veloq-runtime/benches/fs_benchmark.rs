@@ -25,20 +25,18 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
+    let mut exec = LocalExecutor::default();
+    let registrar = exec.registrar();
+    let backing_pool = BuddyPool::new().unwrap();
+    let pool = RegisteredPool::new(backing_pool, registrar).unwrap();
+
+    veloq_runtime::runtime::context::bind_pool(pool.clone());
+
     group.bench_function("write_1gb_concurrent", |b| {
-        let mut exec = LocalExecutor::default();
-        let registrar = exec.registrar();
-        let backing_pool = BuddyPool::new().unwrap();
-        let pool = RegisteredPool::new(backing_pool, registrar).unwrap();
-
-        veloq_runtime::runtime::context::bind_pool(pool.clone());
-
         b.iter(|| {
             let pool = pool.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(async move {
-                // let cx = veloq_runtime::runtime::context::current();
-
                 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
                 let chunk_size = CHUNK_SIZE;
                 let file_path = Path::new("bench_1gb_test.tmp");
