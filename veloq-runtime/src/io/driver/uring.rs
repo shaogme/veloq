@@ -447,7 +447,8 @@ impl UringDriver {
                 Ok((0..regions.len()).collect())
             }
             Err(e) => {
-                if e.raw_os_error() == Some(libc::EBUSY) {
+                let err_code = e.raw_os_error();
+                if err_code == Some(libc::EBUSY) || err_code == Some(libc::EEXIST) {
                     self.buffers_registered = true;
                     Ok((0..regions.len()).collect())
                 } else {
