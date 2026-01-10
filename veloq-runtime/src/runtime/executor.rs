@@ -10,7 +10,7 @@ use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
 use crate::io::buffer::{BufferRegion, BufferRegistrar};
-use crate::io::driver::{Driver, PlatformDriver, PlatformPreInit, RemoteWaker};
+use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
 use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
@@ -29,7 +29,6 @@ pub struct LocalExecutorBuilder {
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
     pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
-    pre_init: Option<PlatformPreInit>,
 }
 
 impl LocalExecutorBuilder {
@@ -39,7 +38,6 @@ impl LocalExecutorBuilder {
             shared: None,
             remote_receiver: None,
             pinned_receiver: None,
-            pre_init: None,
         }
     }
 
@@ -58,11 +56,6 @@ impl LocalExecutorBuilder {
         self
     }
 
-    pub(crate) fn with_pre_init(mut self, pre_init: PlatformPreInit) -> Self {
-        self.pre_init = Some(pre_init);
-        self
-    }
-
     pub fn config(mut self, config: crate::config::Config) -> Self {
         self.config = config;
         self
@@ -71,16 +64,11 @@ impl LocalExecutorBuilder {
     /// Build the LocalExecutor.
     ///
     /// Requires a `pool_constructor` closure that creates an `AnyBufPool` using the provided `BufferRegistrar`.
-    pub fn build<F>(mut self, pool_constructor: F) -> LocalExecutor
+    pub fn build<F>(self, pool_constructor: F) -> LocalExecutor
     where
         F: FnOnce(Box<dyn BufferRegistrar>) -> crate::io::buffer::AnyBufPool,
     {
-        let driver_val = if let Some(pre) = self.pre_init.take() {
-            PlatformDriver::new_from_pre_init(&self.config, pre)
-                .expect("Failed to create driver from pre-init")
-        } else {
-            PlatformDriver::new(&self.config).expect("Failed to create driver")
-        };
+        let driver_val = PlatformDriver::new(&self.config).expect("Failed to create driver");
         // Wrap driver early to create registrar
         let driver = Rc::new(RefCell::new(driver_val));
 
@@ -160,6 +148,12 @@ pub struct LocalExecutor {
 }
 
 impl LocalExecutor {
+    /// Get the raw handle (fd) of the underlying driver.
+    /// Used for Mesh initialization.
+    pub fn raw_driver_handle(&self) -> usize {
+        self.driver.borrow().inner_handle() as usize
+    }
+
     pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
         Rc::downgrade(&self.driver)
     }

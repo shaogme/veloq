@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
-use crate::io::driver::{PlatformDriver, PlatformPreInit};
+
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::mesh::{Consumer, Producer};
@@ -90,7 +90,7 @@ struct WorkerPrep {
     egress: Vec<Producer<crate::runtime::executor::Job>>,
     pool_constructor: PoolConstructor,
     config: crate::config::Config,
-    pre_init: PlatformPreInit,
+    barrier: Arc<std::sync::Barrier>,
 }
 
 pub struct RuntimeBuilder {
@@ -147,17 +147,10 @@ impl RuntimeBuilder {
 
         let mut mesh_matrix = MeshMatrix::new(worker_count, &states);
 
-        // Pre-allocate IO Drivers to determine handles early
-        let mut pre_inits: Vec<Option<PlatformPreInit>> = Vec::with_capacity(worker_count);
+        // Pre-allocate peer handles storage (initially 0/invalid)
         let mut peer_handles_storage = Vec::with_capacity(worker_count);
-
         for _ in 0..worker_count {
-            let pre = PlatformDriver::create_pre_init(&self.config)
-                .expect("Failed to create pre-init driver");
-            let handle = PlatformDriver::pre_init_handle(&pre);
-            pre_inits.push(Some(pre));
-            // Initialize peer_handles immediately with valid handles!
-            peer_handles_storage.push(AtomicUsize::new(handle as usize));
+            peer_handles_storage.push(AtomicUsize::new(0));
         }
         let peer_handles = Arc::new(peer_handles_storage);
 
@@ -188,9 +181,10 @@ impl RuntimeBuilder {
 
         let registry = Arc::new(ExecutorRegistry::new(handles));
         let mut thread_handles = Vec::with_capacity(worker_count);
+
         // Barrier for N workers.
-        // Worker 0 calls wait() in block_on.
-        // Workers 1..N-1 call wait() in thread closure.
+        // All workers (including Worker 0) must reach this barrier after publishing their handle
+        // but before starting their loop.
         let barrier = Arc::new(std::sync::Barrier::new(worker_count));
 
         // Spawn Workers 1 to N-1 (Skip 0)
@@ -211,7 +205,6 @@ impl RuntimeBuilder {
                 .take()
                 .expect("Pinned receiver already taken");
 
-            let pre_init = pre_inits[worker_id].take().unwrap();
             let builder = std::thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
             let barrier = barrier.clone();
 
@@ -221,7 +214,6 @@ impl RuntimeBuilder {
                     .with_shared(shared) // Inject shared state
                     .with_remote_receiver(remote_receiver) // Inject remote receiver
                     .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
-                    .with_pre_init(pre_init)
                     .build(|registrar| {
                         let pool = pool_constructor(worker_id, registrar);
                         crate::io::buffer::AnyBufPool::new(pool)
@@ -229,10 +221,14 @@ impl RuntimeBuilder {
 
                 executor = executor.with_registry(registry.clone()); // Inject registry
 
+                // Publish Handle
+                let fd = executor.raw_driver_handle();
+                peer_handles_clone[worker_id].store(fd, std::sync::atomic::Ordering::Release);
+
                 // Attach Mesh
                 executor.attach_mesh(worker_id, ingress, egress, peer_handles_clone);
 
-                // Wait for all workers to be ready
+                // Wait for all workers to be ready (handles published)
                 barrier.wait();
 
                 // Run Loop
@@ -241,10 +237,6 @@ impl RuntimeBuilder {
 
             thread_handles.push(handle);
         }
-
-        // Wait for all workers to be ready.
-        // This ensures that when build() returns, all background workers are initialized and running.
-        barrier.wait();
 
         // Prepare Worker 0
         let (ingress, egress) = mesh_matrix.take_worker_channels(0);
@@ -260,7 +252,7 @@ impl RuntimeBuilder {
             egress,
             pool_constructor: pool_constructor.clone(),
             config: self.config.clone(),
-            pre_init: pre_inits[0].take().unwrap(),
+            barrier: barrier.clone(), // Pass barrier to Worker 0
         };
 
         Ok(Runtime {
@@ -328,7 +320,6 @@ impl Runtime {
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
-            .with_pre_init(prep.pre_init)
             .build(|registrar| {
                 // Bind Buffer Pool via constructor
                 (prep.pool_constructor)(0, registrar)
@@ -336,14 +327,15 @@ impl Runtime {
 
         executor = executor.with_registry(self.registry.clone());
 
+        // Publish Handle
+        let fd = executor.raw_driver_handle();
+        self.peer_handles[0].store(fd, std::sync::atomic::Ordering::Release);
+
         // Attach Mesh
         executor.attach_mesh(0, prep.ingress, prep.egress, self.peer_handles.clone());
 
-        // Buffer Pool is now bound during build() via closure
-
-        // Sync with other workers
-        // Barrier wait moved to build() to ensure workers 1..N-1 are ready before Runtime is returned.
-        // self.barrier.wait();
+        // Wait for all workers to be ready
+        prep.barrier.wait();
 
         // Run Future
         // block_on in LocalExecutor runs the loop until future completes.

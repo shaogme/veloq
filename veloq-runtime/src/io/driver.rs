@@ -86,8 +86,6 @@ pub trait RemoteWaker: Send + Sync {
 pub(crate) mod uring;
 
 #[cfg(target_os = "linux")]
-pub use uring::PreInit as PlatformPreInit;
-#[cfg(target_os = "linux")]
 pub use uring::UringDriver as PlatformDriver;
 
 #[cfg(target_os = "windows")]
@@ -95,5 +93,3 @@ pub(crate) mod iocp;
 
 #[cfg(target_os = "windows")]
 pub use iocp::IocpDriver as PlatformDriver;
-#[cfg(target_os = "windows")]
-pub use iocp::PreInit as PlatformPreInit;
