@@ -40,13 +40,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          for i in {1..20}; do cargo nextest run --test-threads 1 --run-ignored all || exit 1; done
+          cargo bench -p veloq-runtime --bench fs_benchmark --verbose
 
       - name: Run FS Benchmark (Windows)
         if: runner.os == 'Windows'
-        run: |
-          for ($i=1; $i -le 20; $i++) {
-            cargo nextest run --test-threads 1 --run-ignored all
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-
+        run: cargo bench -p veloq-runtime --bench fs_benchmark --verbose
