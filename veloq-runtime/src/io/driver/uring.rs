@@ -293,6 +293,8 @@ impl UringDriver {
                 self.ops.remove(token);
             }
             self.submit_waker();
+            // Ensure waker is in the ring immediately to avoid lost wakeups
+            self.flush_backlog();
         }
     }
 

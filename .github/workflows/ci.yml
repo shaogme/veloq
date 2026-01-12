@@ -37,6 +37,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install nextest
+        uses: taiki-e/install-action@ne xtest
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -50,13 +53,17 @@ jobs:
 
       - name: Build
         run: cargo build --verbose
-      
+
       - name: Run tests (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          cargo test --verbose -- --include-ignored
+          for i in {1..20}; do cargo nextest run --test-threads 1 --timeout 120s --run-ignored all || exit 1; done
 
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --verbose -- --include-ignored
+        run: |
+          for ($i=1; $i -le 20; $i++) {
+            cargo nextest run --test-threads 1 --timeout 120s --run-ignored all
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

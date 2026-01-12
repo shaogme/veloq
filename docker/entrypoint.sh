@@ -48,9 +48,15 @@ env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environmen
 mkdir -p /run/sshd
 
 # 7. Execute Command
-# If arguments are provided (e.g., docker run ... bash), execute them.
+# If arguments are provided, execute them.
+# Smart execution: if the first argument is a valid command, exec it directly.
+# Otherwise, treat the arguments as a shell command (supporting loops, pipes, etc.).
 if [ $# -gt 0 ]; then
-    exec "$@"
+    if command -v "$1" >/dev/null 2>&1; then
+        exec "$@"
+    else
+        exec bash -c "$*"
+    fi
 fi
 
 # Default: Start SSH Server

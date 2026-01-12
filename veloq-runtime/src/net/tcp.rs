@@ -119,7 +119,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let op = ReadFixed {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
+            offset: u64::MAX,
         };
         let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
@@ -129,7 +129,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let op = WriteFixed {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
+            offset: u64::MAX,
         };
         let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
