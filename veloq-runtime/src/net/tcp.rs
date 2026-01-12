@@ -1,7 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::op::{
-    Accept, Connect, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, ReadFixed,
-    RemoteSubmitter, WriteFixed,
+    Accept, Connect, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, RemoteSubmitter,
 };
 use crate::io::socket::Socket;
 use crate::net::common::InnerSocket;
@@ -116,20 +115,18 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = ReadFixed {
+        let op = crate::io::op::Recv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: u64::MAX,
         };
         let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = WriteFixed {
+        let op = crate::io::op::Send {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: u64::MAX,
         };
         let (res, op_back) = self.submitter.submit(Op::new(op)).await;
         (res, op_back.buf)

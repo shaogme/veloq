@@ -526,89 +526,94 @@ fn test_multithread_tcp_connections() {
 #[test]
 fn test_multithread_tcp_echo() {
     for size in [8192, 16384, 65536] {
-        let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
-        // 2 Workers
-        let runtime = Runtime::builder()
-            .config(crate::config::Config {
-                worker_threads: Some(2),
-                ..Default::default()
-            })
-            .pool_constructor(|_, registrar| {
-                let pool = HybridPool::new().unwrap();
-                let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                AnyBufPool::new(reg_pool)
-            })
-            .build()
-            .unwrap();
+        std::thread::spawn(move || {
+            let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
+            // 2 Workers
+            let runtime = Runtime::builder()
+                .config(crate::config::Config {
+                    worker_threads: Some(2),
+                    ..Default::default()
+                })
+                .pool_constructor(|_, registrar| {
+                    let pool = HybridPool::new().unwrap();
+                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
+                    AnyBufPool::new(reg_pool)
+                })
+                .build()
+                .unwrap();
 
-        let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
+            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
-        runtime.block_on(async move {
-            let addr_tx = addr_tx.clone(); // Move into task
+            runtime.block_on(async move {
+                let addr_tx = addr_tx.clone(); // Move into task
 
-            // Worker 0: Echo server
-            crate::runtime::context::spawn_to(0, async move || {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
-                println!("Echo server listening on {}", listen_addr);
+                // Worker 0: Echo server
+                crate::runtime::context::spawn_to(0, async move || {
+                    let listener =
+                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                    let listen_addr = listener.local_addr().expect("Failed to get local address");
+                    println!("Echo server listening on {}", listen_addr);
 
-                // Send address to client (via channel)
-                addr_tx.send(listen_addr).unwrap();
+                    // Send address to client (via channel)
+                    addr_tx.send(listen_addr).unwrap();
 
-                // Accept and echo
-                let (stream, _) = Arc::new(listener).accept().await.expect("Accept failed");
-                let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
+                    // Accept and echo
+                    let (stream, _) = Arc::new(listener).accept().await.expect("Accept failed");
+                    let pool = crate::runtime::context::current_pool().unwrap(); // Get thread pool
 
-                let buf = pool.alloc(size).unwrap();
+                    let buf = pool.alloc(size).unwrap();
 
-                let (result, buf) = stream.recv(buf).await;
-                let bytes = result.expect("Recv failed") as usize;
+                    let (result, buf) = stream.recv(buf).await;
+                    let bytes = result.expect("Recv failed") as usize;
 
-                // Echo back
-                let mut echo_buf = pool.alloc(size).unwrap();
-                echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
+                    // Echo back
+                    let mut echo_buf = pool.alloc(size).unwrap();
+                    echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
 
-                let (result, _) = stream.send(echo_buf).await;
-                result.expect("Send failed");
-                println!("Echo server sent response");
+                    let (result, _) = stream.send(echo_buf).await;
+                    result.expect("Send failed");
+                    println!("Echo server sent response");
+                });
+
+                // Worker 1: Client
+                let done_tx = done_tx.clone();
+                crate::runtime::context::spawn_to(1, async move || {
+                    // Wait for server address
+                    let listen_addr = addr_rx.recv().await.expect("Channel closed");
+
+                    let stream = TcpStream::connect(listen_addr)
+                        .await
+                        .expect("Failed to connect");
+
+                    let pool = crate::runtime::context::current_pool().unwrap();
+
+                    // Send data
+                    let mut send_buf = pool.alloc(size).unwrap();
+                    let data = b"Hello from worker 1!";
+                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+
+                    let (result, _) = stream.send(send_buf).await;
+                    let _sent = result.expect("Send failed");
+
+                    // Receive echo
+                    let recv_buf = pool.alloc(size).unwrap();
+                    let (result, recv_buf) = stream.recv(recv_buf).await;
+                    let _received = result.expect("Recv failed") as usize;
+
+                    assert_eq!(&recv_buf.as_slice()[..data.len()], data);
+                    println!("Client received correct echo");
+
+                    done_tx.send(()).unwrap();
+                });
+
+                // Wait for client to finish
+                done_rx.recv().await.unwrap();
             });
 
-            // Worker 1: Client
-            let done_tx = done_tx.clone();
-            crate::runtime::context::spawn_to(1, async move || {
-                // Wait for server address
-                let listen_addr = addr_rx.recv().await.expect("Channel closed");
-
-                let stream = TcpStream::connect(listen_addr)
-                    .await
-                    .expect("Failed to connect");
-
-                let pool = crate::runtime::context::current_pool().unwrap();
-
-                // Send data
-                let mut send_buf = pool.alloc(size).unwrap();
-                let data = b"Hello from worker 1!";
-                send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
-
-                let (result, _) = stream.send(send_buf).await;
-                let _sent = result.expect("Send failed");
-
-                // Receive echo
-                let recv_buf = pool.alloc(size).unwrap();
-                let (result, recv_buf) = stream.recv(recv_buf).await;
-                let _received = result.expect("Recv failed") as usize;
-
-                assert_eq!(&recv_buf.as_slice()[..data.len()], data);
-                println!("Client received correct echo");
-
-                done_tx.send(()).unwrap();
-            });
-
-            // Wait for client to finish
-            done_rx.recv().await.unwrap();
-        });
-
-        println!("Multi-thread echo test completed");
+            println!("Multi-thread echo test completed");
+        })
+        .join()
+        .unwrap();
     }
 }
 

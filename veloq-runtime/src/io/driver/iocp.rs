@@ -422,6 +422,28 @@ impl Driver for IocpDriver {
                 }
             }
         }
+
+        // Check if we need to complete a Remote op synchronously (e.g. if submit failed)
+        let should_complete_remote = if let Some(op) = self.ops.get_mut(user_data) {
+            op.result.is_some() && matches!(op.platform_data, PlatformData::Remote(_))
+        } else {
+            false
+        };
+
+        if should_complete_remote {
+            let mut entry = self.ops.remove(user_data);
+            // Extract result
+            let result = entry.result.take().unwrap_or(Ok(0));
+
+            // Extract completer
+            if let PlatformData::Remote(completer) = entry.platform_data {
+                // Extract resources
+                if let Some(iocp_op) = entry.resources {
+                    completer.complete(result, iocp_op);
+                }
+            }
+        }
+
         Ok(Poll::Ready(()))
     }
 
