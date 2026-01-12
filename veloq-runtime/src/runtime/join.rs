@@ -214,15 +214,34 @@ impl<T> JoinProducer<T> {
 
 impl<T> Drop for JoinProducer<T> {
     fn drop(&mut self) {
-        // If we drop, it means we didn't call set(). The task likely panicked.
         let state = &self.state;
 
-        let old_state = state.state.swap(ABORTED, Ordering::AcqRel);
+        // Only switch to ABORTED if we are NOT already READY.
+        // We need a CAS loop to ensure we don't overwrite READY.
+        let mut current = state.state.load(Ordering::Acquire);
+        loop {
+            if current == READY || current == ABORTED {
+                return;
+            }
 
-        if old_state == WAITING {
-            let waker = unsafe { (*state.waker.get()).take() };
-            if let Some(w) = waker {
-                w.wake();
+            // Try to transition to ABORTED
+            match state.state.compare_exchange(
+                current,
+                ABORTED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // Success detected.
+                    if current == WAITING {
+                        let waker = unsafe { (*state.waker.get()).take() };
+                        if let Some(w) = waker {
+                            w.wake();
+                        }
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
             }
         }
     }

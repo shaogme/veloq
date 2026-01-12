@@ -124,7 +124,8 @@ impl<T> Op<T> {
         });
 
         if let Err(e) = injector.inject(closure) {
-            panic!("Remote injection failed: {}", e);
+            let error_code = e.raw_os_error().unwrap_or(0);
+            panic!("Remote injection failed: {} (code: {})", e, error_code);
         }
 
         RemoteOpFuture { rx }
