@@ -9,6 +9,7 @@
 
 use std::{
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -196,6 +197,7 @@ pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     user_data: usize,
+    _marker: PhantomData<std::rc::Rc<T>>,
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
@@ -205,6 +207,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
             state: State::Defined,
             data: Some(data),
             user_data: 0,
+            _marker: Default::default(),
         }
     }
 
