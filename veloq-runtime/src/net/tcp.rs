@@ -73,7 +73,8 @@ impl TcpListener {
         let op = Accept::into_op(self.fd, ());
 
         // Submit and Await
-        let future = Op::new(op, self.driver.clone());
+        // Submit and Await
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back): (io::Result<usize>, Accept) = future.await;
 
         // Post-process to get output
@@ -116,7 +117,7 @@ impl TcpStream {
         };
 
         let driver = crate::runtime::context::current().driver();
-        let future = Op::new(op, driver.clone());
+        let future = Op::new(op).submit_local(driver.clone());
         let (res, _op_back) = future.await;
         res?;
 
@@ -129,7 +130,7 @@ impl TcpStream {
             buf,
             offset: 0,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }
@@ -140,7 +141,7 @@ impl TcpStream {
             buf,
             offset: 0,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }

@@ -99,7 +99,7 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
         };
         let driver = self.file.driver.clone();
         Box::pin(async move {
-            let (res, _) = Op::new(op, driver).await;
+            let (res, _) = Op::new(op).submit_local(driver).await;
             res.map(|_| ())
         })
     }
@@ -138,7 +138,7 @@ impl File {
             offset,
         };
         let driver = self.driver.clone();
-        let (res, op) = Op::new(op, driver).await;
+        let (res, op) = Op::new(op).submit_local(driver).await;
         (res, op.buf)
     }
 
@@ -149,7 +149,7 @@ impl File {
             offset,
         };
         let driver = self.driver.clone();
-        let (res, op) = Op::new(op, driver).await;
+        let (res, op) = Op::new(op).submit_local(driver).await;
         (res, op.buf)
     }
 
@@ -159,7 +159,7 @@ impl File {
             datasync: false,
         };
         let driver = self.driver.clone();
-        let (res, _) = Op::new(op, driver).await;
+        let (res, _) = Op::new(op).submit_local(driver).await;
         res.map(|_| ())
     }
 
@@ -169,7 +169,7 @@ impl File {
             datasync: true,
         };
         let driver = self.driver.clone();
-        let (res, _) = Op::new(op, driver).await;
+        let (res, _) = Op::new(op).submit_local(driver).await;
         res.map(|_| ())
     }
 
@@ -191,7 +191,7 @@ impl File {
             len,
         };
         let driver = self.driver.clone();
-        let (res, _) = Op::new(op, driver).await;
+        let (res, _) = Op::new(op).submit_local(driver).await;
         res.map(|_| ())
     }
 }

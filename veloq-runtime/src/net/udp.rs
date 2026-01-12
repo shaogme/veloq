@@ -54,7 +54,7 @@ impl UdpSocket {
             buf,
             addr: target,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back): (io::Result<usize>, SendTo) = future.await;
         (res, op_back.buf)
     }
@@ -65,7 +65,7 @@ impl UdpSocket {
             buf,
             addr: None,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back): (io::Result<usize>, RecvFrom) = future.await;
 
         match res {
@@ -96,7 +96,7 @@ impl UdpSocket {
             addr_len: raw_addr_len as u32,
         };
         let driver = self.driver.clone();
-        let (res, _) = Op::new(op, driver).await;
+        let (res, _) = Op::new(op).submit_local(driver).await;
         res.map(|_| ())
     }
 
@@ -106,7 +106,7 @@ impl UdpSocket {
             buf,
             offset: 0,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }
@@ -117,7 +117,7 @@ impl UdpSocket {
             buf,
             offset: 0,
         };
-        let future = Op::new(op, self.driver.clone());
+        let future = Op::new(op).submit_local(self.driver.clone());
         let (res, op_back) = future.await;
         (res, op_back.buf)
     }

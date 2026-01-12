@@ -84,7 +84,36 @@ pub trait IntoPlatformOp<D: Driver>: Sized {
 }
 
 // ============================================================================
-// Op Future Wrapper
+// Op (Generic Data Carrier)
+// ============================================================================
+
+/// A generic wrapper for IO operation data.
+///
+/// This struct represents the "intent" of an operation, holding only the data
+/// required to perform the IO (e.g., buffers, file descriptors, flags).
+/// It is decoupled from the execution backend (Driver).
+pub struct Op<T> {
+    pub data: T,
+}
+
+impl<T> Op<T> {
+    /// Create a new operation intent with the given data.
+    pub fn new(data: T) -> Self {
+        Self { data }
+    }
+
+    /// Submit this operation to a local IO driver.
+    /// Returns a `LocalOp` future that resolves when the operation completes.
+    pub fn submit_local(self, driver: Weak<RefCell<PlatformDriver>>) -> LocalOp<T>
+    where
+        T: IntoPlatformOp<PlatformDriver> + 'static,
+    {
+        LocalOp::new(self.data, driver)
+    }
+}
+
+// ============================================================================
+// LocalOp (Future Implementation)
 // ============================================================================
 
 enum State {
@@ -93,21 +122,21 @@ enum State {
     Completed,
 }
 
-/// A Future wrapper for asynchronous IO operations.
+/// A Future wrapper for asynchronous IO operations executed locally.
 ///
-/// This struct manages the lifecycle of an IO operation:
+/// This struct manages the lifecycle of an IO operation submitted to the local driver:
 /// 1. Defined: Operation created but not submitted
 /// 2. Submitted: Operation submitted to the driver
 /// 3. Completed: Operation finished, result available
-pub struct Op<T: IntoPlatformOp<PlatformDriver> + 'static> {
+pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     user_data: usize,
     driver: Weak<RefCell<PlatformDriver>>,
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Op<T> {
-    /// Create a new operation with the given data and driver reference.
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
+    /// Create a new local operation future.
     pub fn new(data: T, driver: Weak<RefCell<PlatformDriver>>) -> Self {
         Self {
             state: State::Defined,
@@ -118,7 +147,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Op<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
     type Output = (std::io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -177,7 +206,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for Op<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for Op<T> {
+impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state
             && let Some(driver_rc) = self.driver.upgrade()
