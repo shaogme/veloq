@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tracing::trace;
 
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
@@ -54,6 +55,7 @@ pub(crate) struct ExecutorShared {
 
 impl harness::Schedule for ExecutorShared {
     fn schedule(&self, task: Runnable) {
+        trace!("Scheduling task via injector");
         self.injected_load.fetch_add(1, Ordering::Relaxed);
         self.future_injector.push(task);
         self.waker
@@ -160,6 +162,7 @@ impl ExecutorHandle {
         // the worker is dead and thus strictly speaking "not available".
         // However, in a robust system we might want to log this.
         let _ = self.shared.pinned.send(job);
+        trace!(worker_id = self.id, "Scheduled pinned task");
         self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
         self.shared.waker.wake().expect("Failed to wake executor");
     }
@@ -235,6 +238,7 @@ impl Spawner {
         // This is important because the Runnable needs a "home" Injector (scheduler)
         // to return to if it is remotely woken.
         let target = self.select_worker();
+        trace!(target_worker = target.id, "Spawning task");
 
         unsafe {
             let (job, handle) = harness::spawn_arc(future, target.shared.clone());
@@ -279,6 +283,7 @@ impl Spawner {
         Output: Send + 'static,
     {
         let (handle, job) = pack_job(async_fn);
+        trace!(worker_id, "Spawning pinned task to worker");
         self.spawn_job_to(job, worker_id);
         handle
     }

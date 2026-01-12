@@ -8,6 +8,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use tracing::trace;
 
 // --- Interfaces ---
 
@@ -122,6 +123,7 @@ unsafe fn create_task<F>(future: F, scheduler: Arc<dyn Schedule>) -> Runnable
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    trace!("Creating harnessed task");
     let vtable = &TaskVTable {
         poll: poll_future::<F>,
         drop_future: drop_future::<F>,
@@ -174,6 +176,7 @@ unsafe fn drop_future<F>(ptr: NonNull<Header>) {
 }
 
 unsafe fn schedule_task<F>(ptr: NonNull<Header>) {
+    trace!("Rescheduling harnessed task");
     let header = unsafe { ptr.as_ref() };
     // We must increment refcount before handing off to scheduler
     // because scheduler will take ownership (via Runnable)

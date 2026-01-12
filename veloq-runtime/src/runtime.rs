@@ -15,6 +15,7 @@ use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared,
 use crate::runtime::mesh::{Consumer, Producer};
 use crossbeam_deque::Worker;
 use crossbeam_queue::SegQueue;
+use tracing::{debug, trace};
 
 pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 use crossbeam_utils::CachePadded;
@@ -125,6 +126,7 @@ impl RuntimeBuilder {
 
     pub fn build(self) -> std::io::Result<Runtime> {
         let worker_count = self.config.worker_threads.unwrap_or_else(num_cpus::get);
+        debug!("Building Runtime with {} workers", worker_count);
         if worker_count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -148,6 +150,7 @@ impl RuntimeBuilder {
         for _ in 0..worker_count {
             states.push(Arc::new(AtomicU8::new(mesh::RUNNING)));
         }
+        trace!("Initialized {} worker states", worker_count);
 
         let mut mesh_matrix = MeshMatrix::new(worker_count, &states);
 
@@ -226,6 +229,7 @@ impl RuntimeBuilder {
             let barrier = barrier.clone();
 
             let handle = builder.spawn(move || {
+                debug!("Worker {} thread started", worker_id);
                 let mut executor = LocalExecutor::builder()
                     .config(config_clone)
                     .with_shared(shared) // Inject shared state
@@ -298,6 +302,7 @@ pub struct Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        debug!("Runtime shutting down");
         // 1. Notify all workers to stop
         for handle in self.registry.all() {
             handle
@@ -349,6 +354,7 @@ impl Runtime {
     where
         F: std::future::Future,
     {
+        debug!("Block_on entered (Worker 0)");
         let prep = self
             .worker_0_prep
             .take()

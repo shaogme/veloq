@@ -352,7 +352,12 @@ fn test_udp_ipv6() {
 
 /// Test UDP across multiple worker threads
 #[test]
-fn test_multithread_udp() {
+fn test_multithread_udp_no_echo() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::TRACE)
+        .try_init();
+
     for size in [8192, 16384] {
         std::thread::spawn(move || {
             let message_count = Arc::new(AtomicUsize::new(0));
@@ -387,7 +392,7 @@ fn test_multithread_udp() {
                             UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
                         let addr1 = socket1.local_addr().expect("Failed to get addr1");
-                        println!("Worker {} socket 1 bound to: {}", worker_id, addr1);
+                        tracing::info!("Worker {} socket 1 bound to: {}", worker_id, addr1);
 
                         let socket1_arc = Arc::new(socket1);
                         let socket2_arc = Arc::new(socket2);
@@ -397,9 +402,24 @@ fn test_multithread_udp() {
                         // Receiver task via crate::context::spawn
                         let h_recv = crate::runtime::context::spawn(async move {
                             let buf = alloc_buf(size);
-                            let (result, _buf) = socket1_clone.recv_from(buf).await;
-                            result.expect("recv_from failed");
-                            println!("Worker {} received message", worker_id);
+                            let (result, buf) = socket1_clone.recv_from(buf).await;
+                            match result {
+                                Ok((_bytes, _from)) => {
+                                    tracing::info!("Worker {} received message", worker_id);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Worker {} recv_from failed: {:?}",
+                                        worker_id,
+                                        e
+                                    );
+                                    panic!(
+                                        "Worker {} recv_from failed callback: {:?}",
+                                        worker_id, e
+                                    );
+                                }
+                            }
+                            drop(buf);
                         });
 
                         // Sender
@@ -409,21 +429,25 @@ fn test_multithread_udp() {
 
                         let (result, _) = socket2_arc.send_to(buf, addr1).await;
                         result.expect("send_to failed");
-                        println!("Worker {} sent message", worker_id);
+                        tracing::info!("Worker {} sent message", worker_id);
 
+                        tracing::info!("Worker {} waiting for h_recv", worker_id);
                         h_recv.await;
+                        tracing::info!("Worker {} h_recv joined", worker_id);
                         counter.fetch_add(1, Ordering::SeqCst);
                         tx_done.send(()).unwrap();
+                        tracing::info!("Worker {} sent done signal", worker_id);
                     });
                 }
 
-                for _ in 0..NUM_WORKERS {
+                for i in 0..NUM_WORKERS {
                     rx.recv().await.unwrap();
+                    tracing::info!("Main loop received done signal {}", i + 1);
                 }
             });
 
             assert_eq!(message_count.load(Ordering::SeqCst), NUM_WORKERS);
-            println!(
+            tracing::info!(
                 "All {} workers completed UDP self-communication",
                 NUM_WORKERS
             );

@@ -13,6 +13,7 @@ intrusive-collections = { workspace = true }
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 crossbeam-deque = "0.8"
+tracing = "0.1.44"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
@@ -32,6 +33,7 @@ veloq-wheel = { path = "../veloq-wheel" }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["html_reports"] }
+tracing-subscriber = "0.3.22"
 
 [[bench]]
 name = "fs_benchmark"

@@ -9,6 +9,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crossbeam_deque::Worker;
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
+use tracing::{debug, trace};
 
 use crate::io::buffer::{BufferRegion, BufferRegistrar};
 use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
@@ -341,6 +342,7 @@ impl LocalExecutor {
                         Steal::Success(task) => {
                             // We assume if we stole it, it was part of the load.
                             target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                            trace!("Stole task from worker");
                             task.run();
                             return true;
                         }
@@ -370,6 +372,7 @@ impl LocalExecutor {
             // 1. Set PARKING
             // This tells remote wakers: "I might sleep soon, so you should probably syscall wake me".
             state.store(mesh::PARKING, Ordering::Release);
+            trace!("Entered PARKING state");
 
             // 2. Poll Mesh (Double check)
             if let Some(mesh_rc) = &self.mesh {
@@ -382,11 +385,16 @@ impl LocalExecutor {
 
             // Double check remote queues
             if can_park {
-                if !self.pinned_receiver.try_recv().is_err()
-                    || !self.remote_receiver.try_recv().is_err()
-                    || !self.shared.future_injector.is_empty()
-                    || !self.stealable.is_empty()
-                {
+                if let Ok(job) = self.pinned_receiver.try_recv() {
+                    self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    self.enqueue_job(job);
+                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    can_park = false;
+                } else if let Ok(task) = self.remote_receiver.try_recv() {
+                    self.queue.borrow_mut().push_back(task);
+                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    can_park = false;
+                } else if !self.shared.future_injector.is_empty() || !self.stealable.is_empty() {
                     state.store(mesh::RUNNING, Ordering::Relaxed);
                     can_park = false;
                 }
@@ -395,6 +403,7 @@ impl LocalExecutor {
             if can_park {
                 // 3. Commit PARKED
                 state.store(mesh::PARKED, Ordering::Release);
+                trace!("Entered PARKED state (wait)");
 
                 driver.wait().unwrap();
             }
@@ -439,6 +448,7 @@ impl LocalExecutor {
 
         loop {
             if self.shared.shutdown.load(Ordering::Relaxed) {
+                debug!("Shutting down LocalExecutor");
                 break;
             }
 
@@ -606,6 +616,7 @@ impl LocalExecutor {
 
 impl Drop for LocalExecutor {
     fn drop(&mut self) {
+        debug!("Dropping LocalExecutor");
         // Clear the task queue to drop all futures.
         // This explicitly drops tasks (and their buffers/sockets) before the driver is dropped.
         if let Ok(mut queue) = self.queue.try_borrow_mut() {

@@ -10,6 +10,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::io::driver::RemoteWaker;
 use crate::runtime::executor::ExecutorShared;
+use tracing::trace;
 
 /// The state of the Task in its lifecycle.
 #[repr(u8)]
@@ -358,6 +359,7 @@ unsafe fn wake_task(ptr: NonNull<Header>) {
 
     // If running logic ensures binding, we can safely access owner_id.
     let owner_id = unsafe { *header.owner_id.get() };
+    trace!("Waking task, owner={}", owner_id);
 
     // Check if handling locally
     let is_local = crate::runtime::context::is_current_worker(owner_id);

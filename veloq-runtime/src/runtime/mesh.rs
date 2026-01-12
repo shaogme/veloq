@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use tracing::debug;
 
 /// State: The worker is actively running tasks.
 pub const RUNNING: u8 = 0;
@@ -179,6 +180,7 @@ impl<T> Consumer<T> {
 
 /// Create a pair of Producer and Consumer.
 pub fn channel<T>(capacity: usize, target_state: Arc<AtomicU8>) -> (Producer<T>, Consumer<T>) {
+    debug!("Creating mesh channel capacity={}", capacity);
     let inner = Arc::new(Inner::new(capacity));
 
     let p = Producer {

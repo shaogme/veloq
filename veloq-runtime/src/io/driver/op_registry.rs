@@ -3,6 +3,7 @@ use crate::io::driver::PlatformOp;
 use std::io;
 use std::ops::{Index, IndexMut};
 use std::task::{Context, Poll, Waker};
+use tracing::trace;
 
 pub struct OpEntry<Op: PlatformOp, P> {
     pub waker: Option<Waker>,
@@ -85,6 +86,7 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         user_data: usize,
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Op)> {
+        trace!(user_data, "OpRegistry::poll_op");
         if let Some(op) = self.slab.get_mut(user_data) {
             if let Some(res) = op.result.take() {
                 let mut entry = self.slab.remove(user_data);

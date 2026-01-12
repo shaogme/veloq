@@ -2,6 +2,7 @@ use std::{
     mem::MaybeUninit,
     ops::{Index, IndexMut},
 };
+use tracing::{debug, trace};
 
 const PAGE_SHIFT: usize = 10;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT; // 1024
@@ -43,6 +44,7 @@ impl<T> StableSlab<T> {
     }
 
     pub fn insert(&mut self, val: T) -> usize {
+        trace!("StableSlab insert");
         let idx = if self.free_head != usize::MAX {
             self.free_head
         } else {
@@ -65,6 +67,7 @@ impl<T> StableSlab<T> {
     }
 
     pub fn remove(&mut self, key: usize) -> T {
+        trace!(key, "StableSlab remove");
         let (idx, generation) = Self::unpack_key(key);
         let (page_idx, slot_idx) = Self::unpack_idx(idx);
 
@@ -140,6 +143,7 @@ impl<T> StableSlab<T> {
         if additional > available {
             let needed = additional - available;
             let pages_needed = needed.div_ceil(PAGE_SIZE);
+            debug!(pages_needed, "Reserving pages");
             for _ in 0..pages_needed {
                 self.add_page();
             }
@@ -148,6 +152,7 @@ impl<T> StableSlab<T> {
 
     fn add_page(&mut self) {
         let page_idx = self.pages.len();
+        debug!(page_idx, "Adding new slab page");
         let start_idx = page_idx * PAGE_SIZE;
 
         let mut page: Box<[MaybeUninit<SlotEntry<T>>]> = Box::new_uninit_slice(PAGE_SIZE);

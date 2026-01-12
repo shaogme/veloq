@@ -13,6 +13,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use tracing::trace;
+
 use crate::io::driver::{Driver, PlatformDriver};
 use crate::io::socket::SockAddrStorage;
 use crate::io::{RawHandle, buffer::FixedBuf};
@@ -105,6 +107,8 @@ impl<T> Op<T> {
     {
         let (tx, rx) = veloq_sync::oneshot::channel();
         let data = self.data;
+
+        trace!("Submitting remote op");
 
         let closure = Box::new(move |driver: &mut D| {
             let op_platform = data.into_platform_op();
@@ -315,6 +319,8 @@ impl OpSubmitter for LocalSubmitter {
             .driver()
             .upgrade()
             .expect("Driver dropped");
+
+        trace!("Submitting local op");
         op.submit_local(driver)
     }
 

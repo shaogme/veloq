@@ -12,6 +12,8 @@ use std::sync::Arc;
 pub mod op;
 pub mod submit;
 
+use tracing::{debug, trace};
+
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
 
@@ -137,6 +139,8 @@ impl UringDriver {
             return Err(io::Error::last_os_error());
         }
 
+        debug!("Initalized UringDriver with {} entries", entries);
+
         let mut driver = Self {
             ring,
             ops,
@@ -195,6 +199,7 @@ impl UringDriver {
     }
 
     pub fn submit_to_kernel(&mut self) -> io::Result<()> {
+        trace!("submit_to_kernel entered");
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
                 self.ring.submit()?;
@@ -239,6 +244,8 @@ impl UringDriver {
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
+
+            trace!("Processing completions, count={}", cqe_kicker.len());
 
             for cqe in cqe_kicker {
                 let user_data = cqe.user_data() as usize;
@@ -301,6 +308,7 @@ impl UringDriver {
     /// Try to push an entry to the submission queue.
     /// Returns true if successful, false if SQ is full.
     fn push_entry(&mut self, entry: squeue::Entry) -> bool {
+        trace!("Pushing SQE user_data={}", entry.get_user_data());
         let mut sq = self.ring.submission();
 
         if unsafe { sq.push(&entry) }.is_ok() {
@@ -316,6 +324,7 @@ impl UringDriver {
             return true;
         }
 
+        debug!("SQ full even after flush");
         false
     }
 
@@ -524,7 +533,9 @@ impl Driver for UringDriver {
     }
 
     fn reserve_op(&mut self) -> usize {
-        self.ops.insert(OpEntry::new(None, UringOpState::new()))
+        let id = self.ops.insert(OpEntry::new(None, UringOpState::new()));
+        trace!(id, "Reserved op slot");
+        id
     }
 
     fn attach_remote_completer(
@@ -556,11 +567,13 @@ impl Driver for UringDriver {
 
         // 3. Push
         if self.push_entry(sqe) {
+            trace!(user_data, "Submitted to SQ");
             if let Some(entry) = self.ops.get_mut(user_data) {
                 entry.platform_data.submitted = true;
             }
             Ok(Poll::Ready(()))
         } else {
+            debug!(user_data, "SQ full, pushing to backlog");
             // SQ Full. Add to backlog.
             if let Some(entry) = self.ops.get_mut(user_data) {
                 entry.platform_data.submitted = false;

@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
+use tracing::debug;
 
 /// A handle to a spawned task.
 pub struct LocalJoinHandle<T> {
@@ -77,6 +78,7 @@ impl<T> Drop for LocalJoinProducer<T> {
     fn drop(&mut self) {
         let mut state = self.state.borrow_mut();
         if let LocalJoinState::Pending(waker) = &*state {
+            debug!("LocalJoinProducer dropped -> task aborted");
             let waker = waker.clone();
             *state = LocalJoinState::Aborted;
             if let Some(w) = waker {
@@ -232,6 +234,7 @@ impl<T> Drop for JoinProducer<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    debug!("JoinProducer dropped -> task aborted");
                     // Success detected.
                     if current == WAITING {
                         let waker = unsafe { (*state.waker.get()).take() };

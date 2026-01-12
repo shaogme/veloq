@@ -16,6 +16,7 @@ use std::io;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use submit::SubmissionResult;
+use tracing::{debug, trace};
 
 const WAKEUP_USER_DATA: usize = usize::MAX;
 const RUN_CLOSURE_KEY: usize = usize::MAX - 2;
@@ -48,9 +49,14 @@ impl Injector<IocpDriver> for IocpInjector {
         let res =
             unsafe { PostQueuedCompletionStatus(self.port, 0, RUN_CLOSURE_KEY, ptr as *mut _) };
         if res == 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::error!(
+                ?err,
+                "IocpInjector::inject failed to PostQueuedCompletionStatus"
+            );
             // Restore box to drop it
             let _ = unsafe { Box::from_raw(ptr) };
-            return Err(std::io::Error::last_os_error());
+            return Err(err);
         }
         Ok(())
     }
@@ -131,6 +137,7 @@ impl IocpDriver {
         port_val: PreInit,
     ) -> io::Result<Self> {
         let port = port_val as HANDLE;
+        debug!(port = ?port, "Initializing IocpDriver");
         // Load extensions
         let extensions = Extensions::new()?;
         let entries = config.iocp.entries;
@@ -174,6 +181,7 @@ impl IocpDriver {
             wait_ms = std::cmp::min(wait_ms, millis);
         }
 
+        trace!(wait_ms, "Entering GetQueuedCompletionStatus");
         let start = Instant::now();
         let res = unsafe {
             GetQueuedCompletionStatus(
@@ -203,6 +211,7 @@ impl IocpDriver {
 
         // Determine user_data from overlapped or completion_key
         let user_data = if completion_key == RUN_CLOSURE_KEY {
+            trace!("Received RUN_CLOSURE_KEY");
             // Execute closure
             if !overlapped.is_null() {
                 let f = unsafe {
@@ -228,15 +237,26 @@ impl IocpDriver {
                 if err == WAIT_TIMEOUT {
                     return Ok(());
                 }
+                debug!(err, "GetQueuedCompletionStatus returned error");
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
             completion_key
         };
 
+        trace!(user_data, bytes_transferred, "CQE received");
+
         if self.ops.contains(user_data) {
             // Check if cancelled
             if self.ops[user_data].cancelled {
-                self.ops.remove(user_data);
+                let entry = self.ops.remove(user_data);
+
+                // If it was a remote op, we must complete it (with error) so the waiter doesn't panic
+                if let PlatformData::Remote(completer) = entry.platform_data {
+                    if let Some(op) = entry.resources {
+                        completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
+                    }
+                }
+
                 return Ok(());
             }
 
@@ -245,6 +265,7 @@ impl IocpDriver {
             // Check if background or remote
             match &mut op_entry.platform_data {
                 PlatformData::Background => {
+                    trace!(user_data, "Background op completion ignored");
                     self.ops.remove(user_data);
                     return Ok(());
                 }
@@ -271,6 +292,10 @@ impl IocpDriver {
                             self.ops.remove(user_data);
                         } else {
                             // Should not happen?
+                            tracing::error!(
+                                user_data,
+                                "RemoteOp completion missing resources - Task will likely panic"
+                            );
                             self.ops.remove(user_data);
                         }
                     }
@@ -292,7 +317,9 @@ impl IocpDriver {
                 } else {
                     // Normal IO completion
                     let mut result = if res == 0 {
-                        Err(io::Error::last_os_error())
+                        let e = io::Error::last_os_error();
+                        // trace!(?e, "IO failed");
+                        Err(e)
                     } else {
                         Ok(bytes_transferred as usize)
                     };
@@ -343,6 +370,7 @@ impl Driver for IocpDriver {
     fn reserve_op(&mut self) -> usize {
         let old_pages = self.ops.page_count();
         let user_data = self.ops.insert(OpEntry::new(None, PlatformData::None));
+        trace!(user_data, "Reserved op slot");
 
         if self.ops.page_count() > old_pages {
             // New page allocated, register it immediately
@@ -369,6 +397,7 @@ impl Driver for IocpDriver {
         user_data: usize,
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
+        trace!(user_data, "Submitting op");
         // Since RIO slab registration is handled eagerly in reserve_op (and new),
         // we no longer need to check/register it here.
         // This resolves the borrow checker conflict.
@@ -483,6 +512,7 @@ impl Driver for IocpDriver {
                     // If it is Pending, it will complete properly and be cleaned up.
                 }
                 Err(e) => {
+                    debug!(error = ?e, user_data, "Background submit failed");
                     self.ops.remove(user_data);
                     return Err(e);
                 }
@@ -513,6 +543,7 @@ impl Driver for IocpDriver {
 
     fn cancel_op(&mut self, user_data: usize) {
         if let Some(op) = self.ops.get_mut(user_data) {
+            trace!(user_data, "Cancelling op");
             op.cancelled = true;
 
             match &mut op.platform_data {
@@ -607,6 +638,7 @@ impl Driver for IocpDriver {
         let res = unsafe {
             PostQueuedCompletionStatus(self.port, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
         };
+        trace!("Wake up posted");
         if res == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -658,6 +690,7 @@ impl IocpDriver {}
 
 impl Drop for IocpDriver {
     fn drop(&mut self) {
+        debug!("Dropping IocpDriver");
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
             if op.resources.is_some() && op.result.is_none() {
@@ -694,6 +727,19 @@ impl Drop for IocpDriver {
                 let err = unsafe { GetLastError() };
                 if err == WAIT_TIMEOUT {
                     continue;
+                }
+            }
+        }
+
+        // Complete any remaining remote ops to avoid panics in their waiters.
+        // During shutdown, we must ensure all RemoteOps return their resources.
+        for (_user_data, op_entry) in self.ops.iter_mut() {
+            if let PlatformData::Remote(_) = op_entry.platform_data {
+                let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
+                if let PlatformData::Remote(completer) = data {
+                    if let Some(op) = op_entry.resources.take() {
+                        completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
+                    }
                 }
             }
         }
