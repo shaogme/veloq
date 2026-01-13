@@ -127,7 +127,7 @@ impl Driver for UringDriver {
     fn wait(&mut self) -> io::Result<()> {
         // self.wait() calls inherent method defined in inner.rs (and imported via Deref? No re-exported struct impl)
         // Rust structs have inherent methods. inner.rs defines them.
-        self.wait()?;
+        UringDriver::wait(self)?;
         self.process_injected();
         Ok(())
     }
@@ -147,7 +147,7 @@ impl Driver for UringDriver {
         &mut self,
         regions: &[crate::io::buffer::BufferRegion],
     ) -> io::Result<Vec<usize>> {
-        self.register_buffer_regions(regions)
+        UringDriver::register_buffer_regions(self, regions)
     }
 
     fn register_files(

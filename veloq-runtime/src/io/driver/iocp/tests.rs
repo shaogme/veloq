@@ -1,3 +1,4 @@
+use super::ext::Extensions;
 use super::*;
 use crate::io::buffer::{BackingPool, HybridPool};
 
