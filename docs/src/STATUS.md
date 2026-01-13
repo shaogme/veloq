@@ -2,7 +2,7 @@
 
 本文档汇总了 Veloq 项目各模块的开发状态、已完成特性以及待办事项列表。
 
-**最后更新时间**: 2026-01-07
+**最后更新时间**: 2026-01-13
 **总体状态**: 🚧 **Alpha 阶段** (核心架构已定型，API 尚未冻结)
 
 ## 仪表盘 (Dashboard)
@@ -58,8 +58,8 @@ pie title 核心模块完成度估算
 - [x] **基础支持**: 基于 `GetQueuedCompletionStatus` 的事件循环。
 - [x] **扩展函数**: 动态加载 `ConnectEx`, `AcceptEx`。
 - [x] **阻塞回退**: 对于 `Open`/`Close` 等同步 API 实现了线程池分流。
+- [x] **Registered I/O (RIO)**: 支持 Registered I/O 以降低网络 I/O 延迟。
 - [ ] **待办 (TODO)**:
-    - [ ] **Registered I/O (RIO)**: 探索 RIO 以降低网络 I/O 延迟。
     - [ ] **SyncFileRange**: 寻找比 `FlushFileBuffers` 更细粒度的刷盘方案。
 
 ## 3. 内存管理 (Memory)
@@ -70,9 +70,9 @@ pie title 核心模块完成度估算
     - [x] **BuddyPool**: 通用的伙伴系统分配器。
     - [x] **HybridPool**: 针对网络包优化的 Slab + Global 混合分配器。
 - [x] **对齐**: 强制 4KB 对齐，满足 Direct I/O 需求。
+- [x] **跨线程归还**: 支持 `FixedBuf` 在不同线程间流转并安全释放。
 - [ ] **待办 (TODO)**:
     - [ ] **动态扩容**: 支持 Arena 的动态增长。
-    - [ ] **跨线程归还**: 支持 `FixedBuf` 在不同线程间流转并安全释放。
     - [ ] **Huge Page**: 支持大页分配。
 
 ## 4. 上层 API (Net & FS)
