@@ -39,10 +39,11 @@ Veloq 抽象出了这一公共流程：
     - **VTable**: 每个操作携带一个静态虚函数表（VTable），包含构建提交项、处理完成回调、销毁逻辑等指针。
     - 这种类似 C++ 虚函数的机制是在编译期生成的，避免了运行时的动态内存分配（Heap Allocation），同时保持了数据结构的紧凑。
 
-### 2.4 Mesh 网络协同
-驱动不仅仅处理 I/O，还深度集成了运行时内部的 Mesh 通信机制。
-- **Inner Handle**: 暴露底层的 `RawFd` (Linux) 或 `HANDLE` (Windows)。
-- **Notify Mesh**: 允许不同线程的驱动实例之间直接发送信号（如 io_uring 的 `IORING_OP_MSG_RING` 或 IOCP 的 `PostQueuedCompletionStatus`），用于跨线程任务调度的高效唤醒。
+### 2.4 Mesh 网络协同与远程注入
+驱动不仅处理本地 I/O，还通过 **Injector** 机制深度集成了跨线程调度能力。
+- **Injector**: 每个驱动实例暴露一个线程安全的注入器 (`Injector<D>`)。
+- **Closure Injection**: 允许其他线程将闭包 (`Box<dyn FnOnce(&mut Driver) + Send>`) 发送到驱动线程执行。这构成了 `RemoteOp` 的基础——远程线程如果不持有 Driver 的资源的线程所有权，可以通过注入闭包，“委托” Driver 线程提交操作并挂载回调。
+- **Inner Handle / Notify**: 暴露底层的 `RawFd` 或 `Handle` 并提供唤醒机制，用于实现高效的事件通知。
 
 ## 3. 模块内结构 (Internal Structure)
 
@@ -71,14 +72,19 @@ src/io/
 
 ### 4.1 Driver Trait (`driver.rs`)
 ```rust
-pub trait Driver {
+pub trait Driver: 'static {
     type Op: PlatformOp;
+    type RemoteInjector: Injector<Self>;
     
     // 核心生命周期
     fn reserve_op(&mut self) -> usize;
     fn submit(&mut self, user_data: usize, op: Self::Op) -> Result<Poll<()>, ...>;
     fn poll_op(&mut self, user_data: usize, cx: &mut Context) -> Poll<...>;
     
+    // 远程操作支持
+    fn injector(&self) -> Arc<Self::RemoteInjector>;
+    fn attach_remote_completer(&mut self, user_data: usize, completer: Box<dyn RemoteCompleter<Self::Op>>);
+
     // 驱动循环
     fn wait(&mut self) -> io::Result<()>;
     fn process_completions(&mut self);
@@ -88,7 +94,10 @@ pub trait Driver {
     fn submit_background(&mut self, op: Self::Op) -> ...;
 }
 ```
-`Driver` 是单线程的（`&mut self`），这意味着它不需要内部锁来保护核心数据结构，极大降低了竞争开销。所有的同步都由上层的 `Mesh` 和 `LocalExecutor` 通过消息传递来协调。
+`Driver` 是单线程的（`&mut self`），这种设计消除了大部分锁竞争。跨线程交互完全依赖 `Injector` 和 `RemoteCompleter`：
+1.  **Remote Submission**: 远程线程通过 `injector.inject()` 发送闭包。
+2.  **Execution**: 驱动线程执行闭包，调用 `submit` 提交操作，并调用 `attach_remote_completer` 将一个回调挂在到 Slot 上。
+3.  **Completion**: 当操作完成时，驱动检测到 Slot 上有 `PlatformData::Remote(completer)`，直接调用 `completer.complete()` 而不是唤醒 Waker。这通常会通过 Channel 通知远程 Future。
 
 ### 4.2 StableSlab (`stable_slab.rs`)
 - **存储结构**: `Vec<Box<[Slot<T>; PAGE_SIZE]>>`。
@@ -102,12 +111,16 @@ pub trait Driver {
 它是连接 `Driver` 和 `Future` 的桥梁。
 - **Payload**: `OpEntry<Op, P>`。包含：
     - `resources`: 实际的 I/O 操作对象（如 Socket 句柄、缓冲区）。操作完成前，所有权属于驱动。
-    - `waker`: 任务挂起时的 Waker。
+    - `waker`: 任务挂起时的 Waker (用于 Local Op)。
+    - `platform_data`: 平台相关数据，也可以存储 `RemoteCompleter` (用于 Remote Op) 或 Timer/Background 标识。
     - `result`: 存放操作完成后的结果。
 - **Poll 逻辑**:
-    - `poll_op` 被上层 `Future` 调用。
+    - `poll_op` 被上层 `Future` 调用 (仅限 Local Op)。
     - 如果 `result` 存在 -> 取出 Result 和 Resources，返回 `Poll::Ready`，并移除 Slot。
     - 否则 -> 更新 `waker`，返回 `Poll::Pending`。
+- **Remote Completion 逻辑**:
+    - 在 `process_completions` 中，如果发现 Slot 关联的是 `RemoteCompleter`，则**不更新 Waker**，也不等待 `poll_op`。
+    - 直接取出 Result 和 Resources，调用 `completer.complete(result, resources)`。这将触发远程 Channel 的发送。
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 

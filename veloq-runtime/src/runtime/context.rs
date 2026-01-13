@@ -77,7 +77,6 @@ pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Task>>>,
     pub(crate) spawner: Option<Spawner>,
-    pub(crate) mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
     pub(crate) handle: ExecutorHandle,
     pub(crate) buf_pool: AnyBufPool,
     pub(crate) stealable: Rc<Worker<Runnable>>,
@@ -89,7 +88,6 @@ impl RuntimeContext {
         driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Task>>>,
         spawner: Option<Spawner>,
-        mesh: Option<Weak<RefCell<crate::runtime::executor::MeshContext>>>,
         handle: ExecutorHandle,
         buf_pool: AnyBufPool,
         stealable: Rc<Worker<Runnable>>,
@@ -98,7 +96,6 @@ impl RuntimeContext {
             driver,
             queue,
             spawner,
-            mesh,
             handle,
             buf_pool,
             stealable,
@@ -177,15 +174,6 @@ impl RuntimeContext {
                 )
             };
             queue.borrow_mut().push_back(job);
-            return handle;
-        }
-
-        // Try Mesh
-        if let Some(mesh_weak) = &self.mesh
-            && let Some(mesh_rc) = mesh_weak.upgrade()
-            && let Some(driver_rc) = self.driver.upgrade()
-        {
-            spawner.spawn_to_with_mesh(job, worker_id, &mesh_rc, &driver_rc);
             return handle;
         }
 

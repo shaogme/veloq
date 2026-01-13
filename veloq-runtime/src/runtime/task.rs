@@ -393,7 +393,7 @@ unsafe fn wake_task(ptr: NonNull<Header>) {
             // If it is RUNNING, it will eventually check the queue (local or global).
             // Note: `crate::runtime::mesh::RUNNING` is 0.
             let state = shared.state.load(Ordering::Acquire);
-            if state != crate::runtime::mesh::RUNNING {
+            if state != crate::runtime::executor::RUNNING {
                 let _ = shared.waker.wake();
             }
         }

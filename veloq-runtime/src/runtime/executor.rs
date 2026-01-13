@@ -16,12 +16,18 @@ use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
 use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
-use crate::runtime::mesh::{self, Consumer, Producer};
 use crate::runtime::task::harness::Runnable;
 use crate::runtime::task::{SpawnedTask, Task};
 
+/// State: The worker is actively running tasks.
+pub const RUNNING: u8 = 0;
+/// State: The worker is preparing to park (checking queues one last time).
+pub const PARKING: u8 = 1;
+/// State: The worker is fully parked on the driver (sleeping).
+pub const PARKED: u8 = 2;
+
 // Re-export common types from spawner which acts as the definition source for these
-pub use self::spawner::{ExecutorHandle, ExecutorRegistry, Job, MeshContext, Spawner};
+pub use self::spawner::{ExecutorHandle, ExecutorRegistry, Job, Spawner};
 
 pub mod spawner;
 
@@ -112,7 +118,7 @@ impl LocalExecutorBuilder {
             let (remote_tx, remote_rx) = mpsc::channel();
             let (pinned_tx, pinned_rx) = mpsc::channel();
             // Default state is RUNNING
-            let state = Arc::new(AtomicU8::new(mesh::RUNNING));
+            let state = Arc::new(AtomicU8::new(RUNNING));
 
             let shared = Arc::new(ExecutorShared {
                 pinned: pinned_tx,
@@ -146,7 +152,6 @@ impl LocalExecutorBuilder {
             pinned_receiver,
             stealable: Rc::new(stealable),
             registry: None,
-            mesh: None,
             id: usize::MAX,
             buf_pool,
         }
@@ -168,8 +173,6 @@ pub struct LocalExecutor {
     // Optional connection to the global registry
     registry: Option<Arc<ExecutorRegistry>>,
 
-    // Mesh Networking
-    mesh: Option<Rc<RefCell<MeshContext>>>,
     // Cached ID (usize::MAX if not in mesh)
     id: usize,
     // Buffer Pool
@@ -196,6 +199,12 @@ impl LocalExecutor {
     /// This enables the executor to steal tasks from others in the registry.
     pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Set the worker ID for this executor.
+    pub fn with_id(mut self, id: usize) -> Self {
+        self.id = id;
         self
     }
 
@@ -241,29 +250,6 @@ impl LocalExecutor {
         handle
     }
 
-    pub(crate) fn attach_mesh(
-        &mut self,
-        id: usize,
-        ingress: Vec<Consumer<Job>>,
-        egress: Vec<Producer<Job>>,
-        peer_handles: Arc<Vec<AtomicUsize>>,
-    ) {
-        // We MUST ensure that the state passed here is consistent with self.shared.state
-        // For now, we assume RuntimeBuilder sets this up correctly (by passing shared.state's clone or same source).
-        // Since `ExecutorShared` is generally immutable once created, if they differ, it's a bug in setup.
-        // Ideally we should ASSERT here:
-        // assert!(Arc::ptr_eq(&self.shared.state, &state), "Mesh state must match Shared state");
-
-        let mesh = MeshContext {
-            id,
-            ingress,
-            egress,
-            peer_handles,
-        };
-        self.mesh = Some(Rc::new(RefCell::new(mesh)));
-        self.id = id;
-    }
-
     fn enqueue_job(&self, task: Job) {
         // Enqueue Job (SpawnedTask) to local queue.
         // This is local work.
@@ -276,14 +262,6 @@ impl LocalExecutor {
             )
         };
         self.queue.borrow_mut().push_back(task);
-    }
-
-    fn try_poll_mesh(&self) -> bool {
-        if let Some(mesh_rc) = &self.mesh {
-            let mut mesh = mesh_rc.borrow_mut();
-            return mesh.poll_ingress(|job| self.enqueue_job(job));
-        }
-        false
     }
 
     fn try_poll_injector(&self) -> bool {
@@ -371,45 +349,36 @@ impl LocalExecutor {
 
             // 1. Set PARKING
             // This tells remote wakers: "I might sleep soon, so you should probably syscall wake me".
-            state.store(mesh::PARKING, Ordering::Release);
+            state.store(PARKING, Ordering::Release);
             trace!("Entered PARKING state");
-
-            // 2. Poll Mesh (Double check)
-            if let Some(mesh_rc) = &self.mesh {
-                let mut mesh = mesh_rc.borrow_mut();
-                if mesh.poll_ingress(|job| self.enqueue_job(job)) {
-                    state.store(mesh::RUNNING, Ordering::Relaxed);
-                    can_park = false;
-                }
-            }
 
             // Double check remote queues
             if can_park {
                 if let Ok(job) = self.pinned_receiver.try_recv() {
                     self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
                     self.enqueue_job(job);
-                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    state.store(RUNNING, Ordering::Relaxed);
                     can_park = false;
                 } else if let Ok(task) = self.remote_receiver.try_recv() {
                     self.queue.borrow_mut().push_back(task);
-                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    state.store(RUNNING, Ordering::Relaxed);
                     can_park = false;
                 } else if !self.shared.future_injector.is_empty() || !self.stealable.is_empty() {
-                    state.store(mesh::RUNNING, Ordering::Relaxed);
+                    state.store(RUNNING, Ordering::Relaxed);
                     can_park = false;
                 }
             }
 
             if can_park {
                 // 3. Commit PARKED
-                state.store(mesh::PARKED, Ordering::Release);
+                state.store(PARKED, Ordering::Release);
                 trace!("Entered PARKED state (wait)");
 
                 driver.wait().unwrap();
             }
 
             // Restore RUNNING
-            state.store(mesh::RUNNING, Ordering::Release);
+            state.store(RUNNING, Ordering::Release);
         }
     }
 
@@ -419,13 +388,10 @@ impl LocalExecutor {
         let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
 
         // Pass the Mesh context if available
-        let mesh_weak = self.mesh.as_ref().map(Rc::downgrade);
-
         let context = RuntimeContext::new(
             self.driver_handle(),
             Rc::downgrade(&self.queue),
             spawner,
-            mesh_weak,
             self.handle(),
             self.buf_pool.clone(),
             self.stealable.clone(),
@@ -434,13 +400,6 @@ impl LocalExecutor {
         let _guard = crate::runtime::context::enter(context);
 
         // Auto-Register removed: Pools should be pre-registered (Scheme 1).
-
-        // Register Mesh Handle
-        if let Some(mesh_rc) = &self.mesh {
-            let mesh = mesh_rc.borrow();
-            let handle = self.driver.borrow().inner_handle();
-            mesh.peer_handles[mesh.id].store(handle.into(), Ordering::Release);
-        }
 
         let main_woken = Arc::new(AtomicBool::new(false));
 
@@ -456,11 +415,6 @@ impl LocalExecutor {
 
             while executed < BUDGET {
                 let mut did_work = false;
-
-                // 0. Poll Mesh (Highest Priority)
-                if self.try_poll_mesh() {
-                    did_work = true;
-                }
 
                 // 1. Poll Stealable (Send Tasks - LIFO)
                 if let Some(task) = self.stealable.pop() {
@@ -516,13 +470,10 @@ impl LocalExecutor {
         let spawner = self.registry.as_ref().map(|reg| Spawner::new(reg.clone()));
 
         // Pass the Mesh context if available
-        let mesh_weak = self.mesh.as_ref().map(Rc::downgrade);
-
         let context = RuntimeContext::new(
             self.driver_handle(),
             Rc::downgrade(&self.queue),
             spawner,
-            mesh_weak,
             self.handle(),
             self.buf_pool.clone(),
             self.stealable.clone(),
@@ -531,13 +482,6 @@ impl LocalExecutor {
         let _guard = crate::runtime::context::enter(context);
 
         // Auto-Register removed.
-
-        // Register Mesh Handle
-        if let Some(mesh_rc) = &self.mesh {
-            let mesh = mesh_rc.borrow();
-            let handle = self.driver.borrow().inner_handle();
-            mesh.peer_handles[mesh.id].store(handle.into(), Ordering::Release);
-        }
 
         let mut pinned_future = Box::pin(future);
         let remote_waker = self.driver.borrow().create_waker();
@@ -555,11 +499,6 @@ impl LocalExecutor {
 
             while executed < BUDGET {
                 let mut did_work = false;
-
-                // 0. Poll Mesh (Highest Priority)
-                if self.try_poll_mesh() {
-                    did_work = true;
-                }
 
                 // 1. Poll Stealable (Send Tasks - LIFO)
                 if let Some(task) = self.stealable.pop() {

@@ -6,33 +6,36 @@
 
 `Executor` 模块实现了 **Work-Stealing** 和 **P2C (Power of Two Choices)** 相结合的混合调度算法。
 它由两部分组成：
-1.  **LocalExecutor** (`executor.rs`): 运行在每个 Worker 线程上的主循环，负责驱动 I/O、处理队列和 Mesh 消息。
+1.  **LocalExecutor** (`executor.rs`): 运行在每个 Worker 线程上的主循环，负责驱动 I/O、处理队列和任务窃取。
 2.  **Runtime & Spawning** (`runtime.rs` / `spawner.rs`): 负责线程的生命周期管理和任务分发策略。
+
+为了实现这一目标，执行器将任务明确划分为两类：
+1.  **Pinned Tasks (绑定任务)**: 必须在特定线程运行的任务（如 `spawn_local`）。由 `task.rs` 定义的 `Task`。
+2.  **Stealable Tasks (可窃取任务)**: 实现了 `Send`，可以在任意线程运行的任务（通过 `spawn` 创建）。由 `runtime/task/harness.rs` 定义的 `Runnable`。
 
 ## 2. 理念和思路 (Philosophy and Design)
 
 ### 2.1 混合调度策略 (Hybrid Scheduling)
 Veloq 结合了发送端和接收端的负载均衡：
-- **发送端 (P2C)**: 当调用 `spawn_balanced` 时，使用“两个随机选择”算法，比较两个 Worker 的负载，将任务发往较空闲的那个。
-- **本地优先 (Local Injection)**: 当调用 `spawn` 时，任务被放入当前 Worker 的 `Injector` 队列，优先由本地消费，但也允许被窃取。
-- **接收端 (Work-Stealing)**: 当 Worker 空闲时，主动去“窃取”其他 Worker 的 `Injector` 队列中的任务。
+- **发送端 (Direct Push)**: 绑定任务 (`spawn_local`/`spawn_to`) 直接通过 MPSC 通道发送到目标 Worker。
+- **本地优先 (Local Injection)**: 当调用 `spawn` 时，任务被放入当前 Worker 的 `Stealable` 队列，优先由本地消费，但也允许被窃取。
+- **接收端 (Work-Stealing)**: 当 Worker 空闲时，主动去“窃取”其他 Worker 的 `Stealable` 队列中的任务。
 
 ### 2.2 优先级倒置 (Priority Inversion for Latency)
 在 `LocalExecutor` 的主循环中，显式定义了轮询顺序：
-1.  **Mesh Messages** (最高优先级): 处理来自其他 Worker 的 P2C 任务分发。这保证了跨核通信的低延迟。
-2.  **Local Queue**: 处理 `spawn_local` 生成的、不可被窃取的本地任务（以及被 Mesh/Remote 唤醒后加入本地队列的任务）。
-3.  **Pinned Queue / Remote Queue**: 处理要求被绑定在当前 Worker 执行的任务，或从其他线程唤醒的任务。
-4.  **Global Injector**: 处理 `spawn` 生成的普通任务。
-5.  **Work Stealing**: 最后尝试去偷任务。
+1.  **Local Stealable**: 优先执行当前线程刚刚生成的 `Send` 任务。这利用了 CPU 缓存热度。
+2.  **Local Pinned Queue**: 处理要求被绑定在当前 Worker 执行的任务 (`spawn_local`)。
+3.  **Injectors**: 处理外部注入的任务（远程唤醒的绑定任务、全局注入的任务）。
+4.  **Work Stealing**: 最后尝试去偷任务。
 
 ### 2.3 动态注册 (Dynamic Registry)
-`ExecutorRegistry` 支持动态扩缩容，并使用 `smr-swap` 实现了无锁的读取快照，确保调度器在遍历 Worker 列表时不会被锁阻塞。
+`ExecutorRegistry` 支持通过 `Arc` 指针共享 Worker 列表，允许 `Spawner` 在运行时动态选择目标 Worker。
 
 ## 3. 模块内结构 (Internal Structure)
 
 - `runtime.rs`:
     - `Runtime`: 运行时顶层入口。
-    - `RuntimeBuilder`: 负责初始化所有 Worker、MeshMatrix 和共享状态，并启动线程。
+    - `RuntimeBuilder`: 负责初始化所有 Worker 和共享状态，并启动线程。
 
 - `executor.rs`:
     - `LocalExecutor`: Worker 线程的本地执行器。
@@ -42,9 +45,12 @@ Veloq 结合了发送端和接收端的负载均衡：
     - `RuntimeContext`: 提供给用户的 TLS 上下文，包含 `spawn`, `spawn_balanced`, `spawn_local` 等接口。
 
 - `executor/spawner.rs`:
-    - `Spawner`: 封装 P2C 逻辑。
+    - `Spawner`: 封装任务分发逻辑。
     - `ExecutorRegistry`: 全局注册表。
-    - `ExecutorShared`: 跨线程共享的原子状态（负载计数、注入队列）。
+    - `ExecutorShared`: 跨线程共享的原子状态（负载计数、注入队列、Pinned 通道）。
+
+- `task/harness.rs`:
+    - `Runnable`: **Stealable Task** 的运行时句柄。封装了 `Future`、状态机 (`AtomicUsize`) 和调度器 (`Schedule` Trait)。
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
@@ -54,20 +60,21 @@ Veloq 结合了发送端和接收端的负载均衡：
 loop {
     let mut executed = 0;
     while executed < BUDGET {
-        // 1. Mesh Polling (Highest Priority)
-        // 处理 P2C 进来的 Job
-        if self.try_poll_mesh() { ... }
         
-        // 2. Local Queue
+        // 1. Local Stealable (Send Tasks - LIFO)
+        if let Some(task) = self.stealable.pop() { ... }
+
+        // 2. Local Pinned Queue
         // 处理本地任务
         if let Some(task) = self.queue.pop() { ... }
         
-        // 3. Pinned / Remote / Injector
+        // 3. Injectors (Pinned/Remote/Global)
         // try_poll_injector 内部会依次检查:
         // - pinned queue (绑定任务)
         // - remote receiver (唤醒的任务)
         // - global injector (普通任务)
         if self.try_poll_injector() { ... }
+        if self.try_poll_future_injector() { ... }
         
         // 4. Stealing
         // 从其他 Worker 偷任务
@@ -82,19 +89,20 @@ loop {
 
 ### 4.2 停车与唤醒 (`park_and_wait`)
 这是一个精细的状态机：
-1.  **Set PARKING**: 标记 Mesh 状态为 PARKING。
-2.  **Double Check**: 再次检查 Mesh 和队列。
+1.  **Set PARKING**: 标记状态为 PARKING。
+2.  **Double Check**: 再次检查队列。
 3.  **Commit PARKED**: 状态设为 PARKED。
 4.  **Driver.wait()**: 调用底层的 `epoll_wait` / `GetQueuedCompletionStatus`。
 
-当其他线程通过 Mesh 发送任务时，如果发现目标处于 `PARKED`，会通过 Driver 的 Waker 唤醒它。
+当其他线程通过 `pinned.send()` 发送任务时，会主动唤醒目标 Executor。
 
 ### 4.3 任务生成 (`context.rs` & `spawner.rs`)
-- **`spawn_balanced`**: 从注册表中随机选两个 Worker，比较 `total_load` (Local + Injected)，选择负载较小的那个，通过 Mesh 发送 Job。
-- **`spawn`**: 直接 push 到 `handle.shared.injector`，并原子增加 `injected_load`。
+- **`spawn`**: 创建一个 `Runnable` (Harness)，优先推入当前 Worker 的 `Stealable` 队列。如果 Worker 繁忙，其他 Worker 可以窃取。
+- **`spawn_to` / `Spawner` Pinned Spawn**: 明确目标 Worker，将任务通过 MPSC 通道发送到目标的 `pinned` 队列。
+- **`spawn_local`**: 创建 `SpawnedTask` 并推入本地 `VecDeque`，永不离开线程。
 
-### 4.4 smr-swap 的使用
-`ExecutorRegistry` 使用 `smr_swap::SmrSwap` 来存储 `Vec<ExecutorHandle>`，实现 wait-free 的读取。
+### 4.4 注册表实现 (Registry Implementation)
+目前 `ExecutorRegistry` 使用静态初始化的 `Arc<Vec<ExecutorHandle>>`。动态扩缩容（及之前的 `smr-swap` 方案）已简化为启动时配置，以减少运行时开销。
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 

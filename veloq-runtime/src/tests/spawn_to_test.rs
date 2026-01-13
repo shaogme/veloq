@@ -1,13 +1,8 @@
 use crate::runtime::{Runtime, spawn_to};
 
 fn current_worker_id() -> Option<usize> {
-    let ctx = crate::runtime::context::current();
-    if let Some(mesh_weak) = &ctx.mesh {
-        if let Some(mesh) = mesh_weak.upgrade() {
-            return Some(mesh.borrow().id);
-        }
-    }
-    None
+    let ctx = crate::runtime::context::try_current();
+    ctx.map(|c| c.handle.id())
 }
 
 #[test]

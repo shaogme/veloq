@@ -4,28 +4,28 @@
 
 ## 1. 概要 (Overview)
 
-Veloq Runtime 是一个基于 **Thread-per-Core** 模型的高性能异步运行时。它旨在充分利用现代多核硬件的特性，通过减少跨核通信、锁竞争和缓存抖动来最大化 I/O 和计算吞吐量。与 Tokio 等通用运行时不同，Veloq 更侧重于显式的资源管理和基于网格 (Mesh) 的任务调度。
+Veloq Runtime 是一个基于 **Thread-per-Core** 模型的高性能异步运行时，同时集成了 **Work-Stealing** 机制以实现更好的计算负载均衡。它旨在充分利用现代多核硬件的特性，通过减少跨核通信、锁竞争和缓存抖动来最大化 I/O 和计算吞吐量。
 
 ## 2. 理念和思路 (Philosophy and Design)
 
-### 2.1 Thread-per-Core 与 Nothing-Shared
-我们坚信在现代高并发场景下，**数据局部性 (Data Locality)** 是性能的关键。
-- 也就是每个 Worker 线程拥有独立的 I/O 驱动 (Driver)、任务队列和缓冲区池。
-- 尽量避免全局锁。线程间的交互主要通过显式的消息传递（Mesh Network）或高效的工作窃取（Work Stealing）进行。
+### 2.1 Thread-per-Core 与 混合任务模型
+我们坚信在现代高并发场景下，**数据局部性 (Data Locality)** 是性能的关键。为此，Veloq 实现了双任务系统：
+- **Pinned Task (Task)**: 绑定在特定核心，拥有独立的 I/O 驱动和缓冲区池。用于 I/O 密集型操作，保持零锁。
+- **Stealable Task (Runnable)**: 实现了 `Send`，可以在核心间窃取和迁移。用于计算密集型操作，平衡负载。
 
-### 2.2 Mesh Network (以通信代共享)
-传统的运行时通常使用全局的 `Mutex<Queue>` 或 `SegQueue` 来进行跨线程任务调度，这在高负载下会产生严重的 CAS 争用。
-Veloq 引入了 **Mesh** 概念：
-- 每个 Worker 之间建立两两互联的 **SPSC (Single-Producer Single-Consumer)** 无锁通道。
-- 当 Worker A 需要将任务发给 Worker B 时，它直接将任务推入 A->B 的 SPSC 通道，零锁竞争。
-- 这种全互联拓扑形成了一个高效的任务分发网格。
+### 2.2 Handle-based Distribution (基于句柄的分发)
+传统的运行时通常使用全局的 `Mutex<Queue>` 或 `SegQueue` 来进行跨线程任务调度的高负载下争用。
+Veloq 使用 **Executor Handles**：
+- 每个 Worker 维护一个 `ExecutorShared` 状态，包含一个专用的 **MPSC (Multi-Producer Single-Consumer)** 通道 (`pinned`) 用于接收定向任务。
+- 当 Worker A 需要将任务发给 Worker B 时 (`spawn_to`)，它持有 B 的 `ExecutorHandle`，直接将任务发送到 B 的通道。
+- 这种方式简化了拓扑结构，同时通过 `ExecutorRegistry` 保持了灵活性。
 
 ### 2.3 显式上下文 (Explicit Context)
 为了避免隐式的全局状态（如 TLS 中的隐藏变量），Veloq 提供了 `RuntimeContext`：
-- 显式通过上下文访问 `Spawner` (用于负载均衡生成任务)、`Driver` (I/O) 和 `Mesh` (通信)。
-- `spawn_balanced`: 使用 P2C 算法进行负载均衡的任务生成。
-- `spawn`: 优先注入当前 Worker 的 Injector 队列。
-- `bind_pool`: 强制要求缓冲区池与当前线程绑定，确保 I/O 内存操作的安全性。
+- 显式通过上下文访问 `Spawner` (用于负载均衡生成任务) 和 `Driver` (I/O)。
+- `spawn`: 创建一个可窃取的任务 (`Runnable`)，优先本地执行，支持被窃取。
+- `spawn_local`: 创建一个绑定任务 (`Task`)，仅限本地执行。
+- `spawn_to`: 将任务直接发送到指定 Worker 的 `pinned` 通道。
 
 ## 3. 模块内结构 (Internal Structure)
 
@@ -35,8 +35,8 @@ Veloq 引入了 **Mesh** 概念：
 src/runtime/
 ├── runtime.rs    // Runtime 主入口，包含 Runtime 结构体、RuntimeBuilder 及 Worker 线程启动逻辑
 ├── context.rs    // 线程局部上下文 (TLS)，提供 spawn 接口和资源访问 (RuntimeContext)
-├── task.rs       // 任务 (Task) 定义，手动实现的 RawWakerVTable
-├── mesh.rs       // Mesh 网络通信原语 (SPSC Channel)
+├── task.rs       // Pinned Task 定义，手动实现的 RawWakerVTable
+    └── harness.rs // Stealable Task (Runnable) 定义
 ├── join.rs       // JoinHandle 实现，管理任务结果的异步等待
 ├── executor.rs   // LocalExecutor 定义，Worker 线程主循环
 └── executor/     // 执行器内部实现细节
@@ -48,32 +48,27 @@ src/runtime/
 ### 4.1 Runtime & Initialization (`runtime.rs`)
 `Runtime` 结构体持有所有 Worker 线程的句柄 (`JoinHandle`) 和全局注册表 (`ExecutorRegistry`)。
 在 `RuntimeBuilder::build()` 过程中，会进行如下关键初始化：
-- **MeshMatrix**: 创建一个扁平化的 SPSC 通道矩阵，负责所有 Worker 之间的两两互联。
-- **Shared States**: 预分配所有 Worker 的共享状态 (`ExecutorShared`)，包含注入队列 (`Injector`) 和负载计数器。
-- **Thread Spawning**: 启动 Worker 线程，每个线程运行一个 `LocalExecutor`，并绑定对应的 Mesh 通道和 Buffer Pool。
+- **Shared States**: 预分配所有 Worker 的共享状态 (`ExecutorShared`)，包含注入队列 (`Injector`)、Pinned 通道 (`mpsc`) 和负载计数器。
+- **Thread Spawning**: 启动 Worker 线程，每个线程运行一个 `LocalExecutor`，并绑定 Buffer Pool。
 
 ### 4.2 Context (`context.rs`)
 `RuntimeContext` 是运行时与任务之间的桥梁。它包含：
 - **Driver**: 指向底层 `PlatformDriver` 的弱引用。
 - **ExecutorHandle**: 当前执行器的句柄，包含共享状态 (Shared State)。
-- **Spawner**: 全局生成器，用于 `spawn_balanced`。
-- **Mesh**: 访问 Mesh 网络的能力。
+- **Spawner**: 全局生成器，用于 `spawn` 和 `spawn_to`。
 
-**Spawn 策略**:
-- `spawn_balanced(future)`: 使用 P2C (Power of Two Choices) 算法选择两个负载最小的 Worker 之一，通过 Mesh 发送任务。
-- `spawn(future)`: 将任务推入当前 Worker 的 Global Injector 队列。
-- `spawn_to(future, worker_id)`: 将任务直接发送到指定 Worker 的 Mesh 通道或远程队列。
+### 4.3 Task System (`task.rs` & `harness.rs`)
+Veloq 的任务系统经过了深度优化，分为两类：
 
-### 4.3 Task (`task.rs`)
-Veloq 的 Task 经过了深度优化，不再使用标准的 `Arc` 或 `Rc` 包装。
-- **手动内存布局**: Task 是一个指向堆内存的指针，内存布局为 `[Header][Future]`。这种紧凑布局减少了内存分配次数和指针解引用开销。
-- **VTable**: 手动实现了 `TaskVTable` (包含 `poll`, `drop_future`, `dealloc`)，用于动态分发，避免了标准 Trait Object 的某些开销。
-- **生命周期状态机**:
-  引入了明确的状态机 (`Spawned` -> `Bound` -> `Running` -> `Dead`)。
-  - `SpawnedTask`: 刚创建但未绑定 Executor 的任务。
-  - `Task`: 已绑定 Executor，准备运行或正在运行的任务。
-- **原子引用计数**: 结合原子状态字，实现了高效的并发访问控制。
-- **无锁竞争处理**: 当任务正在运行时如果被再次唤醒，会自动重新加入队列，避免并发 Poll。
+1.  **Stealable Task (Runnable)** (`harness.rs`):
+    *   专为 Work-Stealing 设计。
+    *   包含 `[Header][Scheduler][Future]` 布局。
+    *   支持原子状态机 (`IDLE`, `RUNNING`, `NOTIFIED`) 和跨线程调度 (`Schedule` trait)。
+
+2.  **Pinned Task (Task)** (`task.rs`):
+    *   专为本地执行设计。
+    *   手动内存布局 `[Header][Future]`，无 Scheduler 指针，更节省内存。
+    *   使用 `VecDeque` 进行调度，极低开销。
 
 ### 4.4 JoinHandle (`join.rs`)
 实现了任务结果的异步获取。

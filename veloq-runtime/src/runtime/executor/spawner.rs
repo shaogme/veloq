@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::trace;
@@ -6,8 +6,7 @@ use tracing::trace;
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
-use crate::io::driver::{Driver, RemoteWaker};
-use crate::runtime::mesh::{self, Consumer, Producer};
+use crate::io::driver::RemoteWaker;
 use crate::runtime::task::{SpawnedTask, Task};
 
 // --- Job Definition ---
@@ -95,55 +94,6 @@ impl RemoteWaker for LateBoundWaker {
             }
         }
         Ok(())
-    }
-}
-
-pub struct MeshContext {
-    pub(crate) id: usize,
-    pub(crate) ingress: Vec<Consumer<Job>>,
-    pub(crate) egress: Vec<Producer<Job>>,
-    pub(crate) peer_handles: Arc<Vec<AtomicUsize>>,
-}
-
-impl MeshContext {
-    pub fn send_to(
-        &mut self,
-        peer_id: usize,
-        job: Job,
-        driver: &mut crate::io::driver::PlatformDriver,
-    ) -> Result<(), Job> {
-        if peer_id >= self.egress.len() {
-            return Err(job);
-        }
-        let producer = &mut self.egress[peer_id];
-
-        if let Err(job) = producer.push(job) {
-            return Err(job);
-        }
-
-        let state = producer.target_state();
-        if state == mesh::PARKED || state == mesh::PARKING {
-            let handle = self.peer_handles[peer_id].load(Ordering::Acquire);
-            if handle != 0 {
-                let _ = driver.notify_mesh(handle.into());
-            }
-        }
-        Ok(())
-    }
-
-    pub fn poll_ingress<F>(&mut self, mut on_job: F) -> bool
-    where
-        F: FnMut(Job),
-    {
-        let mut did_work = false;
-
-        for consumer in &mut self.ingress {
-            if let Some(job) = consumer.pop() {
-                on_job(job);
-                did_work = true;
-            }
-        }
-        did_work
     }
 }
 
@@ -297,26 +247,6 @@ impl Spawner {
             // Panic if the worker_id is invalid, as this implies a logic error in the caller
             // assuming the existence of a specific worker.
             panic!("Worker {} not found in registry", worker_id);
-        }
-    }
-
-    pub(crate) fn spawn_to_with_mesh(
-        &self,
-        job: Job,
-        worker_id: usize,
-        mesh: &RefCell<MeshContext>,
-        driver: &RefCell<crate::io::driver::PlatformDriver>,
-    ) {
-        // Try Mesh
-        let mut mesh = mesh.borrow_mut();
-        let mut driver = driver.borrow_mut();
-
-        if let Err(returned_job) = mesh.send_to(worker_id, job, &mut driver) {
-            // Mesh full or error, fallback to global injector
-            // Drop locks before fallback
-            drop(mesh);
-            drop(driver);
-            self.spawn_job_to(returned_job, worker_id);
         }
     }
 }

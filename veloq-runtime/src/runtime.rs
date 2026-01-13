@@ -1,7 +1,7 @@
 pub mod context;
 pub mod executor;
 pub mod join;
-pub mod mesh;
+
 pub mod task;
 
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use crate::io::buffer::{AnyBufPool, BufferRegistrar, RegisteredPool};
 use crate::io::driver::RemoteWaker;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
-use crate::runtime::mesh::{Consumer, Producer};
 use crossbeam_deque::Worker;
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
@@ -22,75 +21,12 @@ use crossbeam_utils::CachePadded;
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-/// A helper struct to organize and distribute mesh channels.
-/// It uses flattened vectors for better memory locality.
-/// - Ingress: Grouped by Receiver (Transposed) -> `[Receiver * N + Sender]`
-/// - Egress: Grouped by Sender (Row Major) -> `[Sender * N + Receiver]`
-struct MeshMatrix<T> {
-    size: usize,
-    ingress: Vec<Option<Consumer<T>>>,
-    egress: Vec<Option<Producer<T>>>,
-}
-
-impl<T: Send> MeshMatrix<T> {
-    fn new(size: usize, states: &[Arc<AtomicU8>]) -> Self {
-        let capacity = size * size;
-        let mut ingress = Vec::with_capacity(capacity);
-        let mut egress = Vec::with_capacity(capacity);
-
-        // Pre-fill with None
-        for _ in 0..capacity {
-            ingress.push(None);
-            egress.push(None);
-        }
-
-        for i in 0..size {
-            for j in 0..size {
-                let target_state = states[j].clone();
-                let (tx, rx) = mesh::channel(256, target_state);
-
-                // Egress: Sender i, Receiver j -> Row Major: i * N + j
-                egress[i * size + j] = Some(tx);
-
-                // Ingress: Receiver j, Sender i -> Column Major (Transposed): j * N + i
-                // This ensures that for receiver j, all incoming channels are contiguous.
-                ingress[j * size + i] = Some(rx);
-            }
-        }
-
-        Self {
-            size,
-            ingress,
-            egress,
-        }
-    }
-
-    fn take_worker_channels(&mut self, worker_id: usize) -> (Vec<Consumer<T>>, Vec<Producer<T>>) {
-        let start = worker_id * self.size;
-        let end = start + self.size;
-
-        let ingress_batch = self.ingress[start..end]
-            .iter_mut()
-            .map(|opt| opt.take().expect("Ingress channel already distributed"))
-            .collect();
-
-        let egress_batch = self.egress[start..end]
-            .iter_mut()
-            .map(|opt| opt.take().expect("Egress channel already distributed"))
-            .collect();
-
-        (ingress_batch, egress_batch)
-    }
-}
-
 pub type PoolConstructor = Arc<dyn Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync>;
 
 struct WorkerPrep {
     shared: Arc<ExecutorShared>,
     remote_receiver: std::sync::mpsc::Receiver<crate::runtime::task::Task>,
     pinned_receiver: std::sync::mpsc::Receiver<crate::runtime::task::SpawnedTask>,
-    ingress: Vec<Consumer<crate::runtime::executor::Job>>,
-    egress: Vec<Producer<crate::runtime::executor::Job>>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<crate::runtime::task::harness::Runnable>,
     pool_constructor: PoolConstructor,
@@ -148,11 +84,9 @@ impl RuntimeBuilder {
         let mut states = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
-            states.push(Arc::new(AtomicU8::new(mesh::RUNNING)));
+            states.push(Arc::new(AtomicU8::new(executor::RUNNING)));
         }
         trace!("Initialized {} worker states", worker_count);
-
-        let mut mesh_matrix = MeshMatrix::new(worker_count, &states);
 
         // Pre-allocate peer handles storage (initially 0/invalid)
         let mut peer_handles_storage = Vec::with_capacity(worker_count);
@@ -211,9 +145,6 @@ impl RuntimeBuilder {
             let config_clone = self.config.clone();
             let pool_constructor = pool_constructor.clone();
 
-            // Take ownership of the specific mesh components for this worker
-            let (ingress, egress) = mesh_matrix.take_worker_channels(worker_id);
-
             let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
             let remote_receiver = remote_receivers[worker_id]
                 .take()
@@ -242,13 +173,11 @@ impl RuntimeBuilder {
                     });
 
                 executor = executor.with_registry(registry.clone()); // Inject registry
+                executor = executor.with_id(worker_id); // Set Worker ID
 
                 // Publish Handle
                 let fd = executor.raw_driver_handle();
                 peer_handles_clone[worker_id].store(fd, std::sync::atomic::Ordering::Release);
-
-                // Attach Mesh
-                executor.attach_mesh(worker_id, ingress, egress, peer_handles_clone);
 
                 // Wait for all workers to be ready (handles published)
                 barrier.wait();
@@ -261,7 +190,6 @@ impl RuntimeBuilder {
         }
 
         // Prepare Worker 0
-        let (ingress, egress) = mesh_matrix.take_worker_channels(0);
         let shared = shared_states[0].clone();
         let remote_receiver = remote_receivers[0].take().unwrap();
         let pinned_receiver = pinned_receivers[0].take().unwrap();
@@ -271,8 +199,6 @@ impl RuntimeBuilder {
             shared,
             remote_receiver,
             pinned_receiver,
-            ingress,
-            egress,
             stealable_worker,
             pool_constructor: pool_constructor.clone(),
             config: self.config.clone(),
@@ -372,13 +298,11 @@ impl Runtime {
             });
 
         executor = executor.with_registry(self.registry.clone());
+        executor = executor.with_id(0); // Set Worker ID (Worker 0)
 
         // Publish Handle
         let fd = executor.raw_driver_handle();
         self.peer_handles[0].store(fd, std::sync::atomic::Ordering::Release);
-
-        // Attach Mesh
-        executor.attach_mesh(0, prep.ingress, prep.egress, self.peer_handles.clone());
 
         // Wait for all workers to be ready
         prep.barrier.wait();

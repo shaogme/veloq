@@ -26,7 +26,7 @@ pub trait AsyncBufRead {
 ### 2.2 模块化分层
 `io` 模块采用严格的分层架构：
 *   **顶层 (`io.rs`)**: 定义通用的行为 (Traits) 和入口。
-*   **操作层 (`op.rs`)**: 定义具体的 I/O 意图（如“读取文件”、“连接 Socket”），这些定义是平台无关的。
+*   **操作层 (`op.rs`)**: 定义具体的 I/O 意图（`Op<T>`，如“读取文件”、“连接 Socket”）。这些定义是严格平台无关的数据载体，实现了从意图到执行的解耦。
 *   **资源层 (`socket.rs`, `buffer.rs`)**: 管理 I/O 所需的资源（句柄、内存）。
 *   **驱动层 (`driver.rs`)**: 处理与操作系统的脏活累活，实现 `PlatformOp` 到系统调用的映射。
 
@@ -37,23 +37,36 @@ src/io.rs              // 核心入口，定义 AsyncBufRead/AsyncBufWrite Trait
 src/io/
 ├── buffer.rs          // 内存管理 (FixedBuf, BufPool)
 ├── driver.rs          // 驱动抽象 (Driver Trait, PlatformDriver)
-├── op.rs              // 操作定义 (Op Future, Read, Write...)
+├── op.rs              // 操作定义 (Op<T>, OpSubmitter, Local/Remote Submission)
 └── socket.rs          // Socket/Handle 抽象
 ```
 
 *   **`buffer`**: 提供 `FixedBuf`，这是所有 I/O 操作的数据载体。详见 `docs/src/io/buffer/README.md`。
 *   **`driver`**: 定义 `Driver` trait，这是 Reactor/Proactor 的核心接口。详见 `docs/src/io/driver/README.md`。
-*   **`op`**: 将 `Driver` 的底层能力封装为用户友好的 `Future`。详见 `docs/src/io/socket/README.md`（注：op 文档归档在 socket 下）。
+*   **`op`**: 核心操作抽象。
+    *   **`Op<T>`**: 通用数据载体，表示 I/O 意图。不包含任何驱动/运行时引用。
+    *   **`OpSubmitter`**: 统一提交接口。
+        *   `LocalSubmitter`: 将 `Op` 提交到当前线程的驱动 (`submit_local`)。
+        *   `RemoteSubmitter`: 将 `Op` 注入到远程驱动 (`submit_remote`)。
+    *   **具体操作结构体**: 如 `ReadFixed`, `Connect`, `Open` 等平台无关结构。
 *   **`socket`**: 提供跨平台的句柄封装。
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
-### 4.1 `AsyncBufRead` / `AsyncBufWrite`
+### 4.1 统一的操作提交模型 (`Op<T>`)
+Veloq 的 `Op<T>` 设计实现了**数据**与**执行**的彻底分离。
+*   **构建阶段**: 用户构建一个 `Op::new(ReadFixed { ... })`。此时它只是一个纯数据结构，可以在线程间只有移动。
+*   **提交阶段**:
+    *   **Local**: 使用 `submit_local`。操作由当前线程的 Driver 直接处理，生命周期和结果直接通过 `LocalOp` Future 关联。高性能，无跨线程开销。
+    *   **Remote**: 使用 `submit_remote`。操作被打包并通过 `Injector` 发送到持有资源的 Driver 线程。返回 `RemoteOpFuture`，通过 channel 接收结果。
+这种对偶性（Duality）使得同一个 I/O 逻辑可以无缝运行在 Thread-Per-Core 模型（Local）或 Work-Stealing 模型（Remote）下。
+
+### 4.2 `AsyncBufRead` / `AsyncBufWrite`
 这两个 Trait 是 Veloq I/O 生态的一等公民。
 *   **设计权衡**: 相比于 `AsyncRead` (`poll_read`)，`AsyncBufRead` 对编译器更友好（无需处理复杂的生命周期），但对用户代码有侵入性（需要管理 Buffer 池）。
 *   **返回值**: `(Result<usize>, FixedBuf)`。即使 I/O 失败，缓冲区也必须归还给用户，以便重用或释放。如果设计成只返回 `Result`，那么在错误发生时缓冲区就会泄漏（被 drop 掉），这是不可接受的。
 
-### 4.2 模块重导出
+### 4.3 模块重导出
 `io.rs` 充当了 Facade（门面）：
 ```rust
 pub mod buffer;
