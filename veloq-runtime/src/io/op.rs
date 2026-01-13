@@ -10,7 +10,6 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -342,16 +341,11 @@ pub struct RemoteSubmitter {
 impl RemoteSubmitter {
     pub fn new() -> std::io::Result<Self> {
         let ctx = crate::runtime::context::current();
-        let driver_weak = ctx.driver();
-        let driver_rc = driver_weak.upgrade().ok_or_else(|| {
+        let driver = ctx.driver().upgrade().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Runtime driver dropped")
         })?;
-        let injector = driver_rc.borrow().injector();
+        let injector = driver.borrow().injector();
         Ok(Self { injector })
-    }
-
-    pub fn from_injector(injector: Arc<<PlatformDriver as Driver>::RemoteInjector>) -> Self {
-        Self { injector }
     }
 }
 
