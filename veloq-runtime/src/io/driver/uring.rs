@@ -3,6 +3,7 @@ use io_uring::{IoUring, opcode, squeue};
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
@@ -30,18 +31,23 @@ impl UringOpState {
     }
 }
 
-struct UringWaker(RawFd);
+struct UringWaker {
+    fd: RawFd,
+    is_waked: Arc<AtomicBool>,
+}
 
 impl RemoteWaker for UringWaker {
     fn wake(&self) -> io::Result<()> {
-        let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(self.0, buf.as_ptr() as *const _, 8) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAGAIN) {
-                return Ok(());
+        if !self.is_waked.swap(true, Ordering::SeqCst) {
+            let buf = 1u64.to_ne_bytes();
+            let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, 8) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    return Ok(());
+                }
+                return Err(err);
             }
-            return Err(err);
         }
         Ok(())
     }
@@ -50,7 +56,7 @@ impl RemoteWaker for UringWaker {
 impl Drop for UringWaker {
     fn drop(&mut self) {
         unsafe {
-            libc::close(self.0);
+            libc::close(self.fd);
         }
     }
 }
@@ -58,23 +64,26 @@ impl Drop for UringWaker {
 pub struct UringInjector {
     queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
     waker_fd: RawFd,
+    is_waked: Arc<AtomicBool>,
 }
 
 impl Injector<UringDriver> for UringInjector {
     fn inject(&self, f: Box<dyn FnOnce(&mut UringDriver) + Send>) -> io::Result<()> {
         self.queue.push(f);
         // Wake up driver
-        let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(self.waker_fd, buf.as_ptr() as *const _, 8) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            // EAGAIN is fine, driver is already awake or buffer full (unlikely for eventfd)
-            if err.raw_os_error() == Some(libc::EAGAIN) {
-                return Ok(());
+        if !self.is_waked.swap(true, Ordering::SeqCst) {
+            let buf = 1u64.to_ne_bytes();
+            let ret = unsafe { libc::write(self.waker_fd, buf.as_ptr() as *const _, 8) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                // EAGAIN is fine, driver is already awake or buffer full (unlikely for eventfd)
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    return Ok(());
+                }
+                // If it fails, we still pushed to queue, worst case driver picks it up later?
+                // But we should report error.
+                return Err(err);
             }
-            // If it fails, we still pushed to queue, worst case driver picks it up later?
-            // But we should report error.
-            return Err(err);
         }
         Ok(())
     }
@@ -103,6 +112,7 @@ pub struct UringDriver {
     waker_fd: RawFd,
     waker_token: Option<usize>,
     buffers_registered: bool,
+    is_waked: Arc<AtomicBool>,
 
     // Injector support
     queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
@@ -143,9 +153,11 @@ impl UringDriver {
         debug!("Initalized UringDriver with {} entries", entries);
 
         let queue = Arc::new(SegQueue::new());
+        let is_waked = Arc::new(AtomicBool::new(false));
         let injector = Arc::new(UringInjector {
             queue: queue.clone(),
             waker_fd,
+            is_waked: is_waked.clone(),
         });
 
         let mut driver = Self {
@@ -157,6 +169,7 @@ impl UringDriver {
             waker_fd,
             waker_token: None,
             buffers_registered: false,
+            is_waked,
             queue,
             injector,
         };
@@ -526,6 +539,7 @@ impl UringDriver {
         // We let flush_backlog handle it (it checks cancelled).
     }
     fn process_injected(&mut self) {
+        self.is_waked.store(false, Ordering::SeqCst);
         while let Some(f) = self.queue.pop() {
             f(self);
         }
@@ -711,7 +725,10 @@ impl Driver for UringDriver {
         if new_fd < 0 {
             panic!("Failed to dup waker fd");
         }
-        Arc::new(UringWaker(new_fd))
+        Arc::new(UringWaker {
+            fd: new_fd,
+            is_waked: self.is_waked.clone(),
+        })
     }
 
     fn driver_id(&self) -> usize {
