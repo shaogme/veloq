@@ -36,9 +36,10 @@ impl IoFd {
             Self::Fixed(_) => None,
         }
     }
+}
 
-    /// Creates an IoFd from a raw handle.
-    pub fn from_raw(handle: RawHandle) -> Self {
+impl From<RawHandle> for IoFd {
+    fn from(handle: RawHandle) -> Self {
         Self::Raw(handle)
     }
 }
@@ -226,53 +227,42 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
 
-        match op.state {
-            State::Defined => {
-                let mut driver = op.driver.borrow_mut();
+        if let State::Defined = op.state {
+            let mut driver = op.driver.borrow_mut();
 
-                // Submit to driver
-                let data = op.data.take().expect("Op started without data");
-                let driver_op = data.into_platform_op();
-                let user_data = driver.reserve_op();
-                op.user_data = user_data;
+            // Submit to driver
+            let data = op.data.take().expect("Op started without data");
+            let driver_op = data.into_platform_op();
+            let user_data = driver.reserve_op();
+            op.user_data = user_data;
 
-                // Submit to driver.
-                // Whether Ready or Pending, the op is now owned by the driver.
-                // If Pending, it effectively means "Accepted but queued".
-                // If Err((e, op)), driver rejected it and returned ownership.
-                if let Err((e, val)) = driver.submit(user_data, driver_op) {
-                    // Driver rejected submission and returned the op.
-                    // Recover data and return error immediately.
-                    let data = T::from_platform_op(val);
-                    return Poll::Ready((Err(e), data));
-                }
-
-                op.state = State::Submitted;
-
-                // Register waker immediately by polling the op
-                match driver.poll_op(user_data, cx) {
-                    Poll::Ready((res, driver_op)) => {
-                        op.state = State::Completed;
-                        let data = T::from_platform_op(driver_op);
-                        Poll::Ready((res, data))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
+            // Submit to driver.
+            // Whether Ready or Pending, the op is now owned by the driver.
+            // If Pending, it effectively means "Accepted but queued".
+            // If Err((e, op)), driver rejected it and returned ownership.
+            if let Err((e, val)) = driver.submit(user_data, driver_op) {
+                // Driver rejected submission and returned the op.
+                // Recover data and return error immediately.
+                let data = T::from_platform_op(val);
+                return Poll::Ready((Err(e), data));
             }
-            State::Submitted => {
-                let mut driver = op.driver.borrow_mut();
 
-                match driver.poll_op(op.user_data, cx) {
-                    Poll::Ready((res, driver_op)) => {
-                        op.state = State::Completed;
-                        // Convert resources back to T
-                        let data = T::from_platform_op(driver_op);
-                        Poll::Ready((res, data))
-                    }
-                    Poll::Pending => Poll::Pending,
+            op.state = State::Submitted;
+        }
+
+        if let State::Submitted = op.state {
+            let mut driver = op.driver.borrow_mut();
+
+            match driver.poll_op(op.user_data, cx) {
+                Poll::Ready((res, driver_op)) => {
+                    op.state = State::Completed;
+                    let data = T::from_platform_op(driver_op);
+                    Poll::Ready((res, data))
                 }
+                Poll::Pending => Poll::Pending,
             }
-            State::Completed => panic!("Polled after completion"),
+        } else {
+            panic!("Polled after completion");
         }
     }
 }
