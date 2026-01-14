@@ -34,6 +34,7 @@ Veloq 使用 **Executor Handles**：
 ```
 src/runtime/
 ├── runtime.rs    // Runtime 主入口，包含 Runtime 结构体、RuntimeBuilder 及 Worker 线程启动逻辑
+├── blocking.rs   // 全局阻塞线程池，处理 BlockingTask
 ├── context.rs    // 线程局部上下文 (TLS)，提供 spawn 接口和资源访问 (RuntimeContext)
 ├── task.rs       // Pinned Task 定义，手动实现的 RawWakerVTable
     └── harness.rs // Stealable Task (Runnable) 定义
@@ -79,15 +80,11 @@ Veloq 的任务系统经过了深度优化，分为两类：
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 
-1.  **Blocking IO 支持不足**:
-    目前缺乏一个专用的 `blocking_spawn` 线程池来处理重 CPU 或阻塞系统调用（非 I/O 类）。
-    *TODO*: 引入专用的 Blocking Thread Pool。
-
-2.  **Task Debugging**:
+1.  **Task Debugging**:
     目前的 Task 结构体非常精简，缺乏调试信息。
     *TODO*: 在 Debug 模式下注入追踪信息。
 
-3.  **Local Task 饿死**:
+2.  **Local Task 饿死**:
     虽然有 Budget 机制，但在极端混合场景下（大量 Mesh 消息 + 本地任务），调度策略可能仍需微调。
 
 ## 6. 未来的方向 (Future Directions)

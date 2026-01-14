@@ -49,20 +49,24 @@
 - **核心组件**:
   - **Runtime Core (`src/runtime/`)**:
     - **Runtime (`runtime.rs`)**: 运行时入口，定义 `Runtime` 结构体和组装逻辑。
-    - **Mesh (`mesh.rs`)**: 无锁 SPSC 环形缓冲区，用于 Worker 间通信。使用 `#[repr(align(128))]` 防止伪共享。
-    - **Executor (`executor.rs`)**:
-      - `LocalExecutor`: 线程局部执行器。启动时会自动检测并注册当前线程绑定的 `BufPool`。
-      - **调度**: 实现工作窃取 (Work Stealing) 和 P2C (Power of Two Choices)。
-      - **策略**: Mesh 消息优先，使用 `BUDGET` 防止 I/O 饿死。
-    - **Infrastructure**:
-      - `context.rs`: 线程局部上下文管理。负责维护 `RuntimeContext` 及线程绑定的 `BufPool`（通过 `bind_pool`）。
-      - `task.rs`: 基于 `Rc` 的任务封装，手动实现 `RawWakerVTable`。
+    - **Executor (`src/runtime/executor/`)**:
+      - `LocalExecutor`: 线程局部执行器。管理 `Pinned` (本地/非 Send) 任务和 `Stealable` (通用/Send) 任务的执行。
+      - **调度**: 结合工作窃取 (Work Stealing) 和 P2C (Power of Two Choices)。`Spawner` 利用 `ExecutorRegistry` 进行全局负载均衡。
+      - **队列**: 区分 `pinned_receiver` (本地任务通道), `remote_receiver` (远程任务通道), 和 `stealer`/`injector` (任务窃取队列)。
+    - **Task System (`src/runtime/task/`)**:
+      - **架构分离**: 区分 `Task` (Pinned, `!Send`) 和 `Runnable` (Stealable, `Send`)。
+      - `harness.rs`: 实现 `Runnable` 的原子状态机和调度逻辑 (`HarnessedTask`)。
+      - `spawned.rs`: 定义 `SpawnedTask`，表示待绑定的初始任务状态。
+      - `join.rs`: 提供 `JoinHandle` (Send, 基于 Arc/Atomic) 和 `LocalJoinHandle` (!Send, 基于 Rc/RefCell)。
+    - **Context (`src/runtime/context.rs`)**:
+      - `RuntimeContext`: 线程局部上下文。暴露 `spawn` (全局), `spawn_local` (本地), `spawn_to` (定向) 接口，维护 `ExecutorHandle` 和 `BufPool`。
+    - **Blocking (`src/runtime/blocking.rs`)**:
+      - 全局动态线程池，处理阻塞任务 (`BlockingTask`)。支持闭包 (`Fn`) 和系统阻塞操作 (`SysOp`)。
   - **Driver (`src/io/driver.rs`)**:
     - 平台特定 I/O 的抽象层（Linux 上使用 io_uring，Windows 上使用 IOCP）。
     - **Windows IOCP (`src/io/driver/iocp/`)**:
-      - `IocpDriver` (`iocp.rs`): 核心驱动，管理完成端口 (IOCP)、时间轮和线程池。
+      - `IocpDriver` (`iocp.rs`): 核心驱动，管理完成端口 (IOCP) 和时间轮。
       - `submit.rs`: 处理 I/O 操作的提交，支持原生 IOCP 操作（如 `ReadFile`, `WSASendTo`）和阻塞任务的分流。
-      - `blocking.rs`: 线程池实现，用于处理阻塞文件操作（`Open`, `Close`, `Fsync` 等），通过 `PostQueuedCompletionStatus` 通知完成。
       - `op.rs`: 定义 `IocpOp` 和 VTable，使用 `OVERLAPPED` 结构与内核交互。
       - `ext.rs`: 加载 Winsock 扩展函数指针（如 `ConnectEx`, `AcceptEx`）。
     - **Linux io_uring (`src/io/driver/uring/`)**:
@@ -81,7 +85,7 @@
 - `veloq-wheel/`: 核心时间轮库。
 - `veloq-runtime/`: 异步运行时。
   - `src/io/`: I/O 驱动和缓冲区管理。
-  - `src/runtime/`: 任务执行、调度逻辑及 Mesh 网络。
+  - `src/runtime/`: 任务执行、调度逻辑及下层 Context 管理。
 
 ## 工具使用说明 (Tool Usage Guidelines)
 

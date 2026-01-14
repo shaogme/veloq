@@ -9,9 +9,10 @@
 1.  **LocalExecutor** (`executor.rs`): 运行在每个 Worker 线程上的主循环，负责驱动 I/O、处理队列和任务窃取。
 2.  **Runtime & Spawning** (`runtime.rs` / `spawner.rs`): 负责线程的生命周期管理和任务分发策略。
 
-为了实现这一目标，执行器将任务明确划分为两类：
+为了实现这一目标，执行器支持三种类型的任务执行：
 1.  **Pinned Tasks (绑定任务)**: 必须在特定线程运行的任务（如 `spawn_local`）。由 `task.rs` 定义的 `Task`。
 2.  **Stealable Tasks (可窃取任务)**: 实现了 `Send`，可以在任意线程运行的任务（通过 `spawn` 创建）。由 `runtime/task/harness.rs` 定义的 `Runnable`。
+3.  **Blocking Tasks (阻塞任务)**: 长时间运行的 CPU 密集型任务或同步 I/O 任务。由 `runtime/blocking.rs` 的全局线程池处理。
 
 ## 2. 理念和思路 (Philosophy and Design)
 
