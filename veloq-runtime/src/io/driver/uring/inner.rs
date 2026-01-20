@@ -1,13 +1,11 @@
 use crate::io::driver::op_registry::{OpEntry, OpRegistry};
+use crate::io::driver::{DetachedCompleter, RemoteWaker};
 use io_uring::{IoUring, opcode, squeue};
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
-use crossbeam_queue::SegQueue;
 
 use tracing::{debug, trace};
 
@@ -18,7 +16,7 @@ use crate::io::op::IntoPlatformOp;
 pub struct UringOpState {
     pub submitted: bool,
     pub next: Option<usize>,
-    pub remote_completer: Option<Box<dyn RemoteCompleter<UringOp>>>,
+    pub detached_completer: Option<Box<dyn DetachedCompleter<UringOp>>>,
 }
 
 impl UringOpState {
@@ -57,34 +55,6 @@ impl Drop for UringWaker {
     }
 }
 
-pub struct UringInjector {
-    queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
-    waker_fd: RawFd,
-    is_waked: Arc<AtomicBool>,
-}
-
-impl Injector<UringDriver> for UringInjector {
-    fn inject(&self, f: Box<dyn FnOnce(&mut UringDriver) + Send>) -> io::Result<()> {
-        self.queue.push(f);
-        // Wake up driver
-        if !self.is_waked.swap(true, Ordering::SeqCst) {
-            let buf = 1u64.to_ne_bytes();
-            let ret = unsafe { libc::write(self.waker_fd, buf.as_ptr() as *const _, 8) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                // EAGAIN is fine, driver is already awake or buffer full (unlikely for eventfd)
-                if err.raw_os_error() == Some(libc::EAGAIN) {
-                    return Ok(());
-                }
-                // If it fails, we still pushed to queue, worst case driver picks it up later?
-                // But we should report error.
-                return Err(err);
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Special user_data value for cancel operations.
 /// We use u64::MAX - 1 because u64::MAX is already reserved.
 /// CQEs with this user_data are ignored (they're just confirmations that cancel was submitted).
@@ -109,10 +79,6 @@ pub struct UringDriver {
     pub(crate) waker_token: Option<usize>,
     pub(crate) buffers_registered: bool,
     pub(crate) is_waked: Arc<AtomicBool>,
-
-    // Injector support
-    pub(crate) queue: Arc<SegQueue<Box<dyn FnOnce(&mut UringDriver) + Send>>>,
-    pub(crate) injector: Arc<UringInjector>,
 }
 
 impl UringDriver {
@@ -148,13 +114,7 @@ impl UringDriver {
 
         debug!("Initalized UringDriver with {} entries", entries);
 
-        let queue = Arc::new(SegQueue::new());
         let is_waked = Arc::new(AtomicBool::new(false));
-        let injector = Arc::new(UringInjector {
-            queue: queue.clone(),
-            waker_fd,
-            is_waked: is_waked.clone(),
-        });
 
         let mut driver = Self {
             ring,
@@ -166,8 +126,6 @@ impl UringDriver {
             waker_token: None,
             buffers_registered: false,
             is_waked,
-            queue,
-            injector,
         };
 
         driver.submit_waker();
@@ -249,7 +207,6 @@ impl UringDriver {
 
         self.ring.submit_and_wait(1)?;
         self.process_completions_internal();
-        self.process_injected();
 
         // After wait (which implies submit), we might have space
         self.flush_cancellations();
@@ -296,8 +253,8 @@ impl UringDriver {
                     if op.cancelled {
                         self.ops.remove(user_data);
                     } else {
-                        // Check if it has a remote completer
-                        if let Some(completer) = op.platform_data.remote_completer.take() {
+                        // Check if it has a detached completer
+                        if let Some(completer) = op.platform_data.detached_completer.take() {
                             // Must take resources
                             if let Some(res_op) = op.resources.take() {
                                 completer.complete(res, res_op);
@@ -316,6 +273,7 @@ impl UringDriver {
         }
 
         if needs_waker_resubmit {
+            self.is_waked.store(false, Ordering::SeqCst);
             if let Some(token) = self.waker_token.take() {
                 self.ops.remove(token);
             }
@@ -533,13 +491,6 @@ impl UringDriver {
         }
         // Remove from backlog if present? O(N).
         // We let flush_backlog handle it (it checks cancelled).
-    }
-
-    pub(crate) fn process_injected(&mut self) {
-        self.is_waked.store(false, Ordering::SeqCst);
-        while let Some(f) = self.queue.pop() {
-            f(self);
-        }
     }
 }
 

@@ -3,10 +3,9 @@ use super::op::{IocpOp, OverlappedEntry};
 use super::rio::RioState;
 use super::submit;
 use crate::io::driver::op_registry::OpRegistry;
-use crate::io::driver::{Injector, RemoteCompleter, RemoteWaker};
+use crate::io::driver::{DetachedCompleter, RemoteWaker};
 
 use std::io;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, trace};
 
@@ -22,39 +21,12 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
 pub(crate) const WAKEUP_USER_DATA: usize = usize::MAX;
-pub(crate) const RUN_CLOSURE_KEY: usize = usize::MAX - 2;
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
-
-pub struct IocpInjector {
-    port: HANDLE,
-}
-
-unsafe impl Send for IocpInjector {}
-unsafe impl Sync for IocpInjector {}
-
-impl Injector<IocpDriver> for IocpInjector {
-    fn inject(&self, f: Box<dyn FnOnce(&mut IocpDriver) + Send>) -> std::io::Result<()> {
-        let ptr = Box::into_raw(Box::new(f));
-        let res =
-            unsafe { PostQueuedCompletionStatus(self.port, 0, RUN_CLOSURE_KEY, ptr as *mut _) };
-        if res == 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::error!(
-                ?err,
-                "IocpInjector::inject failed to PostQueuedCompletionStatus"
-            );
-            // Restore box to drop it
-            let _ = unsafe { Box::from_raw(ptr) };
-            return Err(err);
-        }
-        Ok(())
-    }
-}
 
 pub enum PlatformData {
     Timer(TaskId),
     Background,
-    Remote(Box<dyn RemoteCompleter<IocpOp>>),
+    Detached(Box<dyn DetachedCompleter<IocpOp>>),
     None,
 }
 
@@ -67,7 +39,6 @@ pub struct IocpDriver {
     pub(crate) wheel: Wheel<usize>,
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
-    pub(crate) injector: Arc<IocpInjector>,
 
     // RIO Support (Decoupled)
     pub(crate) rio_state: Option<RioState>,
@@ -149,7 +120,6 @@ impl IocpDriver {
             wheel: Wheel::new(WheelConfig::default()),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
-            injector: Arc::new(IocpInjector { port }),
             rio_state,
         })
     }
@@ -197,17 +167,7 @@ impl IocpDriver {
         }
 
         // Determine user_data from overlapped or completion_key
-        let user_data = if completion_key == RUN_CLOSURE_KEY {
-            trace!("Received RUN_CLOSURE_KEY");
-            // Execute closure
-            if !overlapped.is_null() {
-                let f = unsafe {
-                    Box::from_raw(overlapped as *mut Box<dyn FnOnce(&mut IocpDriver) + Send>)
-                };
-                f(self);
-            }
-            return Ok(());
-        } else if completion_key == RIO_EVENT_KEY {
+        let user_data = if completion_key == RIO_EVENT_KEY {
             // RIO event is triggered. Process RIO CQ.
             if let Some(rio) = &mut self.rio_state {
                 return rio.process_completions(&mut self.ops, &self.extensions);
@@ -238,7 +198,7 @@ impl IocpDriver {
                 let entry = self.ops.remove(user_data);
 
                 // If it was a remote op, we must complete it (with error) so the waiter doesn't panic
-                if let PlatformData::Remote(completer) = entry.platform_data {
+                if let PlatformData::Detached(completer) = entry.platform_data {
                     if let Some(op) = entry.resources {
                         completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
                     }
@@ -256,10 +216,10 @@ impl IocpDriver {
                     self.ops.remove(user_data);
                     return Ok(());
                 }
-                PlatformData::Remote(_) => {
+                PlatformData::Detached(_) => {
                     // We need to move the completer out
                     let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
-                    if let PlatformData::Remote(completer) = data {
+                    if let PlatformData::Detached(completer) = data {
                         // We must take the resources (op) out
                         let resources = op_entry.resources.take();
                         if let Some(mut iocp_op) = resources {
@@ -362,7 +322,7 @@ impl IocpDriver {
                 PlatformData::Background => {
                     // Should not happen for cancel_op usually, but same logic
                 }
-                PlatformData::None | PlatformData::Remote(_) => {
+                PlatformData::None | PlatformData::Detached(_) => {
                     // Try to CancelIoEx if resources exist
                     if let Some(res) = &mut op.resources
                         && let Some(fd) = res.get_fd()
@@ -514,9 +474,9 @@ impl Drop for IocpDriver {
         // Complete any remaining remote ops to avoid panics in their waiters.
         // During shutdown, we must ensure all RemoteOps return their resources.
         for (_user_data, op_entry) in self.ops.iter_mut() {
-            if let PlatformData::Remote(_) = op_entry.platform_data {
+            if let PlatformData::Detached(_) = op_entry.platform_data {
                 let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
-                if let PlatformData::Remote(completer) = data {
+                if let PlatformData::Detached(completer) = data {
                     if let Some(op) = op_entry.resources.take() {
                         completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
                     }

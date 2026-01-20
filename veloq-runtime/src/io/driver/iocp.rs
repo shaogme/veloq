@@ -8,23 +8,18 @@ mod submit;
 mod tests;
 
 use crate::io::driver::op_registry::OpEntry;
-use crate::io::driver::{Driver, RemoteCompleter, RemoteWaker};
+use crate::io::driver::{DetachedCompleter, Driver, RemoteWaker};
 use std::io;
 use std::task::{Context, Poll};
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
 
-pub use inner::{IocpDriver, IocpInjector, PlatformData};
+pub use inner::{IocpDriver, PlatformData};
 use op::IocpOp;
 use submit::SubmissionResult;
 
 impl Driver for IocpDriver {
     type Op = IocpOp;
-    type RemoteInjector = IocpInjector;
-
-    fn injector(&self) -> std::sync::Arc<Self::RemoteInjector> {
-        self.injector.clone()
-    }
 
     fn reserve_op(&mut self) -> usize {
         let old_pages = self.ops.page_count();
@@ -41,13 +36,13 @@ impl Driver for IocpDriver {
         user_data
     }
 
-    fn attach_remote_completer(
+    fn attach_detached_completer(
         &mut self,
         user_data: usize,
-        completer: Box<dyn RemoteCompleter<Self::Op>>,
+        completer: Box<dyn DetachedCompleter<Self::Op>>,
     ) {
         if let Some(op) = self.ops.get_mut(user_data) {
-            op.platform_data = PlatformData::Remote(completer);
+            op.platform_data = PlatformData::Detached(completer);
         }
     }
 
@@ -112,20 +107,20 @@ impl Driver for IocpDriver {
             }
         }
 
-        // Check if we need to complete a Remote op synchronously (e.g. if submit failed)
-        let should_complete_remote = if let Some(op) = self.ops.get_mut(user_data) {
-            op.result.is_some() && matches!(op.platform_data, PlatformData::Remote(_))
+        // Check if we need to complete a Detached op synchronously (e.g. if submit failed)
+        let should_complete_detached = if let Some(op) = self.ops.get_mut(user_data) {
+            op.result.is_some() && matches!(op.platform_data, PlatformData::Detached(_))
         } else {
             false
         };
 
-        if should_complete_remote {
+        if should_complete_detached {
             let mut entry = self.ops.remove(user_data);
             // Extract result
             let result = entry.result.take().unwrap_or(Ok(0));
 
             // Extract completer
-            if let PlatformData::Remote(completer) = entry.platform_data {
+            if let PlatformData::Detached(completer) = entry.platform_data {
                 // Extract resources
                 if let Some(iocp_op) = entry.resources {
                     completer.complete(result, iocp_op);

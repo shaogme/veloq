@@ -8,19 +8,14 @@ mod inner;
 pub mod op;
 pub mod submit;
 
-pub use inner::{UringDriver, UringInjector, UringOpState};
+pub use inner::{UringDriver, UringOpState};
 
-use crate::io::driver::{Driver, RemoteCompleter, RemoteWaker};
+use crate::io::driver::{DetachedCompleter, Driver, RemoteWaker};
 use inner::UringWaker;
 use op::UringOp;
 
 impl Driver for UringDriver {
     type Op = UringOp;
-    type RemoteInjector = UringInjector;
-
-    fn injector(&self) -> Arc<Self::RemoteInjector> {
-        self.injector.clone()
-    }
 
     fn reserve_op(&mut self) -> usize {
         let id = self.ops.insert(OpEntry::new(None, UringOpState::new()));
@@ -28,13 +23,13 @@ impl Driver for UringDriver {
         id
     }
 
-    fn attach_remote_completer(
+    fn attach_detached_completer(
         &mut self,
         user_data: usize,
-        completer: Box<dyn RemoteCompleter<Self::Op>>,
+        completer: Box<dyn DetachedCompleter<Self::Op>>,
     ) {
         if let Some(entry) = self.ops.get_mut(user_data) {
-            entry.platform_data.remote_completer = Some(completer);
+            entry.platform_data.detached_completer = Some(completer);
         }
     }
 
@@ -128,13 +123,11 @@ impl Driver for UringDriver {
         // self.wait() calls inherent method defined in inner.rs (and imported via Deref? No re-exported struct impl)
         // Rust structs have inherent methods. inner.rs defines them.
         UringDriver::wait(self)?;
-        self.process_injected();
         Ok(())
     }
 
     fn process_completions(&mut self) {
         self.process_completions_internal();
-        self.process_injected();
         self.flush_cancellations();
         self.flush_backlog();
     }

@@ -1,6 +1,6 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::op::{
-    Connect, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, RemoteSubmitter, SendTo,
+    Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, SendTo,
     WriteFixed,
 };
 use crate::io::socket::Socket;
@@ -18,7 +18,7 @@ pub struct GenericUdpSocket<S: OpSubmitter> {
 }
 
 pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter>;
-pub type UdpSocket = GenericUdpSocket<RemoteSubmitter>;
+pub type UdpSocket = GenericUdpSocket<DetachedSubmitter>;
 
 // ============================================================================
 // Constructors
@@ -54,7 +54,7 @@ impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         Ok(Self {
             inner: bind_inner(addr)?,
-            submitter: RemoteSubmitter::new()?,
+            submitter: DetachedSubmitter::new()?,
         })
     }
 }

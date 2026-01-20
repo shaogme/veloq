@@ -105,8 +105,9 @@ impl<T> Op<T> {
         Self { data }
     }
 
-    /// Submit this operation to a remote IO driver via injector.
-    pub fn submit_remote<D>(self, injector: &std::sync::Arc<D::RemoteInjector>) -> RemoteOpFuture<T>
+    /// Submit this operation manually to a specific driver instance.
+    /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOpFuture<T>
     where
         T: IntoPlatformOp<D> + std::marker::Send + 'static,
         D: Driver,
@@ -114,42 +115,35 @@ impl<T> Op<T> {
         let (tx, rx) = veloq_sync::oneshot::channel();
         let data = self.data;
 
-        trace!("Submitting remote op");
+        trace!("Submitting detached op");
 
-        let closure = Box::new(move |driver: &mut D| {
-            let op_platform = data.into_platform_op();
-            let user_data = driver.reserve_op();
+        let op_platform = data.into_platform_op();
+        let user_data = driver.reserve_op();
 
-            let completer = Box::new(GenericCompleter {
-                tx,
-                _phantom: std::marker::PhantomData,
-            });
-            driver.attach_remote_completer(user_data, completer);
-
-            if let Err((_e, _op)) = driver.submit(user_data, op_platform) {
-                // Error handling: if submit fails, we can't easily return error via tx
-                // as completer is already attached.
-                // We log failure or ignore (driver might handle it).
-            }
+        let completer = Box::new(GenericCompleter {
+            tx,
+            _phantom: std::marker::PhantomData,
         });
+        driver.attach_detached_completer(user_data, completer);
 
-        if let Err(e) = injector.inject(closure) {
-            let error_code = e.raw_os_error().unwrap_or(0);
-            panic!("Remote injection failed: {} (code: {})", e, error_code);
+        if let Err((_e, _op)) = driver.submit(user_data, op_platform) {
+            // Error handling: if submit fails, we can't easily return error via tx
+            // as completer is already attached.
+            // We log failure or ignore (driver might handle it).
         }
 
-        RemoteOpFuture { rx }
+        DetachedOpFuture { rx }
     }
 }
 
-use crate::io::driver::{Injector, RemoteCompleter};
+use crate::io::driver::DetachedCompleter;
 
 struct GenericCompleter<T, D> {
     tx: veloq_sync::oneshot::Sender<(std::io::Result<usize>, T)>,
     _phantom: std::marker::PhantomData<fn() -> D>,
 }
 
-impl<T, D> RemoteCompleter<D::Op> for GenericCompleter<T, D>
+impl<T, D> DetachedCompleter<D::Op> for GenericCompleter<T, D>
 where
     D: Driver,
     T: IntoPlatformOp<D> + std::marker::Send,
@@ -160,11 +154,11 @@ where
     }
 }
 
-pub struct RemoteOpFuture<T> {
+pub struct DetachedOpFuture<T> {
     rx: veloq_sync::oneshot::Receiver<(std::io::Result<usize>, T)>,
 }
 
-impl<T> Future for RemoteOpFuture<T> {
+impl<T> Future for DetachedOpFuture<T> {
     type Output = (std::io::Result<usize>, T);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -172,7 +166,7 @@ impl<T> Future for RemoteOpFuture<T> {
             Poll::Ready(Ok(res)) => Poll::Ready(res),
             Poll::Ready(Err(_)) => {
                 // Panic is safer than returning invalid data
-                panic!("Remote driver dropped operation");
+                panic!("Detached driver dropped operation");
             }
             Poll::Pending => Poll::Pending,
         }
@@ -325,34 +319,32 @@ impl OpSubmitter for LocalSubmitter {
 }
 
 // ============================================================================
-// RemoteSubmitter
+// DetachedSubmitter
 // ============================================================================
 
-#[derive(Clone)]
-pub struct RemoteSubmitter {
-    injector: std::sync::Arc<<PlatformDriver as Driver>::RemoteInjector>,
-}
+#[derive(Clone, Copy)]
+pub struct DetachedSubmitter;
 
-impl RemoteSubmitter {
+impl DetachedSubmitter {
     pub fn new() -> std::io::Result<Self> {
-        let ctx = crate::runtime::context::current();
-        let driver = ctx.driver().upgrade().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Runtime driver dropped")
-        })?;
-        let injector = driver.borrow().injector();
-        Ok(Self { injector })
+        Ok(Self)
     }
 }
 
-impl OpSubmitter for RemoteSubmitter {
+impl OpSubmitter for DetachedSubmitter {
     type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
-        RemoteOpFuture<T>;
+        DetachedOpFuture<T>;
 
     fn submit<T>(&self, op: Op<T>) -> Self::Future<T>
     where
         T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
     {
-        op.submit_remote::<PlatformDriver>(&self.injector)
+        let driver = crate::runtime::context::current()
+            .driver()
+            .upgrade()
+            .expect("Driver dropped");
+
+        op.submit_detached(&mut *driver.borrow_mut())
     }
 
     fn from_current_context() -> std::io::Result<Self> {

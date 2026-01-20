@@ -21,11 +21,11 @@ pub trait Driver: 'static {
     fn submit(&mut self, user_data: usize, op: Self::Op)
     -> Result<Poll<()>, (io::Error, Self::Op)>;
 
-    /// Attach a remote completer to an operation.
-    fn attach_remote_completer(
+    /// Attach a detached completer to an operation.
+    fn attach_detached_completer(
         &mut self,
         user_data: usize,
-        completer: Box<dyn RemoteCompleter<Self::Op>>,
+        completer: Box<dyn DetachedCompleter<Self::Op>>,
     );
 
     /// Poll operation status.
@@ -79,12 +79,6 @@ pub trait Driver: 'static {
     /// Create a thread-safe waker.
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
-    /// Typed injector for this driver
-    type RemoteInjector: Injector<Self>;
-
-    /// Get the injector for this driver
-    fn injector(&self) -> std::sync::Arc<Self::RemoteInjector>;
-
     /// Get the unique identifier of the driver.
     fn driver_id(&self) -> usize;
 }
@@ -93,16 +87,10 @@ pub trait RemoteWaker: Send + Sync {
     fn wake(&self) -> io::Result<()>;
 }
 
-/// A trait for processing remote completion logic.
+/// A trait for processing detached completion logic.
 /// This allows the driver to pass ownership of the platform specific op back to the submitter.
-pub trait RemoteCompleter<Op>: Send {
+pub trait DetachedCompleter<Op>: Send {
     fn complete(self: Box<Self>, res: io::Result<usize>, op: Op);
-}
-
-/// A trait for injecting efficient closures into the driver's thread.
-pub trait Injector<D: Driver + ?Sized>: Send + Sync {
-    /// Injects a closure to be executed in the driver's event loop.
-    fn inject(&self, f: Box<dyn FnOnce(&mut D) + Send>) -> io::Result<()>;
 }
 
 // Platform-specific driver implementations

@@ -1,7 +1,7 @@
 use crate::io::buffer::FixedBuf;
 use crate::io::op::{
-    Accept, Connect, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, ReadFixed,
-    RemoteSubmitter, WriteFixed,
+    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter,
+    ReadFixed, WriteFixed,
 };
 use crate::io::socket::Socket;
 use crate::net::common::InnerSocket;
@@ -25,8 +25,8 @@ pub struct GenericTcpStream<S: OpSubmitter> {
 pub type LocalTcpListener = GenericTcpListener<LocalSubmitter>;
 pub type LocalTcpStream = GenericTcpStream<LocalSubmitter>;
 
-pub type TcpListener = GenericTcpListener<RemoteSubmitter>;
-pub type TcpStream = GenericTcpStream<RemoteSubmitter>;
+pub type TcpListener = GenericTcpListener<DetachedSubmitter>;
+pub type TcpStream = GenericTcpStream<DetachedSubmitter>;
 
 // ============================================================================
 // Constructors and Helpers

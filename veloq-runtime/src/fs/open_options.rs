@@ -119,17 +119,14 @@ impl OpenOptions {
 
     /// Open the file with shared submission support (Send, capable of being offloaded).
     pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
-        // 1. 构造 Op
+        // 构造 Op
         let op = self.build_op(path.as_ref())?;
 
-        // 2. 使用 RemoteSubmitter 提交
-        // 注意：RemoteSubmitter::new() 必须在 Runtime 环境下调用，它会捕获当前线程的 Injector。
-        // 这确保了 Open 操作被分发回“最初调用线程”的 Driver 执行（如果那是 Remote 的逻辑），
-        // 或者至少我们持有正确的 Injector 供 File 后续使用。
-        use crate::io::op::{Op, RemoteSubmitter};
+        // 使用 DetachedSubmitter 提交
+        use crate::io::op::{DetachedSubmitter, Op};
 
         // 捕获 SubmitContext (Injector)
-        let submitter = RemoteSubmitter::new()?;
+        let submitter = DetachedSubmitter::new()?;
 
         // 提交执行 (Result, Op) — Op 的所有权被返还
         let (res, _) = submitter.submit(Op::new(op)).await;

@@ -2,7 +2,7 @@ use super::open_options::OpenOptions;
 use crate::io::RawHandle;
 use crate::io::buffer::FixedBuf;
 use crate::io::op::{
-    Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RemoteSubmitter,
+    DetachedSubmitter, Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed,
     SyncFileRange, WriteFixed,
 };
 
@@ -93,7 +93,7 @@ pub struct GenericFile<S: OpSubmitter, P: FilePos> {
 }
 
 pub type LocalFile = GenericFile<LocalSubmitter, Cell<u64>>;
-pub type File = GenericFile<RemoteSubmitter, AtomicU64>;
+pub type File = GenericFile<DetachedSubmitter, AtomicU64>;
 
 pub struct SyncRangeBuilder<'a, S: OpSubmitter, P: FilePos> {
     file: &'a GenericFile<S, P>,
