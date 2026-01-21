@@ -1040,6 +1040,7 @@ dependencies = [
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
+ "atomic-waker",
  "criterion",
  "crossbeam-deque",
  "crossbeam-queue",

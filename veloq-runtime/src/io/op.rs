@@ -7,11 +7,16 @@
 //! - `io/driver/uring/op.rs` for Linux io_uring
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
+use std::cell::UnsafeCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+
+use atomic_waker::AtomicWaker;
 
 use tracing::trace;
 
@@ -112,7 +117,7 @@ impl<T> Op<T> {
         T: IntoPlatformOp<D> + std::marker::Send + 'static,
         D: Driver,
     {
-        let (tx, rx) = veloq_sync::oneshot::channel();
+        let state = Arc::new(DetachedState::new());
         let data = self.data;
 
         trace!("Submitting detached op");
@@ -121,25 +126,48 @@ impl<T> Op<T> {
         let user_data = driver.reserve_op();
 
         let completer = Box::new(GenericCompleter {
-            tx,
+            state: state.clone(),
             _phantom: std::marker::PhantomData,
         });
         driver.attach_detached_completer(user_data, completer);
 
         if let Err((_e, _op)) = driver.submit(user_data, op_platform) {
-            // Error handling: if submit fails, we can't easily return error via tx
+            // Error handling: if submit fails, we can't easily return error via state
             // as completer is already attached.
             // We log failure or ignore (driver might handle it).
         }
 
-        DetachedOpFuture { rx }
+        DetachedOpFuture { state }
     }
 }
 
 use crate::io::driver::DetachedCompleter;
 
+const STATE_WAITING: u8 = 0;
+const STATE_READY: u8 = 1;
+const STATE_CLOSED: u8 = 2;
+
+struct DetachedState<T> {
+    status: AtomicU8,
+    waker: AtomicWaker,
+    data: UnsafeCell<Option<(std::io::Result<usize>, T)>>,
+}
+
+unsafe impl<T: std::marker::Send> std::marker::Send for DetachedState<T> {}
+unsafe impl<T: std::marker::Send> std::marker::Sync for DetachedState<T> {}
+
+impl<T> DetachedState<T> {
+    fn new() -> Self {
+        Self {
+            status: AtomicU8::new(STATE_WAITING),
+            waker: AtomicWaker::new(),
+            data: UnsafeCell::new(None),
+        }
+    }
+}
+
 struct GenericCompleter<T, D> {
-    tx: veloq_sync::oneshot::Sender<(std::io::Result<usize>, T)>,
+    state: Arc<DetachedState<T>>,
     _phantom: std::marker::PhantomData<fn() -> D>,
 }
 
@@ -150,25 +178,50 @@ where
 {
     fn complete(self: Box<Self>, res: std::io::Result<usize>, op: D::Op) {
         let data = T::from_platform_op(op);
-        let _ = self.tx.send((res, data));
+        // SAFETY: WAITING -> READY transition guarantees exclusive access to data cell.
+        // We own the Box<Self>, so we are the specific completer execution.
+        unsafe {
+            *self.state.data.get() = Some((res, data));
+        }
+        self.state.status.store(STATE_READY, Ordering::Release);
+        self.state.waker.wake();
+    }
+}
+
+impl<T, D> Drop for GenericCompleter<T, D> {
+    fn drop(&mut self) {
+        // If we are dropped while still in WAITING state, it means completion didn't happen.
+        // We must transition to CLOSED to let the Future know it will never complete.
+        if self.state.status.load(Ordering::Acquire) == STATE_WAITING {
+            self.state.status.store(STATE_CLOSED, Ordering::Release);
+            self.state.waker.wake();
+        }
     }
 }
 
 pub struct DetachedOpFuture<T> {
-    rx: veloq_sync::oneshot::Receiver<(std::io::Result<usize>, T)>,
+    state: Arc<DetachedState<T>>,
 }
 
 impl<T> Future for DetachedOpFuture<T> {
     type Output = (std::io::Result<usize>, T);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(res)) => Poll::Ready(res),
-            Poll::Ready(Err(_)) => {
-                // Panic is safer than returning invalid data
-                panic!("Detached driver dropped operation");
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.state.waker.register(cx.waker());
+        match self.state.status.load(Ordering::Acquire) {
+            STATE_READY => {
+                let data = unsafe {
+                    (*self.state.data.get())
+                        .take()
+                        .expect("Data missing in READY state")
+                };
+                Poll::Ready(data)
             }
-            Poll::Pending => Poll::Pending,
+            STATE_CLOSED => {
+                panic!("Detached driver dropped operation without completion");
+            }
+            STATE_WAITING => Poll::Pending,
+            _ => unreachable!("Invalid state"),
         }
     }
 }
