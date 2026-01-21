@@ -637,13 +637,4 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
         let mut driver = driver_rc.borrow_mut();
         driver.register_buffer_regions(regions)
     }
-
-    fn driver_id(&self) -> usize {
-        if let Some(driver_rc) = self.driver.upgrade() {
-            driver_rc.borrow().driver_id()
-        } else {
-            // If driver is dead, ID doesn't matter
-            0
-        }
-    }
 }

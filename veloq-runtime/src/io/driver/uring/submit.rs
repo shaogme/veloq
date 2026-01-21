@@ -68,14 +68,13 @@ macro_rules! impl_default_completion {
 
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver_id: usize) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
             let buf_index = rw_op.buf.buf_index();
             let ptr = rw_op.buf.as_mut_ptr();
             let len = rw_op.buf.capacity() as u32;
 
-            let use_fixed =
-                buf_index != NO_REGISTRATION_INDEX && rw_op.buf.registry_id() == driver_id;
+            let use_fixed = buf_index != NO_REGISTRATION_INDEX;
 
             if !use_fixed {
                 match rw_op.fd {
@@ -99,14 +98,13 @@ macro_rules! make_rw_fixed {
         }
     };
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path, write) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver_id: usize) -> squeue::Entry {
+        pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
             let buf_index = rw_op.buf.buf_index();
             let ptr = rw_op.buf.as_slice().as_ptr();
             let len = rw_op.buf.len() as u32;
 
-            let use_fixed =
-                buf_index != NO_REGISTRATION_INDEX && rw_op.buf.registry_id() == driver_id;
+            let use_fixed = buf_index != NO_REGISTRATION_INDEX;
 
             if !use_fixed {
                 match rw_op.fd {

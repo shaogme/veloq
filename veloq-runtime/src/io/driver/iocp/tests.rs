@@ -216,9 +216,6 @@ fn test_iocp_recv_with_buffer_pool() {
         ) -> std::io::Result<Vec<usize>> {
             self.driver.borrow_mut().register_buffer_regions(regions)
         }
-        fn driver_id(&self) -> usize {
-            0
-        }
     }
 
     let registrar = Box::new(LegacyDriverRegistrar {
