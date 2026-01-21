@@ -18,6 +18,7 @@ use tracing::{debug, trace};
 use crate::config::Config;
 use crate::io::buffer::{AnyBufPool, BuddyPool, BufferRegistrar, RegisteredPool};
 use crate::io::driver::RemoteWaker;
+use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::task::harness::Runnable;
@@ -74,6 +75,9 @@ impl RuntimeBuilder {
                 "Worker count must be > 0",
             ));
         }
+
+        // Initialize the blocking pool
+        init_blocking_pool(self.config.blocking_pool.clone());
 
         // Default Pool Constructor
         let pool_constructor = self.pool_constructor.unwrap_or_else(|| {

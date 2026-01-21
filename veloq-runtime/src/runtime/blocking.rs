@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use crate::config::BlockingPoolConfig;
 use crate::io::op::SysBlockingOps;
 
 #[derive(Debug)]
@@ -35,19 +36,22 @@ impl BlockingTask {
 
 pub static BLOCKING_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
+/// Initialize the blocking pool with the given config
+pub fn init_blocking_pool(config: BlockingPoolConfig) -> &'static ThreadPool {
+    BLOCKING_POOL.get_or_init(|| {
+        ThreadPool::new(
+            config.core_threads,
+            config.max_threads,
+            config.queue_capacity,
+            config.keep_alive,
+        )
+    })
+}
+
 /// Get the global blocking thread pool instance.
 /// Initializes it if it hasn't been initialized yet.
 pub fn get_blocking_pool() -> &'static ThreadPool {
-    BLOCKING_POOL.get_or_init(|| {
-        // TODO: Make these configurable via Config/Builder if possible,
-        // but for a static global, generic defaults or environment variables are common.
-        ThreadPool::new(
-            16,                      // Core threads
-            512,                     // Max threads (shared global pool needs higher limit)
-            10000,                   // Queue capacity
-            Duration::from_secs(30), // Keep alive
-        )
-    })
+    BLOCKING_POOL.get().expect("Blocking pool not initialized")
 }
 
 struct PoolState {
