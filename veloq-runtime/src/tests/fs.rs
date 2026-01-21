@@ -92,10 +92,7 @@ fn test_multithread_file_ops() {
     const NUM_WORKERS: usize = 3;
 
     let runtime = Runtime::builder()
-        .config(crate::config::Config {
-            worker_threads: Some(NUM_WORKERS),
-            ..Default::default()
-        })
+        .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
         .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();

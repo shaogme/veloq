@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 /// I/O Driver Operation Mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl Default for BlockingPoolConfig {
 pub struct Config {
     pub uring: UringConfig,
     pub iocp: IocpConfig,
-    pub worker_threads: Option<usize>,
+    pub worker_threads: Option<NonZeroUsize>,
     pub direct_io: bool,
     pub blocking_pool: BlockingPoolConfig,
     pub internal_queue_capacity: usize,
@@ -98,7 +98,10 @@ impl Config {
 
     pub fn worker_threads(self, worker_threads: usize) -> Self {
         Self {
-            worker_threads: Some(worker_threads),
+            worker_threads: Some(
+                NonZeroUsize::new(worker_threads)
+                    .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
+            ),
             ..self
         }
     }

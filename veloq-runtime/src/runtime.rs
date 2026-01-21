@@ -5,7 +5,6 @@ pub mod join;
 pub mod task;
 
 use std::future::Future;
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
@@ -67,14 +66,12 @@ impl RuntimeBuilder {
     }
 
     pub fn build(self) -> std::io::Result<Runtime> {
-        let worker_count = self.config.worker_threads.unwrap_or_else(num_cpus::get);
+        let worker_count = self
+            .config
+            .worker_threads
+            .map(|w| w.get())
+            .unwrap_or(num_cpus::get());
         debug!("Building Runtime with {} workers", worker_count);
-        if worker_count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Worker count must be > 0",
-            ));
-        }
 
         // Initialize the blocking pool
         init_blocking_pool(self.config.blocking_pool.clone());

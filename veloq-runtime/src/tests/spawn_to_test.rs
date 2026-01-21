@@ -7,10 +7,7 @@ fn current_worker_id() -> Option<usize> {
 
 #[test]
 fn test_spawn_to_worker() {
-    let config = crate::config::Config {
-        worker_threads: Some(4),
-        ..Default::default()
-    };
+    let config = crate::config::Config::default().worker_threads(4);
 
     let runtime = Runtime::builder().config(config).build().unwrap();
 

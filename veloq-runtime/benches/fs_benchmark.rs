@@ -155,10 +155,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 // Initialize Runtime with 4 workers and BuddyPool
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
-                    .config(veloq_runtime::config::Config {
-                        worker_threads: Some(WORKER_COUNT),
-                        ..Default::default()
-                    })
+                    .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
                     .buffer_config(BufferConfig::new(BuddySpec::default()))
                     .build()
                     .unwrap();

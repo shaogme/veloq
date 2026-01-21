@@ -176,10 +176,7 @@ fn test_mixed_spawn_in_worker() {
 fn test_multi_worker_throughput() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let runtime = Runtime::builder()
-        .config(crate::config::Config {
-            worker_threads: Some(2),
-            ..Default::default()
-        })
+        .config(crate::config::Config::default().worker_threads(2))
         .build()
         .unwrap();
 

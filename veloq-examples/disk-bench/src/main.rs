@@ -388,10 +388,7 @@ fn main() {
 
     // Initialize Runtime
     let runtime = Runtime::builder()
-        .config(veloq_runtime::config::Config {
-            worker_threads: Some(args.threads),
-            ..Default::default()
-        })
+        .config(veloq_runtime::config::Config::default().worker_threads(args.threads))
         .buffer_config(BufferConfig::new(BuddySpec::default()))
         .build()
         .expect("Failed to build Runtime");
