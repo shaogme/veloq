@@ -1,6 +1,8 @@
+use crate::config::BlockingPoolConfig;
 use crate::fs::{File, LocalFile};
 use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use crate::runtime::Runtime;
+use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::context::alloc;
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
@@ -10,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn test_file_integrity() {
+    init_blocking_pool(BlockingPoolConfig::default());
+
     for size in [8192, 16384, 65536] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
