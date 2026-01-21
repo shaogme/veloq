@@ -13,7 +13,7 @@ use std::thread;
 use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::config::Config;
 use crate::io::driver::RemoteWaker;
@@ -90,112 +90,108 @@ impl RuntimeBuilder {
         };
 
         let (memories, global_info) = GlobalAllocator::new(alloc_config)?;
-        // Ensure we iterate correctly matching worker IDs
-        let mut memories_iter = memories.into_iter();
 
-        let mut states = Vec::with_capacity(worker_count);
-
-        for _ in 0..worker_count {
-            states.push(Arc::new(AtomicU8::new(executor::RUNNING)));
+        // Struct to hold per-worker resources temporarily
+        struct WorkerInit {
+            shared: Arc<ExecutorShared>,
+            remote_rx: mpsc::Receiver<Task>,
+            pinned_rx: mpsc::Receiver<SpawnedTask>,
+            worker: Worker<Runnable>,
         }
-        trace!("Initialized {} worker states", worker_count);
 
-        // Pre-allocate peer handles storage (initially 0/invalid)
-        let mut peer_handles_storage = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            peer_handles_storage.push(AtomicUsize::new(0));
-        }
-        let peer_handles = Arc::new(peer_handles_storage);
-
-        // Pre-allocate Shared State and Handles
-        let mut shared_states = Vec::with_capacity(worker_count);
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut remote_receivers = Vec::with_capacity(worker_count);
-        let mut pinned_receivers = Vec::with_capacity(worker_count);
-        // Temporary storage for workers to be moved into threads
-        let mut stealable_workers = Vec::with_capacity(worker_count);
         let queue_capacity = self.config.internal_queue_capacity;
 
-        for i in 0..worker_count {
-            let (tx, rx) = mpsc::channel();
-            let (pinned_tx, pinned_rx) = mpsc::channel();
+        // 1. Initialize Resources per Worker (Functional / Pipeline)
+        let (handles, workers): (Vec<_>, Vec<_>) = (0..worker_count)
+            .map(|i| {
+                let (remote_tx, remote_rx) = mpsc::channel();
+                let (pinned_tx, pinned_rx) = mpsc::channel();
 
-            // Create stealable worker
-            let worker = Worker::new_fifo();
-            let stealer = worker.stealer();
-            stealable_workers.push(Some(worker));
+                let worker = Worker::new_fifo();
+                let stealer = worker.stealer();
 
-            let shared = Arc::new(ExecutorShared {
-                pinned: pinned_tx,
-                remote_queue: tx,
-                future_injector: ArrayQueue::new(queue_capacity),
-                stealer,
-                waker: LateBoundWaker::new(),
-                injected_load: CachePadded::new(AtomicUsize::new(0)),
-                local_load: CachePadded::new(AtomicUsize::new(0)),
-                state: states[i].clone(),
-                shutdown: AtomicBool::new(false),
-            });
-            shared_states.push(shared.clone());
-            remote_receivers.push(Some(rx));
-            pinned_receivers.push(Some(pinned_rx));
+                let shared = Arc::new(ExecutorShared {
+                    pinned: pinned_tx,
+                    remote_queue: remote_tx,
+                    future_injector: ArrayQueue::new(queue_capacity),
+                    stealer,
+                    waker: LateBoundWaker::new(),
+                    injected_load: CachePadded::new(AtomicUsize::new(0)),
+                    local_load: CachePadded::new(AtomicUsize::new(0)),
+                    state: Arc::new(AtomicU8::new(executor::RUNNING)),
+                    shutdown: AtomicBool::new(false),
+                });
 
-            handles.push(ExecutorHandle { id: i, shared });
-        }
+                let handle = ExecutorHandle {
+                    id: i,
+                    shared: shared.clone(),
+                };
+
+                let init = WorkerInit {
+                    shared,
+                    remote_rx,
+                    pinned_rx,
+                    worker,
+                };
+
+                (handle, init)
+            })
+            .unzip();
 
         let registry = Arc::new(ExecutorRegistry::new(handles));
-        let mut thread_handles = Vec::with_capacity(worker_count);
 
-        // Barrier for N workers.
+        // Initialize peer file descriptors storage (initially 0)
+        let peer_handles = Arc::new(
+            (0..worker_count)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>(),
+        );
+
+        // Barrier for synchronizing worker startup
         let barrier = Arc::new(Barrier::new(worker_count));
 
-        // Consume memory for Worker 0 (to be saved for block_on)
-        let worker_0_memory = memories_iter.next().expect("Worker 0 memory missing");
+        // 2. Separate Worker 0 Resources
+        let mut workers_iter = workers.into_iter();
+        let worker_0_res = workers_iter
+            .next()
+            .expect("Worker 0 resources missing (count > 0 checked)");
 
-        // Spawn Workers 1 to N-1 (Skip 0)
-        for worker_id in 1..worker_count {
+        let mut memories_iter = memories.into_iter();
+        let worker_0_memory = memories_iter
+            .next()
+            .expect("Worker 0 memory missing (count > 0 checked)");
+
+        let mut thread_handles = Vec::with_capacity(worker_count - 1);
+
+        // 3. Spawn Background Workers (1..N)
+        for (i, (res, memory)) in workers_iter.zip(memories_iter).enumerate() {
+            let worker_id = i + 1; // Iterator started from index 1
+
             let registry = registry.clone();
-            let peer_handles_clone = peer_handles.clone();
-            let config_clone = self.config.clone();
-
-            // Per-thread resources
-            let thread_memory = memories_iter.next().expect("Thread memory missing");
-            let buffer_config_clone = buffer_config.clone();
-            let global_info = global_info; // Copy
-
-            let shared = shared_states[worker_id].clone();
-            let remote_receiver = remote_receivers[worker_id]
-                .take()
-                .expect("Receiver already taken");
-            let pinned_receiver = pinned_receivers[worker_id]
-                .take()
-                .expect("Pinned receiver already taken");
-            let stealable_worker = stealable_workers[worker_id]
-                .take()
-                .expect("Worker already taken");
+            let peer_handles = peer_handles.clone();
+            let barrier = barrier.clone();
+            let config = self.config.clone();
+            let buffer_config = buffer_config.clone();
+            // Assuming global_info is Copy or cheap to Clone (it's usually (ptr, len))
+            let global_info = global_info;
 
             let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
-            let barrier = barrier.clone();
 
             let handle = builder.spawn(move || {
                 debug!("Worker {} thread started", worker_id);
                 let mut executor = LocalExecutor::builder()
-                    .config(config_clone)
-                    .with_shared(shared)
-                    .with_remote_receiver(remote_receiver)
-                    .with_pinned_receiver(pinned_receiver)
-                    .with_worker(stealable_worker)
-                    .build(|registrar| {
-                        // Use the captured memory and config
-                        buffer_config_clone.build(thread_memory, registrar, global_info)
-                    });
+                    .config(config)
+                    .with_shared(res.shared)
+                    .with_remote_receiver(res.remote_rx)
+                    .with_pinned_receiver(res.pinned_rx)
+                    .with_worker(res.worker)
+                    .build(|registrar| buffer_config.build(memory, registrar, global_info));
 
-                executor = executor.with_registry(registry.clone());
+                executor = executor.with_registry(registry);
                 executor = executor.with_id(worker_id);
 
                 // Publish Handle
-                let fd = executor.raw_driver_handle();
-                peer_handles_clone[worker_id].store(fd, Ordering::Release);
+                peer_handles[worker_id].store(executor.raw_driver_handle(), Ordering::Release);
 
                 // Wait for all workers to be ready
                 barrier.wait();
@@ -207,22 +203,17 @@ impl RuntimeBuilder {
             thread_handles.push(handle);
         }
 
-        // Prepare Worker 0
-        let shared = shared_states[0].clone();
-        let remote_receiver = remote_receivers[0].take().unwrap();
-        let pinned_receiver = pinned_receivers[0].take().unwrap();
-        let stealable_worker = stealable_workers[0].take().unwrap();
-
+        // 4. Prepare Worker 0 Prep State (for block_on)
         let worker_0_prep = WorkerPrep {
-            shared,
-            remote_receiver,
-            pinned_receiver,
-            stealable_worker,
+            shared: worker_0_res.shared,
+            remote_receiver: worker_0_res.remote_rx,
+            pinned_receiver: worker_0_res.pinned_rx,
+            stealable_worker: worker_0_res.worker,
             thread_memory: worker_0_memory,
             global_info,
             buffer_config,
-            config: self.config.clone(),
-            barrier: barrier.clone(),
+            config: self.config,
+            barrier,
         };
 
         Ok(Runtime {
