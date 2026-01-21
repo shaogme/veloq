@@ -251,12 +251,19 @@ impl RawBuddyAllocator {
 
             // 更新 Buddy 的 Tag
             let buddy_idx = self.calculator.tag_index(buddy_offset);
-            self.tags[buddy_idx] = curr_order as u8;
+            // SAFETY: buddy_idx is calculated from a valid offset within the arena,
+            // so it's guaranteed to be in bounds.
+            unsafe {
+                *self.tags.get_unchecked_mut(buddy_idx) = curr_order as u8;
+            }
         }
 
         // 标记分配出的块
         let idx = self.calculator.tag_index(curr_offset);
-        self.tags[idx] = (order as u8) | TAG_ALLOCATED;
+        // SAFETY: idx is calculated from the current offset, which is always valid.
+        unsafe {
+            *self.tags.get_unchecked_mut(idx) = (order as u8) | TAG_ALLOCATED;
+        }
 
         // SAFETY: curr_offset 始终有效
         Some(unsafe { self.calculator.ptr_at(curr_offset) })
@@ -272,7 +279,11 @@ impl RawBuddyAllocator {
 
         // 立即标记为空闲
         let idx = self.calculator.tag_index(curr_offset);
-        self.tags[idx] = curr_order as u8;
+        // SAFETY: The offset is from a pointer previously allocated by this allocator,
+        // so the index is guaranteed to be in bounds.
+        unsafe {
+            *self.tags.get_unchecked_mut(idx) = curr_order as u8;
+        }
 
         // 尝试向上合并
         while curr_order < NUM_ORDERS - 1 {
@@ -283,7 +294,9 @@ impl RawBuddyAllocator {
             }
 
             let buddy_idx = self.calculator.tag_index(buddy_offset);
-            let buddy_tag = self.tags[buddy_idx];
+            // SAFETY: buddy_offset is checked to be within ARENA_SIZE,
+            // so buddy_idx is in bounds.
+            let buddy_tag = unsafe { *self.tags.get_unchecked(buddy_idx) };
 
             // 检查 Buddy 是否空闲且 Order 一致
             if (buddy_tag & TAG_ALLOCATED) == 0 && (buddy_tag & TAG_ORDER_MASK) == curr_order as u8
@@ -308,7 +321,11 @@ impl RawBuddyAllocator {
 
                 // 更新新块的 Tag
                 let new_idx = self.calculator.tag_index(curr_offset);
-                self.tags[new_idx] = curr_order as u8;
+                // SAFETY: curr_offset is the minimum of two valid offsets,
+                // so it's also a valid offset.
+                unsafe {
+                    *self.tags.get_unchecked_mut(new_idx) = curr_order as u8;
+                }
             } else {
                 break;
             }
