@@ -11,7 +11,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 
 use crossbeam_deque::Worker;
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use tracing::{debug, trace};
 
@@ -110,6 +110,7 @@ impl RuntimeBuilder {
         let mut pinned_receivers = Vec::with_capacity(worker_count);
         // Temporary storage for workers to be moved into threads
         let mut stealable_workers = Vec::with_capacity(worker_count);
+        let queue_capacity = self.config.internal_queue_capacity;
 
         for i in 0..worker_count {
             let (tx, rx) = mpsc::channel();
@@ -123,7 +124,7 @@ impl RuntimeBuilder {
             let shared = Arc::new(ExecutorShared {
                 pinned: pinned_tx,
                 remote_queue: tx,
-                future_injector: SegQueue::new(),
+                future_injector: ArrayQueue::new(queue_capacity),
                 stealer,
                 waker: LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),

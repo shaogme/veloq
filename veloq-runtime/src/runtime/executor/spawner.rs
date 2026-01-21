@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::trace;
+use tracing::{trace, warn};
 
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 
 use crate::io::driver::RemoteWaker;
@@ -42,7 +42,7 @@ pub(crate) struct ExecutorShared {
     pub(crate) remote_queue: std::sync::mpsc::Sender<Task>,
 
     // --- New Stealable Task Support ---
-    pub(crate) future_injector: SegQueue<Runnable>,
+    pub(crate) future_injector: ArrayQueue<Runnable>,
     pub(crate) stealer: crossbeam_deque::Stealer<Runnable>,
     // ----------------------------------
     pub(crate) waker: LateBoundWaker,
@@ -55,8 +55,11 @@ pub(crate) struct ExecutorShared {
 impl harness::Schedule for ExecutorShared {
     fn schedule(&self, task: Runnable) {
         trace!("Scheduling task via injector");
+        if self.future_injector.push(task).is_err() {
+            warn!("Internal task queue is full, dropping task");
+            return;
+        }
         self.injected_load.fetch_add(1, Ordering::Relaxed);
-        self.future_injector.push(task);
         self.waker
             .wake()
             .expect("Failed to wake executor via scheduler");

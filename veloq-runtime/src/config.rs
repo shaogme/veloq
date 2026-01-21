@@ -41,7 +41,6 @@ impl Default for IocpConfig {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct BlockingPoolConfig {
     pub core_threads: usize,
@@ -61,14 +60,27 @@ impl Default for BlockingPoolConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub uring: UringConfig,
     pub iocp: IocpConfig,
     pub worker_threads: Option<usize>,
     pub direct_io: bool,
     pub blocking_pool: BlockingPoolConfig,
+    pub internal_queue_capacity: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            uring: UringConfig::default(),
+            iocp: IocpConfig::default(),
+            worker_threads: None,
+            direct_io: false,
+            blocking_pool: BlockingPoolConfig::default(),
+            internal_queue_capacity: 1024,
+        }
+    }
 }
 
 impl Config {
@@ -93,6 +105,13 @@ impl Config {
 
     pub fn direct_io(self, direct_io: bool) -> Self {
         Self { direct_io, ..self }
+    }
+
+    pub fn internal_queue_capacity(self, capacity: usize) -> Self {
+        Self {
+            internal_queue_capacity: capacity,
+            ..self
+        }
     }
 
     pub fn blocking_pool(self, blocking_pool: BlockingPoolConfig) -> Self {

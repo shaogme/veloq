@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_deque::Worker;
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use tracing::{debug, trace};
 
@@ -120,10 +120,12 @@ impl LocalExecutorBuilder {
             // Default state is RUNNING
             let state = Arc::new(AtomicU8::new(RUNNING));
 
+            let queue_capacity = self.config.internal_queue_capacity;
+
             let shared = Arc::new(ExecutorShared {
                 pinned: pinned_tx,
                 remote_queue: remote_tx,
-                future_injector: SegQueue::new(),
+                future_injector: ArrayQueue::new(queue_capacity),
                 stealer,
                 waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
                 injected_load: CachePadded::new(AtomicUsize::new(0)),
