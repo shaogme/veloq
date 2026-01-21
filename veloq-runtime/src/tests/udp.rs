@@ -1,6 +1,6 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
+use crate::io::buffer::{BufferConfig, HybridSpec};
 use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -19,11 +19,7 @@ fn test_udp_bind() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -51,11 +47,7 @@ fn test_udp_send_receive() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -110,11 +102,7 @@ fn test_udp_echo() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -192,11 +180,7 @@ fn test_udp_multiple_messages() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -254,11 +238,7 @@ fn test_udp_large_data() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -315,11 +295,7 @@ fn test_udp_ipv6() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -356,11 +332,7 @@ fn test_multithread_udp_no_echo() {
                     worker_threads: Some(NUM_WORKERS),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -453,11 +425,7 @@ fn test_multithread_udp_echo() {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -561,11 +529,7 @@ fn test_multithread_concurrent_udp_clients() {
                     worker_threads: Some(NUM_WORKERS),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 

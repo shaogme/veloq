@@ -1,6 +1,6 @@
 use super::ext::Extensions;
 use super::*;
-use crate::io::buffer::{BackingPool, HybridPool};
+use crate::io::buffer::HybridPool;
 
 use crate::io::driver::Driver;
 use crate::io::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout};
@@ -187,8 +187,45 @@ fn test_iocp_timeout() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::new(&crate::config::Config::default()).unwrap();
-    let pool = HybridPool::new().unwrap();
+    use crate::io::buffer::BufPool;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let driver = Rc::new(RefCell::new(
+        IocpDriver::new(&crate::config::Config::default()).unwrap(),
+    ));
+
+    // Setup GlobalAlloc
+    let config = veloq_buf::GlobalAllocatorConfig {
+        thread_sizes: vec![std::num::NonZeroUsize::new(20 * 1024 * 1024).unwrap()],
+    };
+    let (mut memories, global_info) = veloq_buf::GlobalAllocator::new(config).unwrap();
+    let memory = memories.pop().unwrap();
+
+    let pool = HybridPool::new(memory).unwrap();
+
+    // Wrapper to use driver as registrar
+    struct LegacyDriverRegistrar {
+        driver: Rc<RefCell<IocpDriver>>,
+    }
+
+    impl crate::io::buffer::BufferRegistrar for LegacyDriverRegistrar {
+        fn register(
+            &self,
+            regions: &[crate::io::buffer::BufferRegion],
+        ) -> std::io::Result<Vec<usize>> {
+            self.driver.borrow_mut().register_buffer_regions(regions)
+        }
+        fn driver_id(&self) -> usize {
+            0
+        }
+    }
+
+    let registrar = Box::new(LegacyDriverRegistrar {
+        driver: driver.clone(),
+    });
+    let reg_pool = crate::io::buffer::RegisteredPool::new(pool, registrar, global_info)
+        .expect("Failed to register pool");
 
     // Setup connection
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -203,16 +240,8 @@ fn test_iocp_recv_with_buffer_pool() {
     let (stream, _) = listener.accept().unwrap();
     let stream_handle = stream.into_raw_socket().into();
 
-    // Register buffers
-    driver
-        .register_buffer_regions(&pool.get_memory_regions())
-        .expect("Failed to register buffers");
-
     // Alloc buffer
-    let buf = pool
-        .alloc_mem(8192)
-        .into_buf(&pool)
-        .expect("Failed to alloc buffer");
+    let buf = reg_pool.alloc(8192).expect("Failed to alloc buffer");
 
     // Create Recv Op
     let recv_op = Recv {
@@ -221,8 +250,8 @@ fn test_iocp_recv_with_buffer_pool() {
     };
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op);
-    let user_data = driver.reserve_op();
-    let _ = driver.submit(user_data, iocp_op);
+    let user_data = driver.borrow_mut().reserve_op();
+    let _ = driver.borrow_mut().submit(user_data, iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -233,9 +262,9 @@ fn test_iocp_recv_with_buffer_pool() {
         if start.elapsed() > std::time::Duration::from_secs(5) {
             panic!("Recv timed out");
         }
-        driver.process_completions();
+        driver.borrow_mut().process_completions();
 
-        match driver.poll_op(user_data, &mut cx) {
+        match driver.borrow_mut().poll_op(user_data, &mut cx) {
             Poll::Ready((res, iocp_op)) => {
                 assert!(res.is_ok(), "Recv failed: {:?}", res.err());
                 let bytes_read = res.unwrap();

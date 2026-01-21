@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
-use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, FixedBuf, RegisteredPool};
+use veloq_runtime::io::buffer::{BuddySpec, BufPool, BufferConfig, FixedBuf};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;
@@ -392,11 +392,7 @@ fn main() {
             worker_threads: Some(args.threads),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = BuddyPool::new().expect("Failed to create BuddyPool");
-            let reg_pool = RegisteredPool::new(pool, registrar).expect("Failed to register pool");
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(BuddySpec::default()))
         .build()
         .expect("Failed to build Runtime");
 

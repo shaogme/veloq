@@ -1,0 +1,17 @@
+[package]
+name = "veloq-buf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-queue = { workspace = true }
+veloq-bitset = { path = "../veloq-bitset" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

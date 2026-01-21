@@ -1,13 +1,32 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::{AnyBufPool, BuddyPool, BufPool, RegisteredPool};
+use veloq_runtime::io::buffer::{BuddySpec, BufPool, BufferConfig, RegisteredPool};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
+
+fn create_local_executor() -> LocalExecutor {
+    // 256MB for benchmark
+    let config = GlobalAllocatorConfig {
+        thread_sizes: vec![NonZeroUsize::new(256 * 1024 * 1024).unwrap()],
+    };
+    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
+    let memory = memories.pop().unwrap();
+
+    LocalExecutor::builder().build(move |registrar| {
+        let pool = veloq_runtime::io::buffer::BuddyPool::new(memory).unwrap();
+        veloq_runtime::io::buffer::AnyBufPool::new(
+            RegisteredPool::new(pool, registrar, global_info)
+                .expect("Failed to register buffer pool"),
+        )
+    })
+}
 
 fn benchmark_1gb_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("fs_throughput");
@@ -21,15 +40,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        veloq_runtime::io::buffer::AnyBufPool::new(
-            RegisteredPool::new(
-                veloq_runtime::io::buffer::BuddyPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
 
     let pool = exec.pool();
 
@@ -148,11 +159,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         worker_threads: Some(WORKER_COUNT),
                         ..Default::default()
                     })
-                    .pool_constructor(|_, registrar| {
-                        let pool = BuddyPool::new().unwrap();
-                        let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                        AnyBufPool::new(reg_pool)
-                    })
+                    .buffer_config(BufferConfig::new(BuddySpec::default()))
                     .build()
                     .unwrap();
 

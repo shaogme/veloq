@@ -3,9 +3,28 @@
 use crate::io::buffer::RegisteredPool;
 use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
+use crate::sync::mpsc;
 use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+
+fn create_local_executor() -> LocalExecutor {
+    let config = GlobalAllocatorConfig {
+        thread_sizes: vec![NonZeroUsize::new(16 * 1024 * 1024).unwrap()],
+    };
+    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
+    let memory = memories.pop().unwrap();
+
+    LocalExecutor::builder().build(move |registrar| {
+        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
+        crate::io::buffer::AnyBufPool::new(
+            RegisteredPool::new(pool, registrar, global_info)
+                .expect("Failed to register buffer pool"),
+        )
+    })
+}
 
 // ============ LocalExecutor Tests (Single Threaded) ============
 
@@ -13,12 +32,7 @@ use std::sync::Arc;
 /// This verifies that tasks are executed on the same thread.
 #[test]
 fn test_spawn_local_basic() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            RegisteredPool::new(crate::io::buffer::HybridPool::new().unwrap(), registrar)
-                .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     let result = Rc::new(RefCell::new(0));
     let result_clone = result.clone();
 
@@ -38,15 +52,7 @@ fn test_spawn_local_basic() {
 /// Test that spawn_local supports !Send futures (like Rc).
 #[test]
 fn test_spawn_local_not_send() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     // Rc is !Send
     let data = Rc::new(vec![1, 2, 3]);
     let data_clone = data.clone();
@@ -66,15 +72,7 @@ fn test_spawn_local_not_send() {
 /// Test nested spawn_local calls.
 #[test]
 fn test_nested_spawn_local() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     let counter = Rc::new(RefCell::new(0));
     let c1 = counter.clone();
 
@@ -215,17 +213,7 @@ fn test_multi_worker_throughput() {
 /// Test local channel functionality using the runtime.
 #[test]
 fn test_local_channel() {
-    use crate::sync::mpsc;
-
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
 
     exec.block_on(async move {
         let (tx, mut rx) = mpsc::unbounded();
@@ -258,17 +246,7 @@ fn test_local_channel() {
 /// Test local channel disconnect behavior.
 #[test]
 fn test_local_channel_disconnect() {
-    use crate::sync::mpsc;
-
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
 
     exec.block_on(async move {
         let (tx, mut rx) = mpsc::unbounded::<i32>();

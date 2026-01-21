@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 veloq-bitset = { path = "../veloq-bitset" }
 veloq-sync = { path = "../veloq-sync" }
+veloq-buf = { path = "../veloq-buf" }
 
 num_cpus = "1.17.0"
 crossbeam-utils = { workspace = true }
@@ -17,18 +18,10 @@ tracing = "0.1.44"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
-libc = "0.2.178"
+libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
-    "Win32_Networking_WinSock",
-    "Win32_Security"
-] }
+windows-sys = { workspace = true }
 veloq-wheel = { path = "../veloq-wheel" }
 
 [dev-dependencies]

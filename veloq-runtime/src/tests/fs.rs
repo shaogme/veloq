@@ -1,14 +1,32 @@
 use crate::config::BlockingPoolConfig;
 use crate::fs::{File, LocalFile};
-use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
+use crate::io::buffer::{BufferConfig, HybridSpec, RegisteredPool};
 use crate::runtime::Runtime;
 use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::context::alloc;
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+
+fn create_local_executor() -> LocalExecutor {
+    let config = GlobalAllocatorConfig {
+        thread_sizes: vec![NonZeroUsize::new(16 * 1024 * 1024).unwrap()],
+    };
+    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
+    let memory = memories.pop().unwrap();
+
+    LocalExecutor::builder().build(move |registrar| {
+        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
+        crate::io::buffer::AnyBufPool::new(
+            RegisteredPool::new(pool, registrar, global_info)
+                .expect("Failed to register buffer pool"),
+        )
+    })
+}
 
 #[test]
 fn test_file_integrity() {
@@ -17,12 +35,7 @@ fn test_file_integrity() {
     for size in [8192, 16384, 65536] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
-            let mut exec = LocalExecutor::builder().build(|registrar| {
-                crate::io::buffer::AnyBufPool::new(
-                    RegisteredPool::new(crate::io::buffer::HybridPool::new().unwrap(), registrar)
-                        .expect("Failed to register buffer pool"),
-                )
-            });
+            let mut exec = create_local_executor();
 
             exec.block_on(async move {
                 let file_path_string = format!("test_file_integrity_{:?}.tmp", size);
@@ -83,11 +96,7 @@ fn test_multithread_file_ops() {
             worker_threads: Some(NUM_WORKERS),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 

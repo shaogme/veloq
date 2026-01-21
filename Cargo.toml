@@ -3,7 +3,9 @@ members = [
     "veloq-bitset",
     "veloq-runtime",
     "veloq-wheel",
-    "veloq-examples/disk-bench", "veloq-sync",
+    "veloq-examples/disk-bench",
+    "veloq-sync",
+    "veloq-buf",
 ]
 resolver = "3"
 
@@ -13,3 +15,14 @@ intrusive-collections = "0.10"
 atomic-waker = "1.1.2"
 futures-core = "0.3"
 crossbeam-queue = "0.3"
+libc = "0.2.178"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }

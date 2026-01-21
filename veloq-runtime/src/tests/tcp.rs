@@ -1,6 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{AnyBufPool, HybridPool, RegisteredPool};
+use crate::io::buffer::{BufferConfig, HybridSpec};
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -19,11 +19,7 @@ fn test_tcp_connect_with_global_api() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -66,11 +62,7 @@ fn test_tcp_send_recv() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -163,11 +155,7 @@ fn test_tcp_multiple_connections() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -214,11 +202,7 @@ fn test_tcp_large_data_transfer() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
             runtime.block_on(async move {
@@ -295,11 +279,7 @@ fn test_listener_local_addr() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -323,11 +303,7 @@ fn test_tcp_connect_refused() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -351,11 +327,7 @@ fn test_tcp_recv_zero_bytes() {
                     worker_threads: Some(1),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -403,11 +375,7 @@ fn test_tcp_ipv6() {
             worker_threads: Some(1),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -458,11 +426,7 @@ fn test_multithread_tcp_connections() {
             worker_threads: Some(NUM_WORKERS),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 
@@ -527,11 +491,7 @@ fn test_multithread_tcp_echo() {
                     worker_threads: Some(2),
                     ..Default::default()
                 })
-                .pool_constructor(|_, registrar| {
-                    let pool = HybridPool::new().unwrap();
-                    let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-                    AnyBufPool::new(reg_pool)
-                })
+                .buffer_config(BufferConfig::new(HybridSpec))
                 .build()
                 .unwrap();
 
@@ -624,11 +584,7 @@ fn test_multithread_concurrent_clients() {
             worker_threads: Some(NUM_WORKERS),
             ..Default::default()
         })
-        .pool_constructor(|_, registrar| {
-            let pool = HybridPool::new().unwrap();
-            let reg_pool = RegisteredPool::new(pool, registrar).unwrap();
-            AnyBufPool::new(reg_pool)
-        })
+        .buffer_config(BufferConfig::new(HybridSpec))
         .build()
         .unwrap();
 

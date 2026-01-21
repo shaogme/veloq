@@ -16,18 +16,19 @@ use crossbeam_utils::CachePadded;
 use tracing::{debug, trace};
 
 use crate::config::Config;
-use crate::io::buffer::{AnyBufPool, BuddyPool, BufferRegistrar, RegisteredPool};
 use crate::io::driver::RemoteWaker;
 use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::task::harness::Runnable;
 use crate::runtime::task::{SpawnedTask, Task};
+// Re-export common types
 pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-pub type PoolConstructor = Arc<dyn Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync>;
+use crate::io::buffer::{BuddySpec, BufferConfig};
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo, ThreadMemory};
 
 struct WorkerPrep {
     shared: Arc<ExecutorShared>,
@@ -35,21 +36,23 @@ struct WorkerPrep {
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<Runnable>,
-    pool_constructor: PoolConstructor,
+    thread_memory: ThreadMemory,
+    global_info: GlobalMemoryInfo,
+    buffer_config: BufferConfig,
     config: Config,
     barrier: Arc<Barrier>,
 }
 
 pub struct RuntimeBuilder {
     config: Config,
-    pool_constructor: Option<PoolConstructor>,
+    buffer_config: Option<BufferConfig>,
 }
 
 impl RuntimeBuilder {
     pub fn new() -> Self {
         Self {
             config: Config::default(),
-            pool_constructor: None,
+            buffer_config: None,
         }
     }
 
@@ -58,11 +61,8 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn pool_constructor<F>(mut self, f: F) -> Self
-    where
-        F: Fn(usize, Box<dyn BufferRegistrar>) -> AnyBufPool + Send + Sync + 'static,
-    {
-        self.pool_constructor = Some(Arc::new(f));
+    pub fn buffer_config(mut self, config: BufferConfig) -> Self {
+        self.buffer_config = Some(config);
         self
     }
 
@@ -79,15 +79,19 @@ impl RuntimeBuilder {
         // Initialize the blocking pool
         init_blocking_pool(self.config.blocking_pool.clone());
 
-        // Default Pool Constructor
-        let pool_constructor = self.pool_constructor.unwrap_or_else(|| {
-            Arc::new(|_, registrar| {
-                let pool = BuddyPool::new().expect("Failed to create default BuddyPool");
-                let reg_pool =
-                    RegisteredPool::new(pool, registrar).expect("Failed to create RegisteredPool");
-                AnyBufPool::new(reg_pool)
-            })
-        });
+        // Buffer Config & Memory Allocation
+        let buffer_config = self
+            .buffer_config
+            .unwrap_or_else(|| BufferConfig::new(BuddySpec::default()));
+
+        let memory_req = buffer_config.memory_requirement();
+        let alloc_config = GlobalAllocatorConfig {
+            thread_sizes: vec![memory_req; worker_count],
+        };
+
+        let (memories, global_info) = GlobalAllocator::new(alloc_config)?;
+        // Ensure we iterate correctly matching worker IDs
+        let mut memories_iter = memories.into_iter();
 
         let mut states = Vec::with_capacity(worker_count);
 
@@ -143,18 +147,23 @@ impl RuntimeBuilder {
         let mut thread_handles = Vec::with_capacity(worker_count);
 
         // Barrier for N workers.
-        // All workers (including Worker 0) must reach this barrier after publishing their handle
-        // but before starting their loop.
         let barrier = Arc::new(Barrier::new(worker_count));
+
+        // Consume memory for Worker 0 (to be saved for block_on)
+        let worker_0_memory = memories_iter.next().expect("Worker 0 memory missing");
 
         // Spawn Workers 1 to N-1 (Skip 0)
         for worker_id in 1..worker_count {
             let registry = registry.clone();
             let peer_handles_clone = peer_handles.clone();
             let config_clone = self.config.clone();
-            let pool_constructor = pool_constructor.clone();
 
-            let shared = shared_states[worker_id].clone(); // Get pre-allocated shared
+            // Per-thread resources
+            let thread_memory = memories_iter.next().expect("Thread memory missing");
+            let buffer_config_clone = buffer_config.clone();
+            let global_info = global_info; // Copy
+
+            let shared = shared_states[worker_id].clone();
             let remote_receiver = remote_receivers[worker_id]
                 .take()
                 .expect("Receiver already taken");
@@ -172,23 +181,23 @@ impl RuntimeBuilder {
                 debug!("Worker {} thread started", worker_id);
                 let mut executor = LocalExecutor::builder()
                     .config(config_clone)
-                    .with_shared(shared) // Inject shared state
-                    .with_remote_receiver(remote_receiver) // Inject remote receiver
-                    .with_pinned_receiver(pinned_receiver) // Inject pinned receiver
-                    .with_worker(stealable_worker) // Inject stealable worker
+                    .with_shared(shared)
+                    .with_remote_receiver(remote_receiver)
+                    .with_pinned_receiver(pinned_receiver)
+                    .with_worker(stealable_worker)
                     .build(|registrar| {
-                        let pool = pool_constructor(worker_id, registrar);
-                        AnyBufPool::new(pool)
+                        // Use the captured memory and config
+                        buffer_config_clone.build(thread_memory, registrar, global_info)
                     });
 
-                executor = executor.with_registry(registry.clone()); // Inject registry
-                executor = executor.with_id(worker_id); // Set Worker ID
+                executor = executor.with_registry(registry.clone());
+                executor = executor.with_id(worker_id);
 
                 // Publish Handle
                 let fd = executor.raw_driver_handle();
                 peer_handles_clone[worker_id].store(fd, Ordering::Release);
 
-                // Wait for all workers to be ready (handles published)
+                // Wait for all workers to be ready
                 barrier.wait();
 
                 // Run Loop
@@ -209,9 +218,11 @@ impl RuntimeBuilder {
             remote_receiver,
             pinned_receiver,
             stealable_worker,
-            pool_constructor: pool_constructor.clone(),
+            thread_memory: worker_0_memory,
+            global_info,
+            buffer_config,
             config: self.config.clone(),
-            barrier: barrier.clone(), // Pass barrier to Worker 0
+            barrier: barrier.clone(),
         };
 
         Ok(Runtime {
@@ -297,8 +308,9 @@ impl Runtime {
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
             .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
-                // Bind Buffer Pool via constructor
-                (prep.pool_constructor)(0, registrar)
+                // Bind Buffer Pool using stored prep data
+                prep.buffer_config
+                    .build(prep.thread_memory, registrar, prep.global_info)
             });
 
         executor = executor.with_registry(self.registry.clone());

@@ -1,9 +1,27 @@
+use crate::io::buffer::RegisteredPool;
 use crate::runtime::executor::LocalExecutor;
 use crate::select;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 
+fn create_local_executor() -> LocalExecutor {
+    let config = GlobalAllocatorConfig {
+        thread_sizes: vec![NonZeroUsize::new(16 * 1024 * 1024).unwrap()],
+    };
+    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
+    let memory = memories.pop().unwrap();
+
+    LocalExecutor::builder().build(move |registrar| {
+        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
+        crate::io::buffer::AnyBufPool::new(
+            RegisteredPool::new(pool, registrar, global_info)
+                .expect("Failed to register buffer pool"),
+        )
+    })
+}
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
     type Output = T;
@@ -30,15 +48,7 @@ impl Future for PendingFuture {
 
 #[test]
 fn test_select_basic() {
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
             val = ready(1) => { val },
@@ -51,15 +61,7 @@ fn test_select_basic() {
 #[test]
 fn test_select_biased() {
     // Both are ready immediately. First one should win.
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
             val = ready(10) => { val },
@@ -72,15 +74,7 @@ fn test_select_biased() {
 #[test]
 fn test_select_biased_reverse() {
     // Both are ready immediately. First one declared (which is ready(20)) should win.
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
             val = ready(20) => { val },
@@ -93,15 +87,7 @@ fn test_select_biased_reverse() {
 #[test]
 fn test_select_expression() {
     // Test using complex expressions in select
-    let mut exec = LocalExecutor::builder().build(|registrar| {
-        crate::io::buffer::AnyBufPool::new(
-            crate::io::buffer::RegisteredPool::new(
-                crate::io::buffer::HybridPool::new().unwrap(),
-                registrar,
-            )
-            .expect("Failed to register buffer pool"),
-        )
-    });
+    let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
             v = async { 5 + 5 } => { v },

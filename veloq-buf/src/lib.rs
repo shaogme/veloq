@@ -1,0 +1,200 @@
+pub mod buffer;
+mod os;
+
+use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
+
+/// 2MB minimum memory per thread (Huge Page aligned)
+pub const MIN_THREAD_MEMORY: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(2 * 1024 * 1024) };
+
+/// Configuration for GlobalAllocator
+#[derive(Debug, Clone)]
+pub struct GlobalAllocatorConfig {
+    /// Defines the memory size (in bytes) for each thread.
+    /// The index corresponds to the thread/worker ID.
+    pub thread_sizes: Vec<NonZeroUsize>,
+}
+
+/// Underlying physical memory block (RAII Wrapper).
+/// Responsible for actual OS memory allocation and deallocation.
+#[derive(Debug)]
+struct RawSlab {
+    ptr: NonNull<u8>,
+    size: usize,
+}
+
+// Guarantee RawSlab can be shared across threads (needed for Arc internals)
+unsafe impl Send for RawSlab {}
+unsafe impl Sync for RawSlab {}
+
+impl RawSlab {
+    fn new(size: usize) -> io::Result<Self> {
+        let ptr = unsafe {
+            // Reuse existing os::alloc_huge_pages logic
+            os::alloc_huge_pages(size).and_then(|p| {
+                NonNull::new(p).ok_or(io::Error::new(io::ErrorKind::Other, "Allocation failed"))
+            })?
+        };
+        Ok(Self { ptr, size })
+    }
+}
+
+impl Drop for RawSlab {
+    fn drop(&mut self) {
+        unsafe {
+            os::free_huge_pages(self.ptr, self.size);
+        }
+    }
+}
+
+/// Thread-exclusive memory handle.
+///
+/// This structure will be passed to the runtime's Allocator.
+/// It holds a reference to the underlying memory, ensuring validity during usage.
+#[derive(Debug)]
+pub struct ThreadMemory {
+    // Holds Arc to keep the underlying huge chunk alive.
+    // Even if multiple threads share the same physical Huge Page memory,
+    // their ThreadMemory instances are independent handles.
+    _owner: Arc<RawSlab>,
+
+    // The memory region available to this thread
+    ptr: NonNull<u8>,
+    len: NonZeroUsize,
+}
+
+// Allow passing ownership across threads
+unsafe impl Send for ThreadMemory {}
+// Allow sharing references across threads (though typically Allocators are thread-local)
+unsafe impl Sync for ThreadMemory {}
+
+impl ThreadMemory {
+    /// Get the start pointer of the memory region
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the mutable start pointer of the memory region
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the length of the memory region
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
+
+    /// Obtain the global physical memory region this thread memory belongs to.
+    /// Returns (base_ptr, total_size).
+    /// Used for registering the entire memory block with the kernel (e.g., io_uring).
+    pub fn global_region(&self) -> (NonNull<u8>, usize) {
+        (self._owner.ptr, self._owner.size)
+    }
+}
+
+/// Global memory allocator factory.
+///
+/// Currently acts as a pure factory. Can be extended to hold weak references
+/// to all RawSlabs for monitoring or management interfaces to support expansion.
+pub struct GlobalAllocator;
+
+/// Information about the global memory block for Driver Registration (God View).
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalMemoryInfo {
+    pub ptr: NonNull<u8>,
+    pub len: usize,
+}
+
+// Guarantee thread safety for the info pointing to shared memory
+unsafe impl Send for GlobalMemoryInfo {}
+unsafe impl Sync for GlobalMemoryInfo {}
+
+impl GlobalAllocator {
+    /// Create a new global memory allocation.
+    ///
+    /// # Arguments
+    /// - `config`: Configuration containing thread memory sizes.
+    ///
+    /// # Returns
+    /// Returns a tuple containing:
+    /// 1. A vector of `ThreadMemory` objects, each having independent ownership.
+    /// 2. `GlobalMemoryInfo` for registering the entire block with io_uring/RIO.
+    pub fn new(config: GlobalAllocatorConfig) -> io::Result<(Vec<ThreadMemory>, GlobalMemoryInfo)> {
+        if config.thread_sizes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Thread sizes cannot be empty",
+            ));
+        }
+
+        let total_size: usize = config.thread_sizes.iter().map(|s| s.get()).sum();
+
+        // 1. Allocate a single large chunk (Maximizes utilization, huge page friendly)
+        let slab = Arc::new(RawSlab::new(total_size)?);
+
+        let global_info = GlobalMemoryInfo {
+            ptr: slab.ptr,
+            len: slab.size,
+        };
+
+        let mut result = Vec::with_capacity(config.thread_sizes.len());
+        let mut current_ptr = slab.ptr.as_ptr();
+
+        // 2. Slice it for each thread
+        for &size in &config.thread_sizes {
+            let thread_ptr = unsafe { NonNull::new_unchecked(current_ptr) };
+
+            result.push(ThreadMemory {
+                _owner: slab.clone(), // Increment ref count
+                ptr: thread_ptr,
+                len: size,
+            });
+
+            // Move pointer forward
+            unsafe {
+                current_ptr = current_ptr.add(size.get());
+            }
+        }
+
+        Ok((result, global_info))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_global_allocator_lifecycle() {
+        let per_thread_size = MIN_THREAD_MEMORY;
+        let thread_count = 4;
+        let config = GlobalAllocatorConfig {
+            thread_sizes: vec![per_thread_size; thread_count],
+        };
+
+        match GlobalAllocator::new(config) {
+            Ok((memories, _)) => {
+                assert_eq!(memories.len(), thread_count);
+
+                for (i, mem) in memories.iter().enumerate() {
+                    assert_eq!(mem.len(), per_thread_size.get());
+
+                    // Simple write test to verify access
+                    unsafe {
+                        let ptr = mem.as_ptr() as *mut u8;
+                        *ptr = i as u8;
+                        assert_eq!(*ptr, i as u8);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "GlobalAllocator::new failed (likely due to missing permissions): {}",
+                    e
+                );
+            }
+        }
+    }
+}
