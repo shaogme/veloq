@@ -192,103 +192,102 @@ impl IocpDriver {
 
         trace!(user_data, bytes_transferred, "CQE received");
 
-        if self.ops.contains(user_data) {
-            // Check if cancelled
-            if self.ops[user_data].cancelled {
-                let entry = self.ops.remove(user_data);
+        enum CompletionAction {
+            Cancelled,
+            Background,
+            Detached,
+            Normal,
+            NotFound,
+        }
 
-                // If it was a remote op, we must complete it (with error) so the waiter doesn't panic
+        let action = self
+            .ops
+            .get(user_data)
+            .map(|op| {
+                if op.cancelled {
+                    CompletionAction::Cancelled
+                } else {
+                    match op.platform_data {
+                        PlatformData::Background => CompletionAction::Background,
+                        PlatformData::Detached(_) => CompletionAction::Detached,
+                        _ => CompletionAction::Normal,
+                    }
+                }
+            })
+            .unwrap_or(CompletionAction::NotFound);
+
+        match action {
+            CompletionAction::Cancelled => {
+                let mut entry = self.ops.remove(user_data);
                 if let PlatformData::Detached(completer) = entry.platform_data {
-                    if let Some(op) = entry.resources {
+                    if let Some(op) = entry.resources.take() {
                         completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
                     }
                 }
-
-                return Ok(());
             }
+            CompletionAction::Background => {
+                trace!(user_data, "Background op completion ignored");
+                self.ops.remove(user_data);
+            }
+            CompletionAction::Detached => {
+                let mut entry = self.ops.remove(user_data);
+                if let PlatformData::Detached(completer) = entry.platform_data {
+                    if let Some(mut iocp_op) = entry.resources.take() {
+                        let mut result = if res == 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(bytes_transferred as usize)
+                        };
 
-            let op_entry = &mut self.ops[user_data];
-
-            // Check if background or remote
-            match &mut op_entry.platform_data {
-                PlatformData::Background => {
-                    trace!(user_data, "Background op completion ignored");
-                    self.ops.remove(user_data);
-                    return Ok(());
+                        if let Some(blocking_res) = iocp_op.header.blocking_result.take() {
+                            result = blocking_res;
+                        }
+                        completer.complete(result, iocp_op);
+                    } else {
+                        tracing::error!(
+                            user_data,
+                            "RemoteOp completion missing resources - Task will likely panic"
+                        );
+                    }
                 }
-                PlatformData::Detached(_) => {
-                    // We need to move the completer out
-                    let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
-                    if let PlatformData::Detached(completer) = data {
-                        // We must take the resources (op) out
-                        let resources = op_entry.resources.take();
-                        if let Some(mut iocp_op) = resources {
-                            // Extract result
+            }
+            CompletionAction::Normal => {
+                // Unwrapping is fine because we already checked existence in decision phase
+                let op = self.ops.get_mut(user_data).unwrap();
+                let mut result_is_ready = false;
+
+                if op.result.is_none() {
+                    if let Some(iocp_op) = op.resources.as_mut() {
+                        if let Some(entry) = iocp_op.header.blocking_result.take() {
+                            op.result = Some(entry);
+                        } else {
                             let mut result = if res == 0 {
                                 Err(io::Error::last_os_error())
                             } else {
                                 Ok(bytes_transferred as usize)
                             };
 
-                            // Check for blocking result override (e.g. from Open/Close/Fsync offload)
-                            if let Some(blocking_res) = iocp_op.header.blocking_result.take() {
-                                result = blocking_res;
+                            if result.is_ok() {
+                                if let Some(on_comp) = iocp_op.vtable.on_complete {
+                                    let val = result.unwrap();
+                                    result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
+                                }
                             }
-
-                            completer.complete(result, iocp_op);
-                            self.ops.remove(user_data);
-                        } else {
-                            // Should not happen?
-                            tracing::error!(
-                                user_data,
-                                "RemoteOp completion missing resources - Task will likely panic"
-                            );
-                            self.ops.remove(user_data);
+                            op.result = Some(result);
                         }
+                        result_is_ready = true;
                     }
-                    return Ok(());
                 }
-                _ => {}
-            }
 
-            let op = &mut self.ops[user_data];
-            let mut result_is_ready = false;
-
-            if op.result.is_none()
-                && let Some(iocp_op) = op.resources.as_mut()
-            {
-                // Check for blocking result first
-                if let Some(entry) = iocp_op.header.blocking_result.take() {
-                    op.result = Some(entry);
-                    result_is_ready = true;
-                } else {
-                    // Normal IO completion
-                    let mut result = if res == 0 {
-                        let e = io::Error::last_os_error();
-                        // trace!(?e, "IO failed");
-                        Err(e)
-                    } else {
-                        Ok(bytes_transferred as usize)
-                    };
-
-                    if result.is_ok() {
-                        // Use VTable on_complete if available
-                        if let Some(on_comp) = iocp_op.vtable.on_complete {
-                            let val = result.unwrap();
-                            result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
-                        }
+                if result_is_ready {
+                    op.platform_data = PlatformData::None;
+                    if let Some(waker) = op.waker.take() {
+                        waker.wake();
                     }
-                    op.result = Some(result);
-                    result_is_ready = true;
                 }
             }
-
-            if result_is_ready {
-                // Clean up resources
-                op.platform_data = PlatformData::None;
-                if let Some(waker) = op.waker.take() {
-                    waker.wake();
-                }
+            CompletionAction::NotFound => {
+                // Op not found, do nothing.
             }
         }
 

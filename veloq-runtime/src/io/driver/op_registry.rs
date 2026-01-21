@@ -41,6 +41,10 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.insert(entry)
     }
 
+    pub fn get(&self, user_data: usize) -> Option<&OpEntry<Op, P>> {
+        self.slab.get(user_data)
+    }
+
     pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<Op, P>> {
         self.slab.get_mut(user_data)
     }
