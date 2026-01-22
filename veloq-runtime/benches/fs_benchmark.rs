@@ -1,4 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use veloq_runtime::config::BlockingPoolConfig;
+use veloq_runtime::runtime::blocking::init_blocking_pool;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -41,6 +43,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(120));
 
     let mut exec = create_local_executor();
+
+    init_blocking_pool(BlockingPoolConfig::default());
 
     let pool = exec.pool();
 
