@@ -1,4 +1,5 @@
 use std::io;
+use std::num::NonZeroUsize;
 use std::ptr;
 use std::ptr::NonNull;
 
@@ -8,12 +9,12 @@ use std::ptr::NonNull;
 const MAP_HUGETLB: libc::c_int = 0x40000;
 const MAP_POPULATE: libc::c_int = 0x08000;
 
-pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
+pub unsafe fn alloc_huge_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
     // Try Huge Pages first
     let ptr = unsafe {
         libc::mmap(
             ptr::null_mut(),
-            size,
+            size.get(),
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE,
             -1,
@@ -29,7 +30,7 @@ pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
     let ptr = unsafe {
         libc::mmap(
             ptr::null_mut(),
-            size,
+            size.get(),
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_POPULATE,
             -1,
@@ -44,8 +45,8 @@ pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
     }
 }
 
-pub unsafe fn free_huge_pages(ptr: NonNull<u8>, size: usize) {
+pub unsafe fn free_huge_pages(ptr: NonNull<u8>, size: NonZeroUsize) {
     unsafe {
-        libc::munmap(ptr.as_ptr() as *mut _, size);
+        libc::munmap(ptr.as_ptr() as *mut _, size.get());
     }
 }

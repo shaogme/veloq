@@ -80,7 +80,7 @@ fn test_tcp_send_recv() {
                         };
 
                         // Echo exact bytes received
-                        buf.set_len(bytes_read);
+                        buf.set_len(std::num::NonZeroUsize::new(bytes_read).unwrap());
                         if let Err(e) = stream.send(buf).await.0 {
                             println!("Server echo failed: {}", e);
                             break;

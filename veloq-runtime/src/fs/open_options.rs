@@ -1,4 +1,5 @@
 use crate::io::op::{OpSubmitter, Open};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +170,7 @@ impl OpenOptions {
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
 
-        buf.set_len(len);
+        buf.set_len(NonZeroUsize::new(len).unwrap());
 
         // 标志位计算
         let mut flags = if self.read && !self.write && !self.append {
@@ -253,7 +254,7 @@ impl OpenOptions {
                 slice.as_mut_ptr(),
                 len_bytes,
             );
-            buf.set_len(len_bytes);
+            buf.set_len(NonZeroUsize::new(len_bytes).unwrap());
         }
 
         // 2. Process Access

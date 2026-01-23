@@ -1,4 +1,5 @@
 use std::io;
+use std::num::NonZeroUsize;
 use std::ptr;
 use std::ptr::NonNull;
 use windows_sys::Win32::System::Memory::{
@@ -6,13 +7,13 @@ use windows_sys::Win32::System::Memory::{
     VirtualFree,
 };
 
-pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
+pub unsafe fn alloc_huge_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
     // Windows requires the SeLockMemoryPrivilege for MEM_LARGE_PAGES to work.
     // First, try allocating with MEM_LARGE_PAGES.
     let ptr = unsafe {
         VirtualAlloc(
             ptr::null_mut(),
-            size,
+            size.get(),
             MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
             PAGE_READWRITE,
         )
@@ -27,7 +28,7 @@ pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
     let ptr = unsafe {
         VirtualAlloc(
             ptr::null_mut(),
-            size,
+            size.get(),
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         )
@@ -40,7 +41,7 @@ pub unsafe fn alloc_huge_pages(size: usize) -> io::Result<*mut u8> {
     }
 }
 
-pub unsafe fn free_huge_pages(ptr: NonNull<u8>, _size: usize) {
+pub unsafe fn free_huge_pages(ptr: NonNull<u8>, _size: NonZeroUsize) {
     // MEM_RELEASE: "dwSize must be 0"
     unsafe {
         VirtualFree(ptr.as_ptr() as *mut _, 0, MEM_RELEASE);

@@ -454,8 +454,8 @@ impl UringDriver {
         let iovecs: Vec<libc::iovec> = regions
             .iter()
             .map(|region| libc::iovec {
-                iov_base: region.ptr.as_ptr() as *mut _,
-                iov_len: region.len,
+                iov_base: region.as_mut_ptr() as *mut _,
+                iov_len: region.len(),
             })
             .collect();
 

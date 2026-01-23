@@ -121,7 +121,7 @@ fn test_multithread_file_ops() {
                 {
                     let file = File::create(path).await.expect("Failed to create file");
                     let mut write_buf = alloc(len);
-                    write_buf.set_len(len);
+                    write_buf.set_len(NonZeroUsize::new(len).unwrap());
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
 
                     let (res, _) = file.write_at(write_buf, 0).await;

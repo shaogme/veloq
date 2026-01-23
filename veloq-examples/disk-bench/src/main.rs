@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use rand::prelude::*;
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -34,21 +35,21 @@ enum BlockSize {
 }
 
 impl BlockSize {
-    fn as_bytes(&self) -> usize {
+    fn as_bytes(&self) -> NonZeroUsize {
         match self {
-            BlockSize::K4 => 4 * 1024,
-            BlockSize::K8 => 8 * 1024,
-            BlockSize::K16 => 16 * 1024,
-            BlockSize::K32 => 32 * 1024,
-            BlockSize::K64 => 64 * 1024,
-            BlockSize::K128 => 128 * 1024,
-            BlockSize::K256 => 256 * 1024,
-            BlockSize::K512 => 512 * 1024,
-            BlockSize::M1 => 1024 * 1024,
-            BlockSize::M2 => 2 * 1024 * 1024,
-            BlockSize::M4 => 4 * 1024 * 1024,
-            BlockSize::M8 => 8 * 1024 * 1024,
-            BlockSize::M16 => 16 * 1024 * 1024,
+            BlockSize::K4 => unsafe { NonZeroUsize::new_unchecked(4 * 1024) },
+            BlockSize::K8 => unsafe { NonZeroUsize::new_unchecked(8 * 1024) },
+            BlockSize::K16 => unsafe { NonZeroUsize::new_unchecked(16 * 1024) },
+            BlockSize::K32 => unsafe { NonZeroUsize::new_unchecked(32 * 1024) },
+            BlockSize::K64 => unsafe { NonZeroUsize::new_unchecked(64 * 1024) },
+            BlockSize::K128 => unsafe { NonZeroUsize::new_unchecked(128 * 1024) },
+            BlockSize::K256 => unsafe { NonZeroUsize::new_unchecked(256 * 1024) },
+            BlockSize::K512 => unsafe { NonZeroUsize::new_unchecked(512 * 1024) },
+            BlockSize::M1 => unsafe { NonZeroUsize::new_unchecked(1024 * 1024) },
+            BlockSize::M2 => unsafe { NonZeroUsize::new_unchecked(2 * 1024 * 1024) },
+            BlockSize::M4 => unsafe { NonZeroUsize::new_unchecked(4 * 1024 * 1024) },
+            BlockSize::M8 => unsafe { NonZeroUsize::new_unchecked(8 * 1024 * 1024) },
+            BlockSize::M16 => unsafe { NonZeroUsize::new_unchecked(16 * 1024 * 1024) },
         }
     }
 }
@@ -124,7 +125,7 @@ struct ThreadConfig {
     thread_index: usize,
     file_path: PathBuf,
     ops: Vec<WriteOp>,
-    block_size: usize,
+    block_size: NonZeroUsize,
 }
 
 /// Helper to generate filenames
@@ -171,7 +172,7 @@ async fn run_iteration_measured(
     qdepth: usize,
     file: Rc<File>,
     ops: &[WriteOp],
-    block_size: usize,
+    block_size: NonZeroUsize,
     initial_buffers: &mut Vec<FixedBuf>, // Take buffers to reuse
 ) -> (IterationResult, Vec<FixedBuf>) {
     let pool =
@@ -363,10 +364,10 @@ fn main() {
         let file_path = get_file_path(t_idx);
 
         // Generate Ops
-        let num_blocks = file_size_per_file / block_size_bytes as u64;
+        let num_blocks = file_size_per_file / block_size_bytes.get() as u64;
         let mut ops = Vec::with_capacity(num_blocks as usize);
         let mut offsets: Vec<u64> = (0..num_blocks)
-            .map(|i| i * block_size_bytes as u64)
+            .map(|i| i * block_size_bytes.get() as u64)
             .collect();
 
         if matches!(args.mode, WriteMode::Rand) {

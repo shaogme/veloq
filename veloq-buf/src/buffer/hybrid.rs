@@ -8,6 +8,7 @@ use crate::ThreadMemory;
 use crossbeam_queue::SegQueue;
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::UnsafeCell;
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
@@ -334,7 +335,7 @@ unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     if thread::current().id() == pool_arc.owner_id {
         let inner = unsafe { &mut *pool_arc.allocator.get() };
         unsafe {
-            if let Err(_e) = inner.dealloc(params.ptr, params.cap, params.context) {
+            if let Err(_e) = inner.dealloc(params.ptr, params.cap.get(), params.context) {
                 #[cfg(debug_assertions)]
                 eprintln!("HybridPool dealloc error: {}", _e);
             }
@@ -388,7 +389,7 @@ impl HybridPool {
         // Drain return queue
         while let Some(params) = self.inner.return_queue.pop() {
             unsafe {
-                if let Err(_e) = allocator.dealloc(params.ptr, params.cap, params.context) {
+                if let Err(_e) = allocator.dealloc(params.ptr, params.cap.get(), params.context) {
                     #[cfg(debug_assertions)]
                     eprintln!("HybridPool deferred dealloc error: {}", _e);
                 }
@@ -414,11 +415,11 @@ impl HybridPool {
 }
 
 impl BackingPool for HybridPool {
-    fn alloc_mem(&self, size: usize) -> AllocResult {
-        if let Some((ptr, cap, global_index, context)) = self.alloc_mem_inner(size) {
+    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
+        if let Some((ptr, cap, global_index, context)) = self.alloc_mem_inner(size.get()) {
             AllocResult::Allocated {
                 ptr,
-                cap,
+                cap: unsafe { NonZeroUsize::new_unchecked(cap) },
                 global_index,
                 context,
             }
@@ -521,12 +522,12 @@ mod tests {
         let memory = memories.pop().unwrap();
 
         let pool = HybridPool::new(memory).unwrap();
-        let res = pool.alloc_mem(4096);
+        let res = pool.alloc_mem(NonZeroUsize::new(4096).unwrap());
         match res {
             AllocResult::Allocated {
                 cap, global_index, ..
             } => {
-                assert_eq!(cap, 4096);
+                assert_eq!(cap.get(), 4096);
                 assert_eq!(global_index, 0);
             }
             _ => panic!("Alloc failed"),

@@ -1,6 +1,4 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use veloq_runtime::config::BlockingPoolConfig;
-use veloq_runtime::runtime::blocking::init_blocking_pool;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -8,9 +6,11 @@ use std::rc::Rc;
 use std::time::Duration;
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 use veloq_runtime::LocalExecutor;
+use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::io::buffer::{BuddySpec, BufPool, BufferConfig, RegisteredPool};
 use veloq_runtime::runtime::Runtime;
+use veloq_runtime::runtime::blocking::init_blocking_pool;
 use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
@@ -53,7 +53,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             let pool = pool.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(async move {
-                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                const CHUNK_SIZE: NonZeroUsize =
+                    unsafe { NonZeroUsize::new_unchecked(4 * 1024 * 1024) };
                 let chunk_size = CHUNK_SIZE;
                 let file_path = Path::new("bench_1gb_test.tmp");
 
@@ -89,7 +90,8 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                         // Use pool directly
                         if let Some(buf) = pool.alloc(CHUNK_SIZE) {
                             let remaining = TOTAL_SIZE - offset;
-                            let write_len = std::cmp::min(remaining, chunk_size as u64) as usize;
+                            let write_len =
+                                std::cmp::min(remaining, chunk_size.get() as u64) as usize;
 
                             let file_clone = file.clone();
                             let current_offset = offset;
@@ -180,7 +182,9 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             // Use a clone for inner loop if needed, though AnyBufPool is cheap to clone
                             // We will need to call .alloc() on it.
 
-                            const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                            const CHUNK_SIZE: NonZeroUsize = unsafe {
+                                NonZeroUsize::new_unchecked(4 * 1024 * 1024)
+                            };
                             let chunk_size = CHUNK_SIZE;
 
                             let start_file_idx = i * FILES_PER_WORKER;
@@ -244,7 +248,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                     if let Some(idx) = found {
                                         if let Some(buf) = pool.alloc(CHUNK_SIZE) {
                                             let remaining = FILE_SIZE - offsets[idx];
-                                            let write_len = std::cmp::min(remaining, chunk_size as u64) as usize;
+                                            let write_len = std::cmp::min(remaining, chunk_size.get() as u64) as usize;
 
                                             let file_clone = files[idx].clone();
                                             let current_offset = offsets[idx];

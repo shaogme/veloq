@@ -45,7 +45,7 @@
 //!
 //! See [`buddy::BuddyPool`] and [`hybrid::HybridPool`] for reference implementations.
 
-use std::{alloc::LayoutError, ptr::NonNull};
+use std::{alloc::LayoutError, num::NonZeroUsize, ptr::NonNull};
 
 pub mod buddy;
 pub mod hybrid;
@@ -63,16 +63,16 @@ pub struct PoolVTable {
 
 #[derive(Debug)]
 pub struct DeallocParams {
-    pub ptr: NonNull<u8>, // Points to the Payload (data), not the header
-    pub cap: usize,       // Capacity of the Payload
-    pub context: usize,   // Context restored from header
+    pub ptr: NonNull<u8>,  // Points to the Payload (data), not the header
+    pub cap: NonZeroUsize, // Capacity of the Payload
+    pub context: usize,    // Context restored from header
 }
 
 #[derive(Debug)]
 pub enum AllocResult {
     Allocated {
         ptr: NonNull<u8>,
-        cap: usize,
+        cap: NonZeroUsize,
         global_index: u16,
         context: usize,
     },
@@ -105,8 +105,26 @@ impl AllocResult {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRegion {
-    pub ptr: NonNull<u8>,
-    pub len: usize,
+    ptr: NonNull<u8>,
+    len: NonZeroUsize,
+}
+
+impl BufferRegion {
+    pub fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
 }
 
 unsafe impl Send for BufferRegion {}
@@ -127,7 +145,7 @@ pub trait BackingPool: std::fmt::Debug + 'static {
     /// Allocate memory without registration context.
     /// Returns allocation result containing ptr, capacity, and header context.
     /// The `global_index` in the result should be ignored or 0.
-    fn alloc_mem(&self, size: usize) -> AllocResult;
+    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult;
 
     /// Get the VTable for this pool (used by FixedBuf for deallocation).
     fn vtable(&self) -> &'static PoolVTable;
@@ -140,7 +158,7 @@ pub trait BackingPool: std::fmt::Debug + 'static {
 /// Represents a pool that is ready for I/O operations (registered if necessary).
 pub trait BufPool: std::fmt::Debug + 'static {
     /// Allocate a buffer ready for I/O.
-    fn alloc(&self, len: usize) -> Option<FixedBuf>;
+    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf>;
 }
 
 /// 核心 Trait：定义 Buffer Pool 的规格
@@ -250,7 +268,7 @@ impl<P: BackingPool> std::fmt::Debug for RegisteredPool<P> {
 }
 
 impl<P: BackingPool> BufPool for RegisteredPool<P> {
-    fn alloc(&self, len: usize) -> Option<FixedBuf> {
+    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
         match self.pool.alloc_mem(len) {
             AllocResult::Allocated {
                 ptr, cap, context, ..
@@ -285,8 +303,8 @@ impl<P: BackingPool> BufPool for RegisteredPool<P> {
 #[derive(Debug)]
 pub struct FixedBuf {
     ptr: NonNull<u8>,
-    len: usize,
-    cap: usize,
+    len: NonZeroUsize,
+    cap: NonZeroUsize,
     global_index: u16,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
@@ -308,7 +326,7 @@ impl FixedBuf {
     #[inline(always)]
     pub unsafe fn new(
         ptr: NonNull<u8>,
-        cap: usize,
+        cap: NonZeroUsize,
         global_index: u16,
         pool_data: NonNull<()>,
         vtable: &'static PoolVTable,
@@ -339,18 +357,18 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len.get()) }
     }
 
     #[inline(always)]
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len.get()) }
     }
 
     /// Access the full capacity as a mutable slice for writing data before set_len is called.
     #[inline(always)]
     pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap.get()) }
     }
 
     #[inline(always)]
@@ -366,21 +384,21 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap.get()
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len
+        self.len.get()
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        false
     }
 
     #[inline(always)]
-    pub fn set_len(&mut self, len: usize) {
+    pub fn set_len(&mut self, len: NonZeroUsize) {
         assert!(len <= self.cap);
         self.len = len;
     }
@@ -425,7 +443,7 @@ impl std::error::Error for AllocError {}
 
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
-    pub alloc: unsafe fn(*const (), usize) -> Option<FixedBuf>,
+    pub alloc: unsafe fn(*const (), NonZeroUsize) -> Option<FixedBuf>,
     pub clone: unsafe fn(*const ()) -> *mut (),
     pub drop: unsafe fn(*mut ()),
     pub fmt: unsafe fn(*const (), &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
@@ -440,7 +458,7 @@ pub struct AnyBufPool {
 impl AnyBufPool {
     /// 从任意实现了 `BufPool + Clone` 的类型构造 `AnyBufPool`。
     pub fn new<P: BufPool + Clone + 'static>(pool: P) -> Self {
-        unsafe fn alloc_shim<P: BufPool>(ptr: *const (), size: usize) -> Option<FixedBuf> {
+        unsafe fn alloc_shim<P: BufPool>(ptr: *const (), size: NonZeroUsize) -> Option<FixedBuf> {
             unsafe {
                 let pool = &*(ptr as *const P);
                 pool.alloc(size)
@@ -490,7 +508,7 @@ impl AnyBufPool {
 }
 
 impl BufPool for AnyBufPool {
-    fn alloc(&self, len: usize) -> Option<FixedBuf> {
+    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
         unsafe { (self.vtable.alloc)(self.data, len) }
     }
 }

@@ -19,7 +19,7 @@ pub struct GlobalAllocatorConfig {
 #[derive(Debug)]
 struct RawSlab {
     ptr: NonNull<u8>,
-    size: usize,
+    size: NonZeroUsize,
 }
 
 // Guarantee RawSlab can be shared across threads (needed for Arc internals)
@@ -27,7 +27,7 @@ unsafe impl Send for RawSlab {}
 unsafe impl Sync for RawSlab {}
 
 impl RawSlab {
-    fn new(size: usize) -> io::Result<Self> {
+    fn new(size: NonZeroUsize) -> io::Result<Self> {
         let ptr = unsafe {
             // Reuse existing os::alloc_huge_pages logic
             os::alloc_huge_pages(size).and_then(|p| {
@@ -90,7 +90,7 @@ impl ThreadMemory {
     /// Returns (base_ptr, total_size).
     /// Used for registering the entire memory block with the kernel (e.g., io_uring).
     pub fn global_region(&self) -> (NonNull<u8>, usize) {
-        (self._owner.ptr, self._owner.size)
+        (self._owner.ptr, self._owner.size.get())
     }
 }
 
@@ -104,7 +104,7 @@ pub struct GlobalAllocator;
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalMemoryInfo {
     pub ptr: NonNull<u8>,
-    pub len: usize,
+    pub len: NonZeroUsize,
 }
 
 // Guarantee thread safety for the info pointing to shared memory
@@ -132,7 +132,10 @@ impl GlobalAllocator {
         let total_size: usize = config.thread_sizes.iter().map(|s| s.get()).sum();
 
         // 1. Allocate a single large chunk (Maximizes utilization, huge page friendly)
-        let slab = Arc::new(RawSlab::new(total_size)?);
+        // SAFETY: total_size is guaranteed to be non-zero because config.thread_sizes is not empty.
+        let slab = Arc::new(RawSlab::new(unsafe {
+            NonZeroUsize::new_unchecked(total_size)
+        })?);
 
         let global_info = GlobalMemoryInfo {
             ptr: slab.ptr,

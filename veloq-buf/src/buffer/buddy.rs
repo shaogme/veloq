@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 // Buddy System Constants
-const ARENA_SIZE: usize = 32 * 1024 * 1024; // 32MB Total to support higher concurrency with overhead
+const ARENA_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(32 * 1024 * 1024) }; // 32MB Total to support higher concurrency with overhead
 const MIN_BLOCK_SIZE: usize = 4096; // 4KB to support 4KB payload with 4KB alignment
 
 // Number of orders: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB
@@ -176,7 +176,7 @@ struct RawBuddyAllocator {
 impl RawBuddyAllocator {
     fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
         // Check memory size
-        if memory.len() < ARENA_SIZE {
+        if memory.len() < ARENA_SIZE.get() {
             // For now fail if provided memory is less than ARENA_SIZE
             // In future we could adjust ARENA_SIZE dynamically
             return Err(AllocError::Oom);
@@ -204,7 +204,7 @@ impl RawBuddyAllocator {
         free_lists[max_order].head = Some(root_node_ptr);
         let free_bitmap = 1 << max_order;
 
-        let leaf_count = ARENA_SIZE / MIN_BLOCK_SIZE;
+        let leaf_count = ARENA_SIZE.get() / MIN_BLOCK_SIZE;
         let mut tags = vec![0u8; leaf_count];
         // 标记第一个最大块为空闲
         tags[0] = max_order as u8;
@@ -303,7 +303,7 @@ impl RawBuddyAllocator {
         while curr_order < NUM_ORDERS - 1 {
             let buddy_offset = self.calculator.buddy_offset(curr_offset, curr_order);
 
-            if buddy_offset >= ARENA_SIZE {
+            if buddy_offset >= ARENA_SIZE.get() {
                 break;
             }
 
@@ -375,7 +375,7 @@ impl BuddyAllocator {
     }
 
     fn calculate_order(size: usize) -> Option<usize> {
-        if size > ARENA_SIZE {
+        if size > ARENA_SIZE.get() {
             return None;
         }
         if size <= MIN_BLOCK_SIZE {
@@ -473,7 +473,7 @@ impl Default for BuddySpec {
     fn default() -> Self {
         Self {
             // SAFETY: ARENA_SIZE is non-zero (32MB)
-            arena_size: unsafe { NonZeroUsize::new_unchecked(ARENA_SIZE) },
+            arena_size: ARENA_SIZE,
         }
     }
 }
@@ -558,7 +558,7 @@ impl BuddyPool {
 }
 
 impl BackingPool for BuddyPool {
-    fn alloc_mem(&self, size: usize) -> AllocResult {
+    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         // Enforce thread locality for allocation
         if thread::current().id() != self.inner.owner_id {
             panic!("BuddyPool::alloc_mem called from non-owner thread");
@@ -571,14 +571,14 @@ impl BackingPool for BuddyPool {
             unsafe { allocator.dealloc(params.ptr, params.context) };
         }
 
-        match allocator.alloc(size) {
+        match allocator.alloc(size.get()) {
             Some((block_ptr, order)) => {
                 let capacity = MIN_BLOCK_SIZE << order;
                 // No header writing needed
 
                 AllocResult::Allocated {
                     ptr: block_ptr,
-                    cap: capacity,
+                    cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
                     // BackingPool doesn't know about registration
                     global_index: 0,
                     context: order,
@@ -602,7 +602,6 @@ impl BackingPool for BuddyPool {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
 
     use super::*;
 
@@ -612,7 +611,7 @@ mod tests {
 
         // Create a real ThreadMemory for testing
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![NonZeroUsize::new(ARENA_SIZE).unwrap()],
+            thread_sizes: vec![ARENA_SIZE],
         };
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();

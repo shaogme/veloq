@@ -102,8 +102,8 @@ impl RioState {
             self.registered_bufs.reserve(regions.len());
 
             for region in regions {
-                let len = region.len;
-                let id = unsafe { reg_fn(region.ptr.as_ptr() as *const u8, len as u32) };
+                let len = region.len();
+                let id = unsafe { reg_fn(region.as_ptr() as *const u8, len as u32) };
 
                 if id == RIO_INVALID_BUFFERID {
                     return Err(io::Error::last_os_error());

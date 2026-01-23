@@ -238,7 +238,9 @@ fn test_iocp_recv_with_buffer_pool() {
     let stream_handle = stream.into_raw_socket().into();
 
     // Alloc buffer
-    let buf = reg_pool.alloc(8192).expect("Failed to alloc buffer");
+    let buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("Failed to alloc buffer");
 
     // Create Recv Op
     let recv_op = Recv {
@@ -269,7 +271,8 @@ fn test_iocp_recv_with_buffer_pool() {
 
                 let mut op =
                     <Recv as crate::io::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
-                op.buf.set_len(bytes_read);
+                op.buf
+                    .set_len(std::num::NonZeroUsize::new(bytes_read).unwrap());
                 assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle.into()) };

@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use crossbeam_deque::Worker;
@@ -70,6 +71,7 @@ pub fn try_current() -> Option<RuntimeContext> {
 
 /// Try to allocate a buffer from the current runtime context.
 pub fn try_alloc(size: usize) -> Option<FixedBuf> {
+    let size = NonZeroUsize::new(size)?;
     try_current()
         .expect("Runtime context not set. Are you running inside an executor?")
         .buf_pool
@@ -81,6 +83,7 @@ pub fn try_alloc(size: usize) -> Option<FixedBuf> {
 /// # Panics
 /// Panics when called outside a runtime context or when the buffer pool is full.
 pub fn alloc(size: usize) -> FixedBuf {
+    let size = NonZeroUsize::new(size).expect("Cannot allocate 0 size");
     let ctx = current();
     ctx.buf_pool.alloc(size).expect("Buffer pool is full")
 }
