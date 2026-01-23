@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, nz};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
@@ -53,8 +53,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             let pool = pool.clone();
             // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
             exec.block_on(async move {
-                const CHUNK_SIZE: NonZeroUsize =
-                    unsafe { NonZeroUsize::new_unchecked(4 * 1024 * 1024) };
+                const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
                 let chunk_size = CHUNK_SIZE;
                 let file_path = Path::new("bench_1gb_test.tmp");
 
@@ -182,9 +181,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             // Use a clone for inner loop if needed, though AnyBufPool is cheap to clone
                             // We will need to call .alloc() on it.
 
-                            const CHUNK_SIZE: NonZeroUsize = unsafe {
-                                NonZeroUsize::new_unchecked(4 * 1024 * 1024)
-                            };
+                            const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
                             let chunk_size = CHUNK_SIZE;
 
                             let start_file_idx = i * FILES_PER_WORKER;

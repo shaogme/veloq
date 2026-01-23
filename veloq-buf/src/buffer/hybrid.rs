@@ -442,11 +442,11 @@ impl BackingPool for HybridPool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::nz;
     use std::num::NonZeroUsize;
 
-    use super::*;
-
-    const ARENA_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20 * 1024 * 1024) };
+    const ARENA_SIZE: NonZeroUsize = nz!(20 * 1024 * 1024);
 
     #[test]
     fn test_allocator_basic() {

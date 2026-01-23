@@ -11,6 +11,21 @@ use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;
 
+/// 创建 NonZeroUsize 的宏
+/// - 输入 0：编译失败
+/// - 输入非 0 字面量/常量：编译通过，且无运行时开销
+macro_rules! nz {
+    ($value:expr) => {{
+        // 1. 利用匿名常量强制进行编译时检查
+        // 如果 $value 为 0，assert! 会 panic，导致编译中断
+        const _: () = assert!($value != 0, "nz! macro: Value cannot be zero!");
+
+        // 2. 如果上面通过了，说明 $value 肯定不为 0
+        // 使用 unsafe 块调用 new_unchecked
+        unsafe { NonZeroUsize::new_unchecked($value) }
+    }};
+}
+
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum WriteMode {
     Seq,
@@ -37,19 +52,19 @@ enum BlockSize {
 impl BlockSize {
     fn as_bytes(&self) -> NonZeroUsize {
         match self {
-            BlockSize::K4 => unsafe { NonZeroUsize::new_unchecked(4 * 1024) },
-            BlockSize::K8 => unsafe { NonZeroUsize::new_unchecked(8 * 1024) },
-            BlockSize::K16 => unsafe { NonZeroUsize::new_unchecked(16 * 1024) },
-            BlockSize::K32 => unsafe { NonZeroUsize::new_unchecked(32 * 1024) },
-            BlockSize::K64 => unsafe { NonZeroUsize::new_unchecked(64 * 1024) },
-            BlockSize::K128 => unsafe { NonZeroUsize::new_unchecked(128 * 1024) },
-            BlockSize::K256 => unsafe { NonZeroUsize::new_unchecked(256 * 1024) },
-            BlockSize::K512 => unsafe { NonZeroUsize::new_unchecked(512 * 1024) },
-            BlockSize::M1 => unsafe { NonZeroUsize::new_unchecked(1024 * 1024) },
-            BlockSize::M2 => unsafe { NonZeroUsize::new_unchecked(2 * 1024 * 1024) },
-            BlockSize::M4 => unsafe { NonZeroUsize::new_unchecked(4 * 1024 * 1024) },
-            BlockSize::M8 => unsafe { NonZeroUsize::new_unchecked(8 * 1024 * 1024) },
-            BlockSize::M16 => unsafe { NonZeroUsize::new_unchecked(16 * 1024 * 1024) },
+            BlockSize::K4 => nz!(4 * 1024),
+            BlockSize::K8 => nz!(8 * 1024),
+            BlockSize::K16 => nz!(16 * 1024),
+            BlockSize::K32 => nz!(32 * 1024),
+            BlockSize::K64 => nz!(64 * 1024),
+            BlockSize::K128 => nz!(128 * 1024),
+            BlockSize::K256 => nz!(256 * 1024),
+            BlockSize::K512 => nz!(512 * 1024),
+            BlockSize::M1 => nz!(1024 * 1024),
+            BlockSize::M2 => nz!(2 * 1024 * 1024),
+            BlockSize::M4 => nz!(4 * 1024 * 1024),
+            BlockSize::M8 => nz!(8 * 1024 * 1024),
+            BlockSize::M16 => nz!(16 * 1024 * 1024),
         }
     }
 }

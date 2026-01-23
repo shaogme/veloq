@@ -2,7 +2,7 @@ use super::{
     AllocError, AllocResult, AnyBufPool, BackingPool, DeallocParams, FixedBuf, PoolSpec,
     PoolVTable, RegisteredPool,
 };
-use crate::ThreadMemory;
+use crate::{ThreadMemory, nz};
 use crossbeam_queue::SegQueue;
 use std::cell::UnsafeCell;
 use std::num::NonZeroUsize;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 // Buddy System Constants
-const ARENA_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(32 * 1024 * 1024) }; // 32MB Total to support higher concurrency with overhead
+const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
 const MIN_BLOCK_SIZE: usize = 4096; // 4KB to support 4KB payload with 4KB alignment
 
 // Number of orders: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB

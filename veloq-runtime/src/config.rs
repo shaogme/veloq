@@ -1,5 +1,7 @@
 use std::{num::NonZeroUsize, time::Duration};
 
+use veloq_buf::nz;
+
 /// I/O Driver Operation Mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
@@ -98,10 +100,7 @@ impl Config {
 
     pub fn worker_threads(self, worker_threads: usize) -> Self {
         Self {
-            worker_threads: Some(
-                NonZeroUsize::new(worker_threads)
-                    .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
-            ),
+            worker_threads: Some(NonZeroUsize::new(worker_threads).unwrap_or(nz!(1))),
             ..self
         }
     }
