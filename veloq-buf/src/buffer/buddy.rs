@@ -580,7 +580,7 @@ impl BackingPool for BuddyPool {
                     ptr: block_ptr,
                     cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
                     // BackingPool doesn't know about registration
-                    global_index: 0,
+                    global_index: None,
                     context: order,
                 }
             }

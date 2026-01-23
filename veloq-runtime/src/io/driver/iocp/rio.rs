@@ -1,4 +1,4 @@
-use crate::io::buffer::{FixedBuf, NO_REGISTRATION_INDEX};
+use crate::io::buffer::FixedBuf;
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::submit::SubmissionResult;
 use crate::io::driver::iocp::{IocpOp, PlatformData};
@@ -265,7 +265,7 @@ impl RioState {
         user_data: usize,
         ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index() != NO_REGISTRATION_INDEX {
+        if buf.buf_index().is_some() {
             let (idx, offset) = buf.resolve_region_info();
             // Solve borrow checker issue: extraction of Copy data (id)
             let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
@@ -305,7 +305,7 @@ impl RioState {
         user_data: usize,
         ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index() != NO_REGISTRATION_INDEX {
+        if buf.buf_index().is_some() {
             let (idx, offset) = buf.resolve_region_info();
             // Solve borrow checker issue
             let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
@@ -347,7 +347,7 @@ impl RioState {
         // Removed `ops` here. Caller must ensure slab registration.
         ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index() == NO_REGISTRATION_INDEX {
+        if buf.buf_index().is_none() {
             return Ok(None);
         }
 
@@ -423,7 +423,7 @@ impl RioState {
         // Removed `ops`
         ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index() == NO_REGISTRATION_INDEX {
+        if buf.buf_index().is_none() {
             return Ok(None);
         }
 

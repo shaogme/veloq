@@ -45,7 +45,11 @@
 //!
 //! See [`buddy::BuddyPool`] and [`hybrid::HybridPool`] for reference implementations.
 
-use std::{alloc::LayoutError, num::NonZeroUsize, ptr::NonNull};
+use std::{
+    alloc::LayoutError,
+    num::{NonZeroU16, NonZeroUsize},
+    ptr::NonNull,
+};
 
 pub mod buddy;
 pub mod hybrid;
@@ -53,7 +57,50 @@ pub mod hybrid;
 pub use buddy::BuddyPool;
 pub use hybrid::HybridPool;
 
-pub const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+
+/// A wrapper for `u16` that guarantees it never equals `S`.
+/// This enables `Option<NotU16<S>>` to have the same size as `u16`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct NotU16<const S: u16>(NonZeroU16);
+
+impl<const S: u16> NotU16<S> {
+    /// Creates a new instance.
+    /// Returns `None` if `n` equals `S`.
+    #[inline]
+    pub const fn new(n: u16) -> Option<Self> {
+        match NonZeroU16::new(n ^ S) {
+            Some(inner) => Some(Self(inner)),
+            None => None,
+        }
+    }
+
+    /// Creates a new instance without checking.
+    ///
+    /// # Safety
+    /// `n` must not equal `S`.
+    #[inline]
+    pub const unsafe fn new_unchecked(n: u16) -> Self {
+        #[cfg(debug_assertions)]
+        debug_assert!(n != S, "Value must not be the sentinel value");
+        Self(unsafe { NonZeroU16::new_unchecked(n ^ S) })
+    }
+
+    /// Returns the primitive value.
+    #[inline]
+    pub const fn get(self) -> u16 {
+        self.0.get() ^ S
+    }
+}
+
+impl<const S: u16> std::fmt::Debug for NotU16<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+pub type GlobalIndex = NotU16<NO_REGISTRATION_INDEX>;
 
 #[derive(Debug)]
 pub struct PoolVTable {
@@ -73,7 +120,7 @@ pub enum AllocResult {
     Allocated {
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
-        global_index: u16,
+        global_index: Option<GlobalIndex>,
         context: usize,
     },
     Failed,
@@ -144,7 +191,7 @@ pub trait BufferRegistrar {
 pub trait BackingPool: std::fmt::Debug + 'static {
     /// Allocate memory without registration context.
     /// Returns allocation result containing ptr, capacity, and header context.
-    /// The `global_index` in the result should be ignored or 0.
+    /// The `global_index` in the result should be ignored or None.
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult;
 
     /// Get the VTable for this pool (used by FixedBuf for deallocation).
@@ -276,11 +323,11 @@ impl<P: BackingPool> BufPool for RegisteredPool<P> {
                 // Use the first registration ID as the global index.
                 // For complex multi-region pools, we might need mapping logic,
                 // but currently Buddy/Hybrid are single-region arenas.
-                let global_index =
-                    self.registration_ids
-                        .first()
-                        .copied()
-                        .unwrap_or(NO_REGISTRATION_INDEX as usize) as u16;
+                let global_index = self
+                    .registration_ids
+                    .first()
+                    .copied()
+                    .and_then(|idx| GlobalIndex::new(idx as u16));
 
                 unsafe {
                     let mut buf = FixedBuf::new(
@@ -305,7 +352,7 @@ pub struct FixedBuf {
     ptr: NonNull<u8>,
     len: NonZeroUsize,
     cap: NonZeroUsize,
-    global_index: u16,
+    global_index: Option<GlobalIndex>,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
     vtable: &'static PoolVTable,
@@ -327,7 +374,7 @@ impl FixedBuf {
     pub unsafe fn new(
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
-        global_index: u16,
+        global_index: Option<GlobalIndex>,
         pool_data: NonNull<()>,
         vtable: &'static PoolVTable,
         context: usize,
@@ -344,7 +391,7 @@ impl FixedBuf {
     }
 
     #[inline(always)]
-    pub fn buf_index(&self) -> u16 {
+    pub fn buf_index(&self) -> Option<GlobalIndex> {
         self.global_index
     }
 

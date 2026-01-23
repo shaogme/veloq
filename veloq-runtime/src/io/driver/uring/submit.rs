@@ -3,7 +3,6 @@
 //! This module implements the logic for submitting operations and handling completions,
 //! exposed as static functions for VTable construction.
 
-use crate::io::buffer::NO_REGISTRATION_INDEX;
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IoFd;
 use io_uring::{opcode, squeue, types};
@@ -74,23 +73,22 @@ macro_rules! make_rw_fixed {
             let ptr = rw_op.buf.as_mut_ptr();
             let len = rw_op.buf.capacity() as u32;
 
-            let use_fixed = buf_index != NO_REGISTRATION_INDEX;
-
-            if !use_fixed {
+            if let Some(idx) = buf_index {
+                let fixed_idx = idx.get();
                 match rw_op.fd {
-                    IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
+                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build(),
-                    IoFd::Fixed(idx) => $type_raw(types::Fixed(idx), ptr, len)
+                    IoFd::Fixed(fd_idx) => $type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build(),
                 }
             } else {
                 match rw_op.fd {
-                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, buf_index)
+                    IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
                         .offset(rw_op.offset)
                         .build(),
-                    IoFd::Fixed(idx) => $type_fixed(types::Fixed(idx), ptr, len, buf_index)
+                    IoFd::Fixed(fd_idx) => $type_raw(types::Fixed(fd_idx), ptr, len)
                         .offset(rw_op.offset)
                         .build(),
                 }
@@ -104,23 +102,22 @@ macro_rules! make_rw_fixed {
             let ptr = rw_op.buf.as_slice().as_ptr();
             let len = rw_op.buf.len() as u32;
 
-            let use_fixed = buf_index != NO_REGISTRATION_INDEX;
-
-            if !use_fixed {
+            if let Some(idx) = buf_index {
+                let fixed_idx = idx.get();
                 match rw_op.fd {
-                    IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
+                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build(),
-                    IoFd::Fixed(idx) => $type_raw(types::Fixed(idx), ptr, len)
+                    IoFd::Fixed(fd_idx) => $type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build(),
                 }
             } else {
                 match rw_op.fd {
-                    IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, buf_index)
+                    IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
                         .offset(rw_op.offset)
                         .build(),
-                    IoFd::Fixed(idx) => $type_fixed(types::Fixed(idx), ptr, len, buf_index)
+                    IoFd::Fixed(fd_idx) => $type_raw(types::Fixed(fd_idx), ptr, len)
                         .offset(rw_op.offset)
                         .build(),
                 }

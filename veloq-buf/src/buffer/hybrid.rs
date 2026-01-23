@@ -1,8 +1,8 @@
 use veloq_bitset::BitSet;
 
 use super::{
-    AllocError, AllocResult, AnyBufPool, BackingPool, DeallocParams, FixedBuf, PoolSpec,
-    PoolVTable, RegisteredPool,
+    AllocError, AllocResult, AnyBufPool, BackingPool, DeallocParams, FixedBuf, GlobalIndex,
+    PoolSpec, PoolVTable, RegisteredPool,
 };
 use crate::ThreadMemory;
 use crossbeam_queue::SegQueue;
@@ -380,7 +380,10 @@ impl HybridPool {
     }
 
     // Helper to return proper types for FixedBuf or AllocResult
-    fn alloc_mem_inner(&self, size: usize) -> Option<(NonNull<u8>, usize, u16, usize)> {
+    fn alloc_mem_inner(
+        &self,
+        size: usize,
+    ) -> Option<(NonNull<u8>, usize, Option<GlobalIndex>, usize)> {
         if thread::current().id() != self.inner.owner_id {
             panic!("HybridPool::alloc_mem called from non-owner thread");
         }
@@ -404,7 +407,7 @@ impl HybridPool {
                 Some((
                     NonNull::new_unchecked(block_ptr),
                     raw.cap,
-                    0, // BackingPool: global_index is 0
+                    None, // BackingPool: global_index is None
                     raw.context,
                 ))
             }
@@ -528,7 +531,7 @@ mod tests {
                 cap, global_index, ..
             } => {
                 assert_eq!(cap.get(), 4096);
-                assert_eq!(global_index, 0);
+                assert!(global_index.is_none());
             }
             _ => panic!("Alloc failed"),
         }

@@ -4,8 +4,7 @@
 
 pub use veloq_buf::buffer::{
     AllocError, AllocResult, AnyBufPool, BackingPool, BufPool, BufferConfig, BufferRegion,
-    BufferRegistrar, DeallocParams, FixedBuf, NO_REGISTRATION_INDEX, PoolSpec, PoolVTable,
-    RegisteredPool,
+    BufferRegistrar, DeallocParams, FixedBuf, PoolSpec, PoolVTable, RegisteredPool,
 };
 
 pub use veloq_buf::GlobalMemoryInfo;
