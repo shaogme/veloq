@@ -63,11 +63,11 @@ mod flavor {
         fn release(&self);
         fn register_send_wait(
             &self,
-            node: &mut WaiterNode,
+            node: Pin<&mut WaiterNode>,
             cx: &Context<'_>,
             is_full: impl Fn() -> bool,
         ) -> bool;
-        fn remove_send_wait(&self, node: &mut WaiterNode);
+        fn remove_send_wait(&self, node: Pin<&mut WaiterNode>);
         fn notify_all_senders(&self);
     }
 
@@ -80,13 +80,13 @@ mod flavor {
         fn release(&self) {}
         fn register_send_wait(
             &self,
-            _node: &mut WaiterNode,
+            _node: Pin<&mut WaiterNode>,
             _cx: &Context<'_>,
             _is_full: impl Fn() -> bool,
         ) -> bool {
             false
         }
-        fn remove_send_wait(&self, _node: &mut WaiterNode) {}
+        fn remove_send_wait(&self, _node: Pin<&mut WaiterNode>) {}
         fn notify_all_senders(&self) {}
     }
 
@@ -115,20 +115,18 @@ mod flavor {
                 let mut lock = self.waiters.lock();
                 if let Some(node) = lock.pop_front() {
                     self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                    unsafe {
-                        node.as_ref().waker.wake();
-                    }
+                    node.as_ref().waker.wake();
                 }
             }
         }
 
         fn register_send_wait(
             &self,
-            node: &mut WaiterNode,
+            node: Pin<&mut WaiterNode>,
             cx: &Context<'_>,
             is_full: impl Fn() -> bool,
         ) -> bool {
-            node.waker.register(cx.waker());
+            node.as_ref().waker.register(cx.waker());
             let mut lock = self.waiters.lock();
             // Double check
             if !is_full() {
@@ -137,22 +135,22 @@ mod flavor {
             unsafe {
                 // 如果已经在链表中，就不重复添加？
                 // 通常 register 每次 poll 调用。
-                if !node.link.is_linked() {
-                    lock.push_back(NonNull::new_unchecked(node as *mut _));
+                if !node.as_ref().link.is_linked() {
+                    lock.push_back(node);
                     self.waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
             true
         }
 
-        fn remove_send_wait(&self, node: &mut WaiterNode) {
+        fn remove_send_wait(&self, node: Pin<&mut WaiterNode>) {
             // 必须检查是否链接，否则 cursor 可能 panic
             if node.link.is_linked() {
                 let mut lock = self.waiters.lock();
                 if node.link.is_linked() {
                     unsafe {
                         // cursor_mut_from_ptr 需要 unsafe
-                        let ptr = NonNull::new_unchecked(node as *mut _);
+                        let ptr = NonNull::from(&*node);
                         let mut cursor = lock.cursor_mut_from_ptr(ptr);
                         cursor.remove();
                         self.waiter_count.fetch_sub(1, Ordering::Relaxed);
@@ -164,7 +162,7 @@ mod flavor {
         fn notify_all_senders(&self) {
             let mut lock = self.waiters.lock();
             while let Some(node) = lock.pop_front() {
-                unsafe { node.as_ref().waker.wake() };
+                node.as_ref().waker.wake();
             }
             self.waiter_count.store(0, Ordering::Relaxed);
         }
@@ -278,7 +276,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Shared<T, F, Q> {
             // Wake all receivers
             let mut lock = self.recv_waiters.lock();
             while let Some(node) = lock.pop_front() {
-                unsafe { node.as_ref().waker.wake() };
+                node.as_ref().waker.wake();
             }
         }
     }
@@ -296,7 +294,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Shared<T, F, Q> {
             // Recheck
             if let Some(node) = lock.pop_front() {
                 self.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
-                unsafe { node.as_ref().waker.wake() };
+                node.as_ref().waker.wake();
             }
         }
     }
@@ -339,7 +337,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericSender<T, F, Q> {
                 SendFuture {
                     sender: self,
                     msg: Some(m),
-                    node: WaiterNode::new(),
+                    node: Box::pin(WaiterNode::new()),
                     queued: false,
                 }
                 .await
@@ -378,7 +376,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
 
         RecvFuture {
             receiver: self,
-            node: WaiterNode::new(),
+            node: Box::pin(WaiterNode::new()),
             queued: false,
         }
         .await
@@ -398,7 +396,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
 struct SendFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     sender: &'a GenericSender<T, F, Q>,
     msg: Option<T>,
-    node: WaiterNode,
+    node: Pin<Box<WaiterNode>>,
     queued: bool,
 }
 
@@ -413,7 +411,10 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
             match this.sender.shared.queue.push(this.msg.take().unwrap()) {
                 Ok(_) => {
                     if this.queued {
-                        this.sender.shared.flavor.remove_send_wait(&mut this.node);
+                        this.sender
+                            .shared
+                            .flavor
+                            .remove_send_wait(this.node.as_mut());
                         this.queued = false;
                     }
                     this.sender.shared.notify_recv_one();
@@ -427,7 +428,10 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
             // 2. Check closed
             if this.sender.shared.is_closed.load(Ordering::Relaxed) {
                 if this.queued {
-                    this.sender.shared.flavor.remove_send_wait(&mut this.node);
+                    this.sender
+                        .shared
+                        .flavor
+                        .remove_send_wait(this.node.as_mut());
                 }
                 return Poll::Ready(Err(SendError(this.msg.take().unwrap())));
             }
@@ -438,7 +442,9 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
                     .sender
                     .shared
                     .flavor
-                    .register_send_wait(&mut this.node, cx, || this.sender.shared.queue.is_full())
+                    .register_send_wait(this.node.as_mut(), cx, || {
+                        this.sender.shared.queue.is_full()
+                    })
                 {
                     this.queued = true;
                     // registered successfully means we should wait now
@@ -461,14 +467,17 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for SendFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            self.sender.shared.flavor.remove_send_wait(&mut self.node);
+            self.sender
+                .shared
+                .flavor
+                .remove_send_wait(self.node.as_mut());
         }
     }
 }
 
 struct RecvFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     receiver: &'a GenericReceiver<T, F, Q>,
-    node: WaiterNode,
+    node: Pin<Box<WaiterNode>>,
     queued: bool,
 }
 
@@ -482,7 +491,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
             // 1. Try Recv
             if let Some(msg) = this.receiver.shared.queue.pop() {
                 if this.queued {
-                    remove_recv_waiter(&this.receiver.shared, &mut this.node);
+                    remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
                     this.queued = false;
                 }
                 this.receiver.shared.flavor.release();
@@ -494,7 +503,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
                 // Re-check to ensure no race where item was pushed before close
                 if let Some(msg) = this.receiver.shared.queue.pop() {
                     if this.queued {
-                        remove_recv_waiter(&this.receiver.shared, &mut this.node);
+                        remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
                         this.queued = false;
                     }
                     this.receiver.shared.flavor.release();
@@ -502,7 +511,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
                 }
 
                 if this.queued {
-                    remove_recv_waiter(&this.receiver.shared, &mut this.node);
+                    remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
                 }
                 return Poll::Ready(Err(TryRecvError::Disconnected));
             }
@@ -513,7 +522,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
             if !this.queued {
                 let mut lock = this.receiver.shared.recv_waiters.lock();
                 unsafe {
-                    lock.push_back(NonNull::new_unchecked(&mut this.node as *mut _));
+                    lock.push_back(this.node.as_mut());
                 }
                 this.receiver
                     .shared
@@ -530,7 +539,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            remove_recv_waiter(&self.receiver.shared, &mut self.node);
+            remove_recv_waiter(&self.receiver.shared, self.node.as_mut());
         }
     }
 }
@@ -538,13 +547,13 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T,
 // Helper for recv removal (since logic is duplicated in Stream)
 fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
     shared: &Shared<T, F, Q>,
-    node: &mut WaiterNode,
+    node: Pin<&mut WaiterNode>,
 ) {
     if node.link.is_linked() {
         let mut lock = shared.recv_waiters.lock();
         if node.link.is_linked() {
             unsafe {
-                let ptr = NonNull::new_unchecked(node as *mut _);
+                let ptr = NonNull::from(&*node);
                 let mut cursor = lock.cursor_mut_from_ptr(ptr);
                 cursor.remove();
                 shared.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
@@ -568,9 +577,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
         loop {
             if let Some(msg) = this.shared.queue.pop() {
                 if this.queued {
-                    remove_recv_waiter(this.shared, unsafe {
-                        this.node.as_mut().get_unchecked_mut()
-                    });
+                    remove_recv_waiter(this.shared, this.node.as_mut());
                     this.queued = false;
                 }
                 this.shared.flavor.release();
@@ -581,9 +588,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
                 // Re-check to ensure no race where item was pushed before close
                 if let Some(msg) = this.shared.queue.pop() {
                     if this.queued {
-                        remove_recv_waiter(this.shared, unsafe {
-                            this.node.as_mut().get_unchecked_mut()
-                        });
+                        remove_recv_waiter(this.shared, this.node.as_mut());
                         this.queued = false;
                     }
                     this.shared.flavor.release();
@@ -591,9 +596,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
                 }
 
                 if this.queued {
-                    remove_recv_waiter(this.shared, unsafe {
-                        this.node.as_mut().get_unchecked_mut()
-                    });
+                    remove_recv_waiter(this.shared, this.node.as_mut());
                 }
                 return Poll::Ready(None);
             }
@@ -603,9 +606,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
             if !this.queued {
                 let mut lock = this.shared.recv_waiters.lock();
                 unsafe {
-                    lock.push_back(NonNull::new_unchecked(
-                        this.node.as_mut().get_unchecked_mut() as *mut _,
-                    ));
+                    lock.push_back(this.node.as_mut());
                 }
                 this.shared
                     .recv_waiter_count
@@ -621,9 +622,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for ReceiverStream<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            remove_recv_waiter(self.shared, unsafe {
-                self.node.as_mut().get_unchecked_mut()
-            });
+            remove_recv_waiter(self.shared, self.node.as_mut());
         }
     }
 }

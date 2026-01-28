@@ -1,7 +1,7 @@
-use crate::adapter::Adapter;
 use crate::cursor::CursorMut;
-use crate::link::Link;
+use crate::{Adapter, Link};
 use core::marker::PhantomData;
+use core::pin::Pin;
 use core::ptr::NonNull;
 
 pub struct LinkedList<A: Adapter> {
@@ -36,9 +36,15 @@ impl<A: Adapter> LinkedList<A> {
     }
 
     /// 将节点添加到尾部
-    pub fn push_back(&mut self, value: NonNull<A::Value>) {
+    ///
+    /// # Safety
+    /// 必须保证 value 在链表中存在期间有效。
+    pub unsafe fn push_back(&mut self, value: Pin<&mut A::Value>) {
         unsafe {
-            let link_ptr = self.adapter.get_link(value);
+            // Unsafe: get_unchecked_mut is required to get a raw pointer for the adapter.
+            // We guarantee we do not move out of this reference.
+            let raw_val = value.get_unchecked_mut();
+            let link_ptr = self.adapter.get_link(NonNull::from(raw_val));
             let link = link_ptr.as_ref();
 
             if link.is_linked() {
@@ -46,13 +52,13 @@ impl<A: Adapter> LinkedList<A> {
             }
 
             let old_tail = self.tail;
-            *link.next.get() = None;
-            *link.prev.get() = old_tail;
-            *link.linked.get() = true;
+            link.next.with_mut(|n| *n = None);
+            link.prev.with_mut(|p| *p = old_tail);
+            link.linked.with_mut(|l| *l = true);
 
             if let Some(tail) = old_tail {
                 let tail_link = tail.as_ref();
-                *tail_link.next.get() = Some(link_ptr);
+                tail_link.next.with_mut(|n| *n = Some(link_ptr));
             } else {
                 self.head = Some(link_ptr);
             }
@@ -63,16 +69,16 @@ impl<A: Adapter> LinkedList<A> {
     }
 
     /// 从头部移除节点
-    pub fn pop_front(&mut self) -> Option<NonNull<A::Value>> {
+    pub fn pop_front(&mut self) -> Option<Pin<&mut A::Value>> {
         unsafe {
             let head = self.head?;
             // head 是 NonNull<Link>
             let head_link = head.as_ref();
-            let next = *head_link.next.get();
+            let next = head_link.next.with(|n| *n);
 
             if let Some(next_ptr) = next {
                 let next_link = next_ptr.as_ref();
-                *next_link.prev.get() = None;
+                next_link.prev.with_mut(|p| *p = None);
             } else {
                 self.tail = None;
             }
@@ -83,7 +89,10 @@ impl<A: Adapter> LinkedList<A> {
             // 清理取出的 link 状态
             head_link.unsafe_unlink();
 
-            Some(self.adapter.get_value(head))
+            let val_ptr = self.adapter.get_value(head);
+            // Unsafe: We trust the adapter gives us a valid pointer to the object.
+            // We return Pin because the object was pinned when inserted (guaranteed by API).
+            Some(Pin::new_unchecked(&mut *val_ptr.as_ptr()))
         }
     }
 
@@ -106,7 +115,20 @@ impl<A: Adapter> LinkedList<A> {
 impl<A: Adapter> Drop for LinkedList<A> {
     fn drop(&mut self) {
         // 清理链表防止 Link 数据残留
-        while self.pop_front().is_some() {}
+        let mut current = self.head;
+        self.head = None;
+        self.tail = None;
+        self.len = 0;
+
+        while let Some(link_ptr) = current {
+            unsafe {
+                let link = link_ptr.as_ref();
+                // 必须在 unlink 之前获取 next，因为 unlink 会清除 next
+                let next = link.next.with(|n| *n);
+                link.unsafe_unlink();
+                current = next;
+            }
+        }
     }
 }
 
@@ -121,8 +143,6 @@ impl<A: Adapter> core::fmt::Debug for LinkedList<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::Adapter;
-    use crate::link::Link;
     use std::boxed::Box;
 
     struct TestNode {
@@ -152,37 +172,30 @@ mod tests {
         let mut list = LinkedList::new(TestAdapter);
         assert!(list.is_empty());
 
-        let node1 = Box::new(TestNode {
+        let mut node1 = Box::pin(TestNode {
             val: 1,
             link: Link::new(),
         });
-        let node2 = Box::new(TestNode {
+        let mut node2 = Box::pin(TestNode {
             val: 2,
             link: Link::new(),
         });
 
-        let ptr1 = NonNull::new(Box::into_raw(node1)).unwrap();
-        let ptr2 = NonNull::new(Box::into_raw(node2)).unwrap();
-
-        list.push_back(ptr1);
-        list.push_back(ptr2);
+        unsafe {
+            list.push_back(node1.as_mut());
+            list.push_back(node2.as_mut());
+        }
 
         assert_eq!(list.len(), 2);
         assert!(!list.is_empty());
 
         let popped1 = list.pop_front().unwrap();
-        unsafe {
-            assert_eq!(popped1.as_ref().val, 1);
-            let _ = Box::from_raw(popped1.as_ptr());
-        }
+        assert_eq!(popped1.val, 1);
 
         assert_eq!(list.len(), 1);
 
         let popped2 = list.pop_front().unwrap();
-        unsafe {
-            assert_eq!(popped2.as_ref().val, 2);
-            let _ = Box::from_raw(popped2.as_ptr());
-        }
+        assert_eq!(popped2.val, 2);
 
         assert!(list.is_empty());
         assert!(list.pop_front().is_none());
@@ -195,21 +208,20 @@ mod tests {
         // We should verify that the nodes are still valid but unlinked.
 
         let mut list = LinkedList::new(TestAdapter);
-        let node = Box::new(TestNode {
+        let mut node = Box::pin(TestNode {
             val: 10,
             link: Link::new(),
         });
-        let ptr = NonNull::new(Box::into_raw(node)).unwrap();
-
-        list.push_back(ptr);
-        drop(list);
 
         unsafe {
-            // Node should be unlinked
-            let node_ref = ptr.as_ref();
-            assert!(!node_ref.link.is_linked());
-            // We can now drop the node
-            let _ = Box::from_raw(ptr.as_ptr());
+            list.push_back(node.as_mut());
         }
+        drop(list);
+
+        // Node is automatically dropped when `node` variable goes out of scope here.
+        // We just need to verify linkage integrity via unsafe inspection if needed,
+        // but with Box::pin we are limited in accessing internal link state if we don't hold ref.
+        // However, node is still alive here.
+        assert!(!node.link.is_linked());
     }
 }

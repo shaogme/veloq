@@ -1,0 +1,271 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug unit tests in library 'veloq_bitset'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=veloq-bitset"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'veloq_runtime'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=veloq-runtime"
+                ]
+            }
+        },
+        {
+            "name": "Debug benchmark 'fs_benchmark'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bench=fs_benchmark",
+                    "--package=veloq-runtime"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'atomic_waker'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=atomic-waker"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'intrusive_linklist'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=intrusive-linklist"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'integration_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=integration_test",
+                    "--package=intrusive-linklist"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'veloq_buf'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=veloq-buf"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'veloq_sync'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'loom_mpmc'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=loom_mpmc",
+                    "--package=veloq-sync",
+                    "--features=loom"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'loom_mpsc'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=loom_mpsc",
+                    "--package=veloq-sync",
+                    "--features=loom"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'loom_mutex'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=loom_mutex",
+                    "--package=veloq-sync",
+                    "--features=loom"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'loom_oneshot'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=loom_oneshot",
+                    "--package=veloq-sync",
+                    "--features=loom"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'loom_rwlock'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=loom_rwlock",
+                    "--package=veloq-sync",
+                    "--features=loom"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'mpmc'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=mpmc",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'mpsc'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=mpsc",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'mutex'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=mutex",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'oneshot'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=oneshot",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'rwlock'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=rwlock",
+                    "--package=veloq-sync"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'veloq_wheel'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=veloq-wheel"
+                ]
+            }
+        },
+        {
+            "name": "Debug benchmark 'wheel_bench'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bench=wheel_bench",
+                    "--package=veloq-wheel"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'disk-bench'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=disk-bench",
+                    "--package=disk-bench"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'disk-bench'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=disk-bench",
+                    "--package=disk-bench"
+                ]
+            }
+        }
+    ]
+}

@@ -162,7 +162,7 @@ fn register_into_waiting_queue<T, A: WaiterAction>(
         return;
     }
 
-    A::get_list(state).push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
+    unsafe { A::get_list(state).push_back(node) };
 }
 
 fn remove_from_the_waiting_queue<T, A: WaiterAction>(
@@ -245,7 +245,7 @@ impl<T> State<T> {
             self.channel.push_back(item);
 
             Ok(self.recv_waiters.pop_front().map(|n| {
-                unsafe { n.as_ref() }
+                n.as_ref()
                     .waker
                     .borrow_mut()
                     .take()
@@ -277,7 +277,7 @@ impl<T> State<T> {
                 item,
                 self.send_waiters
                     .pop_front()
-                    .and_then(|node| unsafe { node.as_ref() }.waker.borrow_mut().take()),
+                    .and_then(|node| node.as_ref().waker.borrow_mut().take()),
             ))),
             None => {
                 if self.tx_count > 0 {
@@ -416,8 +416,7 @@ fn wake_up_all(waiters: &mut LinkedList<WaiterAdapter>) {
     let mut cursor = waiters.front_mut();
     while !cursor.is_null() {
         {
-            let mut node_ptr = cursor.get().expect("Waiter queue check");
-            let node = unsafe { Pin::new_unchecked(node_ptr.as_mut()) };
+            let node = cursor.get().expect("Waiter queue check");
             node.waker
                 .borrow_mut()
                 .take()

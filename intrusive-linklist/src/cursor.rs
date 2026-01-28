@@ -1,6 +1,6 @@
-use crate::adapter::Adapter;
-use crate::link::Link;
 use crate::list::LinkedList;
+use crate::{Adapter, Link};
+use core::pin::Pin;
 use core::ptr::NonNull;
 
 pub struct CursorMut<'a, A: Adapter> {
@@ -13,26 +13,44 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
         Self { list, current }
     }
 
-    /// 获取当前指向的元素
-    pub fn get(&self) -> Option<NonNull<A::Value>> {
+    /// 获取当前指向元素的原始指针
+    pub fn get_raw(&self) -> Option<NonNull<A::Value>> {
         self.current
             .map(|link| unsafe { self.list.adapter.get_value(link) })
     }
 
+    /// 获取当前指向的元素引用
+    pub fn get(&self) -> Option<&A::Value> {
+        self.current.map(|link| unsafe {
+            let value_ptr = self.list.adapter.get_value(link);
+            &*value_ptr.as_ptr()
+        })
+    }
+
+    /// 获取当前指向的元素可变引用（Pinned）
+    ///
+    /// 返回 Pin<&mut T> 以防止节点在内存中被移动，这对侵入式链表至关重要。
+    pub fn get_mut(&mut self) -> Option<Pin<&mut A::Value>> {
+        self.current.map(|link| unsafe {
+            let value_ptr = self.list.adapter.get_value(link);
+            Pin::new_unchecked(&mut *value_ptr.as_ptr())
+        })
+    }
+
     /// 移除当前指向的元素，并将游标移动到下一个元素。
     /// 返回被移除的元素。
-    pub fn remove(&mut self) -> Option<NonNull<A::Value>> {
+    pub fn remove(&mut self) -> Option<Pin<&mut A::Value>> {
         let current_link_ptr = self.current?;
 
         unsafe {
             let current_link = current_link_ptr.as_ref();
-            let prev = *current_link.prev.get();
-            let next = *current_link.next.get();
+            let prev = current_link.prev.with(|p| *p);
+            let next = current_link.next.with(|n| *n);
 
             // 更新 prev 的 next
             if let Some(prev_ptr) = prev {
                 let prev_link = prev_ptr.as_ref();
-                *prev_link.next.get() = next;
+                prev_link.next.with_mut(|n| *n = next);
             } else {
                 // 如果没有 prev，说明是 head
                 self.list.head = next;
@@ -41,7 +59,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
             // 更新 next 的 prev
             if let Some(next_ptr) = next {
                 let next_link = next_ptr.as_ref();
-                *next_link.prev.get() = prev;
+                next_link.prev.with_mut(|p| *p = prev);
             } else {
                 // 如果没有 next，说明是 tail
                 self.list.tail = prev;
@@ -55,7 +73,8 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
             // 清理被移除节点的连接状态
             current_link.unsafe_unlink();
 
-            Some(self.list.adapter.get_value(current_link_ptr))
+            let val_ptr = self.list.adapter.get_value(current_link_ptr);
+            Some(Pin::new_unchecked(&mut *val_ptr.as_ptr()))
         }
     }
 
@@ -63,7 +82,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
     pub fn move_next(&mut self) {
         if let Some(curr) = self.current {
             unsafe {
-                self.current = *curr.as_ref().next.get();
+                self.current = curr.as_ref().next.with(|n| *n);
             }
         } else {
             self.current = None;
@@ -78,8 +97,6 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::Adapter;
-    use crate::link::Link;
     use std::boxed::Box;
 
     struct TestNode {
@@ -107,67 +124,67 @@ mod tests {
     #[test]
     fn test_cursor_traversal() {
         let mut list = LinkedList::new(TestAdapter);
-        let node1 = Box::new(TestNode {
+        let mut node1 = Box::pin(TestNode {
             val: 1,
             link: Link::new(),
         });
-        let node2 = Box::new(TestNode {
+        let mut node2 = Box::pin(TestNode {
             val: 2,
             link: Link::new(),
         });
-        let node3 = Box::new(TestNode {
+        let mut node3 = Box::pin(TestNode {
             val: 3,
             link: Link::new(),
         });
 
         unsafe {
-            list.push_back(NonNull::new_unchecked(Box::into_raw(node1)));
-            list.push_back(NonNull::new_unchecked(Box::into_raw(node2)));
-            list.push_back(NonNull::new_unchecked(Box::into_raw(node3)));
+            list.push_back(node1.as_mut());
+            list.push_back(node2.as_mut());
+            list.push_back(node3.as_mut());
         }
 
         let mut cursor = list.front_mut();
 
-        assert_eq!(unsafe { cursor.get().unwrap().as_ref().val }, 1);
+        assert_eq!(cursor.get().unwrap().val, 1);
         cursor.move_next();
-        assert_eq!(unsafe { cursor.get().unwrap().as_ref().val }, 2);
+        assert_eq!(cursor.get().unwrap().val, 2);
         cursor.move_next();
-        assert_eq!(unsafe { cursor.get().unwrap().as_ref().val }, 3);
+        assert_eq!(cursor.get().unwrap().val, 3);
         cursor.move_next();
         assert!(cursor.get().is_none());
         assert!(cursor.is_null());
 
         // Cleanup
-        while list.pop_front().is_some() {}
-        // Since pop_front returns NonNull but doesn't drop box, we leaked memory unless we capture it.
-        // But for this test, we accept leak or should clean properly?
-        // Let's rely on drop(list) cleaning links, but we leak memory.
-        // To be correct:
+        // In this test with stack pinned boxes, we rely on Drop of list to unlink,
+        // and stack unwinding to drop nodes.
+        // But popping check is fine.
+        while let Some(popped) = list.pop_front() {
+            // Just verifying it pops.
+            let _ = popped;
+        }
     }
 
     #[test]
     fn test_cursor_remove() {
         let mut list = LinkedList::new(TestAdapter);
-        let node1 = Box::new(TestNode {
+        let mut node1 = Box::pin(TestNode {
             val: 1,
             link: Link::new(),
         });
-        let node2 = Box::new(TestNode {
+        let mut node2 = Box::pin(TestNode {
             val: 2,
             link: Link::new(),
         });
-        let node3 = Box::new(TestNode {
+        let mut node3 = Box::pin(TestNode {
             val: 3,
             link: Link::new(),
         });
 
-        let ptr1 = unsafe { NonNull::new_unchecked(Box::into_raw(node1)) };
-        let ptr2 = unsafe { NonNull::new_unchecked(Box::into_raw(node2)) };
-        let ptr3 = unsafe { NonNull::new_unchecked(Box::into_raw(node3)) };
-
-        list.push_back(ptr1);
-        list.push_back(ptr2);
-        list.push_back(ptr3);
+        unsafe {
+            list.push_back(node1.as_mut());
+            list.push_back(node2.as_mut());
+            list.push_back(node3.as_mut());
+        }
 
         let mut cursor = list.front_mut();
         // Pointing at 1
@@ -175,21 +192,16 @@ mod tests {
         // Pointing at 2
 
         let removed = cursor.remove().unwrap();
-        unsafe {
-            assert_eq!(removed.as_ref().val, 2);
-            let _ = Box::from_raw(removed.as_ptr());
-        }
+        assert_eq!(removed.val, 2);
 
         // Cursor should now point to 3 (next element)
         // Cursor should now point to 3 (next element)
-        assert_eq!(unsafe { cursor.get().unwrap().as_ref().val }, 3);
+        // Cursor should now point to 3 (next element)
+        assert_eq!(cursor.get().unwrap().val, 3);
 
         // Remove 3
         let removed3 = cursor.remove().unwrap();
-        unsafe {
-            assert_eq!(removed3.as_ref().val, 3);
-            let _ = Box::from_raw(removed3.as_ptr());
-        }
+        assert_eq!(removed3.val, 3);
 
         // Cursor null
         assert!(cursor.get().is_none());
@@ -198,9 +210,6 @@ mod tests {
         drop(cursor);
         assert_eq!(list.len(), 1);
         let head = list.pop_front().unwrap();
-        unsafe {
-            assert_eq!(head.as_ref().val, 1);
-            let _ = Box::from_raw(head.as_ptr());
-        }
+        assert_eq!(head.val, 1);
     }
 }

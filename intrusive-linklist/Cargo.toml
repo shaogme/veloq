@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+loom = { version = "0.7.2", optional = true }
+
+[features]
+loom = ["dep:loom"]

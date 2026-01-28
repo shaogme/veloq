@@ -36,9 +36,9 @@ fn test_integration_flow() {
     let mut list = LinkedList::new(MyAdapter);
 
     // Create nodes
-    let nodes: Vec<_> = (0..5)
+    let mut nodes: Vec<_> = (0..5)
         .map(|i| {
-            Box::new(MyNode {
+            Box::pin(MyNode {
                 id: i,
                 link: Link::new(),
             })
@@ -46,10 +46,9 @@ fn test_integration_flow() {
         .collect();
 
     // Push all
-    for node in nodes {
-        let ptr = Box::into_raw(node);
+    for node in nodes.iter_mut() {
         unsafe {
-            list.push_back(NonNull::new_unchecked(ptr));
+            list.push_back(node.as_mut());
         }
     }
 
@@ -58,13 +57,8 @@ fn test_integration_flow() {
     // Verify order and remove
     let mut count = 0;
     while let Some(ptr) = list.pop_front() {
-        unsafe {
-            let node_ref = ptr.as_ref();
-            assert_eq!(node_ref.id, count);
-            count += 1;
-            // Clean up memory
-            let _ = Box::from_raw(ptr.as_ptr());
-        }
+        assert_eq!(ptr.id, count);
+        count += 1;
     }
 
     assert_eq!(count, 5);
@@ -74,35 +68,32 @@ fn test_integration_flow() {
 #[test]
 fn test_cursor_integration() {
     let mut list = LinkedList::new(MyAdapter);
-    let node1 = Box::into_raw(Box::new(MyNode {
+    let mut node1 = Box::pin(MyNode {
         id: 100,
         link: Link::new(),
-    }));
-    let node2 = Box::into_raw(Box::new(MyNode {
+    });
+    let mut node2 = Box::pin(MyNode {
         id: 200,
         link: Link::new(),
-    }));
-    let node3 = Box::into_raw(Box::new(MyNode {
+    });
+    let mut node3 = Box::pin(MyNode {
         id: 300,
         link: Link::new(),
-    }));
+    });
 
     unsafe {
-        list.push_back(NonNull::new_unchecked(node1));
-        list.push_back(NonNull::new_unchecked(node2));
-        list.push_back(NonNull::new_unchecked(node3));
+        list.push_back(node1.as_mut());
+        list.push_back(node2.as_mut());
+        list.push_back(node3.as_mut());
     }
 
     let mut cursor = list.front_mut();
 
     // Find 200 and remove
     while let Some(node) = cursor.get() {
-        if unsafe { node.as_ref().id } == 200 {
+        if node.id == 200 {
             let removed = cursor.remove().unwrap();
-            unsafe {
-                assert_eq!(removed.as_ref().id, 200);
-                let _ = Box::from_raw(removed.as_ptr());
-            }
+            assert_eq!(removed.id, 200);
             // After removal, cursor points to 300
         } else {
             cursor.move_next();
@@ -113,12 +104,8 @@ fn test_cursor_integration() {
     assert_eq!(list.len(), 2);
 
     let v1 = list.pop_front().unwrap();
-    let v2 = list.pop_front().unwrap();
+    assert_eq!(v1.id, 100);
 
-    unsafe {
-        assert_eq!(v1.as_ref().id, 100);
-        assert_eq!(v2.as_ref().id, 300);
-        let _ = Box::from_raw(v1.as_ptr());
-        let _ = Box::from_raw(v2.as_ptr());
-    }
+    let v2 = list.pop_front().unwrap();
+    assert_eq!(v2.id, 300);
 }
