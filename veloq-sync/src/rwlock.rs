@@ -2,12 +2,12 @@ use crate::shim::atomic::{AtomicUsize, Ordering};
 use crate::shim::cell::UnsafeCell;
 use crate::shim::lock::SpinLock;
 use crate::waker::{WaiterAdapter, WaiterNode};
-use intrusive_linklist::LinkedList;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
+use veloq_intrusive_linklist::LinkedList;
 
 /// An asynchronous reader-writer lock.
 pub struct RwLock<T: ?Sized> {

@@ -9,13 +9,13 @@ use crate::{
     waker::{WaiterAdapter, WaiterNode},
 };
 use futures_core::stream::Stream;
-use intrusive_linklist::LinkedList;
 use std::{
     future::Future,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
+use veloq_intrusive_linklist::LinkedList;
 
 mod flavor {
     use super::*;

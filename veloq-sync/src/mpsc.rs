@@ -6,11 +6,11 @@ use crate::{
         queue::SegQueue,
     },
 };
-use atomic_waker::AtomicWaker;
 use futures_core::stream::Stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use veloq_atomic_waker::AtomicWaker;
 
 /// A multi-producer, single-consumer channel for sending values across threads
 /// to a local executor task.

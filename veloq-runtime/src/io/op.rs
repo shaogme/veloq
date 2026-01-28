@@ -16,7 +16,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use atomic_waker::AtomicWaker;
+use veloq_atomic_waker::AtomicWaker;
 
 use tracing::trace;
 

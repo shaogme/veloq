@@ -1,19 +1,28 @@
 [package]
 name = "veloq-runtime"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [dependencies]
-veloq-bitset = { path = "../veloq-bitset" }
-veloq-sync = { path = "../veloq-sync" }
-veloq-buf = { path = "../veloq-buf" }
+veloq-bitset = { workspace = true }
+veloq-sync = { workspace = true }
+veloq-buf = { workspace = true }
+veloq-intrusive-linklist = { workspace = true }
+veloq-atomic-waker = { workspace = true }
 
 num_cpus = "1.17.0"
 crossbeam-utils = { workspace = true }
-intrusive-linklist = { path = "../intrusive-linklist" }
+
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
-atomic-waker = { path = "../atomic-waker" }
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
 rustc-hash = "2.1.1"
@@ -24,7 +33,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true }
-veloq-wheel = { path = "../veloq-wheel" }
+veloq-wheel = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["html_reports"] }

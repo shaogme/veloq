@@ -1,5 +1,5 @@
 [package]
-name = "veloq-buf"
+name = "veloq-wheel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,14 +12,10 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-bitset = { workspace = true }
-crossbeam-queue = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true }
+slotmap = "1.0"
+[[bench]]
+name = "wheel_bench"
+harness = false
 
 [dev-dependencies]
-tempfile = "3"
+criterion = "0.7.0"

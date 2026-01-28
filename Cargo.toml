@@ -1,18 +1,45 @@
 [workspace]
 members = [
-    "veloq-bitset",
     "veloq-runtime",
-    "veloq-wheel",
     "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf", 
-    "atomic-waker", 
-    "intrusive-linklist", 
-    "veloq-shim",
+    "utils/veloq-shim",
+    "utils/veloq-atomic-waker", 
+    "utils/veloq-intrusive-linklist", 
+    "utils/veloq-bitset",
+    "utils/veloq-wheel",
 ]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Shao G. <shaogme@gmail.com>"]
+repository = "https://github.com/shaogme/veloq"
+description = "An asynchronous Rust runtime based on the completion model."
+readme = "README.md"
+homepage = "https://github.com/shaogme/veloq"
+documentation = "https://docs.rs/veloq"
+keywords = ["async", "runtime", "io-uring", "iocp", "completion-based"]
+categories = ["asynchronous", "network-programming"]
+
 [workspace.dependencies]
+
+# Internal Crates
+veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
+veloq-sync = { path = "veloq-sync", version = "0.1.0" }
+veloq-buf = { path = "veloq-buf", version = "0.1.0" }
+
+veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
+veloq-atomic-waker = { path = "utils/veloq-atomic-waker", version = "0.1.0" }
+veloq-intrusive-linklist = { path = "utils/veloq-intrusive-linklist", version = "0.1.0" }
+veloq-bitset = { path = "utils/veloq-bitset", version = "0.1.0" }
+veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
+
+
+# External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
 futures-core = "0.3"
 crossbeam-queue = "0.3"

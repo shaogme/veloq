@@ -1,6 +1,6 @@
-use atomic_waker::AtomicWaker;
-use intrusive_linklist::{Link, intrusive_adapter};
 use std::marker::PhantomPinned;
+use veloq_atomic_waker::AtomicWaker;
+use veloq_intrusive_linklist::{Link, intrusive_adapter};
 
 pub struct WaiterNode {
     pub(crate) waker: AtomicWaker,

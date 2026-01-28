@@ -1,6 +1,6 @@
 use futures_core::Future;
 use futures_core::stream::Stream;
-use intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 use std::{
     cell::RefCell,

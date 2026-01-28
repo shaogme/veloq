@@ -1,5 +1,5 @@
 [package]
-name = "disk-bench"
+name = "veloq-bitset"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,3 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
-rand = "0.8"
-veloq-runtime = { workspace = true }
