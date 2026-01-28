@@ -5,7 +5,7 @@ use crate::io::driver::iocp::{IocpOp, PlatformData};
 use crate::io::driver::op_registry::OpRegistry;
 use crate::io::op::IoFd;
 use crate::io::socket::SockAddrStorage;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -25,7 +25,7 @@ pub struct RioState {
     pub(crate) cq: RIO_CQ,
     pub(crate) registered_bufs: Vec<RioBufferInfo>,
     // RIO Request Queues per socket (raw handle)
-    pub(crate) rio_rqs: HashMap<HANDLE, RIO_RQ>,
+    pub(crate) rio_rqs: FxHashMap<HANDLE, RIO_RQ>,
     // RIO Request Queues for registered files (O(1) lookup)
     pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
     // RIO Registration for Slab Pages (for Address Buffers)
@@ -66,7 +66,7 @@ impl RioState {
             Ok(Some(Self {
                 cq,
                 registered_bufs: Vec::new(),
-                rio_rqs: HashMap::new(),
+                rio_rqs: FxHashMap::default(),
                 registered_rio_rqs: Vec::new(),
                 slab_rio_pages: Vec::new(),
             }))
