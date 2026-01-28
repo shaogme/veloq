@@ -1,5 +1,5 @@
 use crate::shim::Arc;
-use crate::shim::atomic::AtomicUsize;
+use crate::shim::atomic::{AtomicUsize, fence};
 use crate::shim::cell::UnsafeCell;
 
 use std::fmt;
@@ -560,16 +560,19 @@ impl State {
             if State(state).is_closed() {
                 break;
             }
-            // TODO: This could be `Release`, followed by an `Acquire` fence *if*
-            // the `RX_TASK_SET` flag is set. However, `loom` does not support
-            // fences yet.
+
             match cell.compare_exchange_weak(
                 state,
                 state | VALUE_SENT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    if State(state).is_rx_task_set() {
+                        fence(Ordering::Acquire);
+                    }
+                    break;
+                }
                 Err(actual) => state = actual,
             }
         }

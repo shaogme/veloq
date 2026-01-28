@@ -7,7 +7,7 @@ pub mod atomic {
         AtomicI32 as StdAtomicI32, AtomicI64 as StdAtomicI64, AtomicIsize as StdAtomicIsize,
         AtomicPtr as StdAtomicPtr, AtomicU8 as StdAtomicU8, AtomicU16 as StdAtomicU16,
         AtomicU32 as StdAtomicU32, AtomicU64 as StdAtomicU64, AtomicUsize as StdAtomicUsize,
-        Ordering,
+        Ordering, fence,
     };
 
     macro_rules! impl_atomic {
