@@ -6,6 +6,7 @@ mod shim;
 use crate::shim::cell::UnsafeCell;
 use std::ptr::NonNull;
 
+pub use cursor::Cursor;
 pub use cursor::CursorMut;
 pub use list::LinkedList;
 
@@ -59,11 +60,19 @@ impl Link {
     }
 
     /// 强制断开连接（unsafe，需确保已从列表中移除）
-    pub unsafe fn unsafe_unlink(&self) {
+    pub(crate) unsafe fn unsafe_unlink(&self) {
         unsafe {
             self.next.with_mut(|n| *n = None);
             self.prev.with_mut(|p| *p = None);
             self.linked.with_mut(|l| *l = false);
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if self.is_linked() && !std::thread::panicking() {
+            panic!("dropped a node that is still linked");
         }
     }
 }
@@ -84,4 +93,3 @@ impl core::fmt::Debug for Link {
 }
 
 unsafe impl Send for Link {}
-unsafe impl Sync for Link {}

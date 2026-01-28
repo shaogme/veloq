@@ -1,35 +1,12 @@
-use intrusive_linklist::{Adapter, Link, LinkedList};
+use intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use std::boxed::Box;
-use std::ptr::NonNull;
 
 struct MyNode {
     id: usize,
     link: Link,
 }
 
-struct MyAdapter;
-
-unsafe impl Adapter for MyAdapter {
-    type Value = MyNode;
-
-    unsafe fn get_link(&self, value: NonNull<MyNode>) -> NonNull<Link> {
-        let ptr = value.as_ptr();
-        unsafe {
-            // Address of the link field
-            NonNull::new_unchecked(std::ptr::addr_of_mut!((*ptr).link))
-        }
-    }
-
-    unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<MyNode> {
-        let link_ptr = link.as_ptr();
-        // Use standard library offset_of if available
-        let offset = core::mem::offset_of!(MyNode, link); // stable in recent Rust
-        unsafe {
-            let val_ptr = (link_ptr as *mut u8).sub(offset) as *mut MyNode;
-            NonNull::new_unchecked(val_ptr)
-        }
-    }
-}
+intrusive_adapter!(MyAdapter = MyNode { link: Link });
 
 #[test]
 fn test_integration_flow() {

@@ -1,6 +1,6 @@
 use futures_core::Future;
 use futures_core::stream::Stream;
-use intrusive_linklist::{Adapter, Link, LinkedList, container_of, offset_of};
+use intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 use std::{
     cell::RefCell,
@@ -200,29 +200,10 @@ struct WaiterNode {
     _p: PhantomPinned,
 }
 
-struct WaiterAdapter;
+intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
 
 impl WaiterAdapter {
     pub const NEW: Self = WaiterAdapter;
-}
-
-unsafe impl Adapter for WaiterAdapter {
-    type Value = WaiterNode;
-
-    unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
-        let ptr = value.as_ptr() as *mut u8;
-        unsafe {
-            let link_ptr = ptr.add(offset_of!(WaiterNode, link)) as *mut Link;
-            NonNull::new_unchecked(link_ptr)
-        }
-    }
-
-    unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
-        let ptr = link.as_ptr();
-        // container_of macro has unsafe block internally, but let's be safe
-        let value_ptr = container_of!(ptr, WaiterNode, link) as *mut WaiterNode;
-        unsafe { NonNull::new_unchecked(value_ptr) }
-    }
 }
 
 #[derive(Debug)]

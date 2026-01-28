@@ -3,6 +3,46 @@ use crate::{Adapter, Link};
 use core::pin::Pin;
 use core::ptr::NonNull;
 
+pub struct Cursor<'a, A: Adapter> {
+    list: &'a LinkedList<A>,
+    current: Option<NonNull<Link>>, // 当前指向的 Link
+}
+
+impl<'a, A: Adapter> Cursor<'a, A> {
+    pub(crate) fn new(list: &'a LinkedList<A>, current: Option<NonNull<Link>>) -> Self {
+        Self { list, current }
+    }
+
+    /// 获取当前指向元素的原始指针
+    pub fn get_raw(&self) -> Option<NonNull<A::Value>> {
+        self.current
+            .map(|link| unsafe { self.list.adapter.get_value(link) })
+    }
+
+    /// 获取当前指向的元素引用
+    pub fn get(&self) -> Option<&A::Value> {
+        self.current.map(|link| unsafe {
+            let value_ptr = self.list.adapter.get_value(link);
+            &*value_ptr.as_ptr()
+        })
+    }
+
+    // 移动到下一个
+    pub fn move_next(&mut self) {
+        if let Some(curr) = self.current {
+            unsafe {
+                self.current = curr.as_ref().next.with(|n| *n);
+            }
+        } else {
+            self.current = None;
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.current.is_none()
+    }
+}
+
 pub struct CursorMut<'a, A: Adapter> {
     list: &'a mut LinkedList<A>,
     current: Option<NonNull<Link>>, // 当前指向的 Link
@@ -104,22 +144,7 @@ mod tests {
         link: Link,
     }
 
-    struct TestAdapter;
-
-    unsafe impl Adapter for TestAdapter {
-        type Value = TestNode;
-
-        unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
-            let ptr = value.as_ptr();
-            unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*ptr).link)) }
-        }
-
-        unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
-            let link_ptr = link.as_ptr();
-            let val_ptr = crate::container_of!(link_ptr, TestNode, link) as *mut TestNode;
-            unsafe { NonNull::new_unchecked(val_ptr) }
-        }
-    }
+    crate::intrusive_adapter!(TestAdapter = TestNode { link: Link });
 
     #[test]
     fn test_cursor_traversal() {
@@ -211,5 +236,39 @@ mod tests {
         assert_eq!(list.len(), 1);
         let head = list.pop_front().unwrap();
         assert_eq!(head.val, 1);
+    }
+
+    #[test]
+    fn test_readonly_cursor_traversal() {
+        let mut list = LinkedList::new(TestAdapter);
+        let mut node1 = Box::pin(TestNode {
+            val: 10,
+            link: Link::new(),
+        });
+        let mut node2 = Box::pin(TestNode {
+            val: 20,
+            link: Link::new(),
+        });
+
+        unsafe {
+            list.push_back(node1.as_mut());
+            list.push_back(node2.as_mut());
+        }
+
+        // Use read-only cursor
+        let mut cursor = list.front();
+
+        assert_eq!(cursor.get().unwrap().val, 10);
+        cursor.move_next();
+        assert_eq!(cursor.get().unwrap().val, 20);
+        cursor.move_next();
+        assert!(cursor.get().is_none());
+        assert!(cursor.is_null());
+
+        // List is not modified
+        assert_eq!(list.len(), 2);
+
+        // Cleanup: remove nodes from list before they are dropped
+        while list.pop_front().is_some() {}
     }
 }

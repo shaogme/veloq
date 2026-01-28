@@ -1,4 +1,4 @@
-use crate::cursor::CursorMut;
+use crate::cursor::{Cursor, CursorMut};
 use crate::{Adapter, Link};
 use core::marker::PhantomData;
 use core::pin::Pin;
@@ -96,7 +96,13 @@ impl<A: Adapter> LinkedList<A> {
         }
     }
 
-    /// 获取头部 Cursor
+    /// 获取头部 Cursor (只读)
+    pub fn front(&self) -> Cursor<'_, A> {
+        let head = self.head;
+        Cursor::new(self, head)
+    }
+
+    /// 获取头部 Cursor (可变)
     pub fn front_mut(&mut self) -> CursorMut<'_, A> {
         let head = self.head;
         CursorMut::new(self, head)
@@ -109,6 +115,62 @@ impl<A: Adapter> LinkedList<A> {
     pub unsafe fn cursor_mut_from_ptr(&mut self, ptr: NonNull<A::Value>) -> CursorMut<'_, A> {
         let link = unsafe { self.adapter.get_link(ptr) };
         CursorMut::new(self, Some(link))
+    }
+
+    /// 将节点添加到尾部，并返回一个 ScopedGuard。
+    ///
+    /// 当 Guard 离开作用域时，节点会自动从链表中移除。
+    ///
+    /// # Safety
+    /// 必须保证 value 在 Guard 存活期间有效。
+    pub unsafe fn push_back_scoped<'a>(
+        &'a mut self,
+        mut value: Pin<&mut A::Value>,
+    ) -> RemoveOnDrop<'a, A> {
+        unsafe {
+            let node_ptr = NonNull::from(value.as_mut().get_unchecked_mut());
+            // 先 push
+            self.push_back(value);
+            RemoveOnDrop {
+                list: self,
+                node_ptr,
+            }
+        }
+    }
+}
+
+pub struct RemoveOnDrop<'a, A: Adapter> {
+    list: &'a mut LinkedList<A>,
+    node_ptr: NonNull<A::Value>,
+}
+
+impl<'a, A: Adapter> Drop for RemoveOnDrop<'a, A> {
+    fn drop(&mut self) {
+        unsafe {
+            // 安全性：
+            // node_ptr 来自于创建 Guard 时传入的引用，由于 Guard 持有 list 的可变引用，
+            // 且 Guard 的生命周期受限于 list，所以此时 list 有效。
+            // 我们需要检查节点是否仍然链接在链表中。
+            let link_ptr = self.list.adapter.get_link(self.node_ptr);
+            if link_ptr.as_ref().is_linked() {
+                let mut cursor = self.list.cursor_mut_from_ptr(self.node_ptr);
+                cursor.remove();
+            }
+        }
+    }
+}
+
+impl<'a, A: Adapter> core::ops::Deref for RemoveOnDrop<'a, A> {
+    type Target = LinkedList<A>;
+
+    fn deref(&self) -> &Self::Target {
+        self.list
+    }
+}
+
+impl<'a, A: Adapter> core::ops::DerefMut for RemoveOnDrop<'a, A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.list
     }
 }
 
@@ -150,22 +212,7 @@ mod tests {
         link: Link,
     }
 
-    struct TestAdapter;
-
-    unsafe impl Adapter for TestAdapter {
-        type Value = TestNode;
-
-        unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
-            let ptr = value.as_ptr();
-            unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*ptr).link)) }
-        }
-
-        unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
-            let link_ptr = link.as_ptr();
-            let val_ptr = crate::container_of!(link_ptr, TestNode, link) as *mut TestNode;
-            unsafe { NonNull::new_unchecked(val_ptr) }
-        }
-    }
+    crate::intrusive_adapter!(TestAdapter = TestNode { link: Link });
 
     #[test]
     fn test_push_pop() {
@@ -223,5 +270,28 @@ mod tests {
         // but with Box::pin we are limited in accessing internal link state if we don't hold ref.
         // However, node is still alive here.
         assert!(!node.link.is_linked());
+    }
+
+    #[test]
+    fn test_scoped_push() {
+        let mut list = LinkedList::new(TestAdapter);
+        let mut node = Box::pin(TestNode {
+            val: 42,
+            link: Link::new(),
+        });
+
+        {
+            let _guard = unsafe { list.push_back_scoped(node.as_mut()) };
+            assert_eq!(_guard.len(), 1);
+            assert!(node.link.is_linked());
+        } // _guard dropped here, should remove node
+
+        assert_eq!(list.len(), 0);
+        assert!(!node.link.is_linked());
+
+        // Ensure we can push it again (it was cleanly removed)
+        unsafe { list.push_back(node.as_mut()) };
+        assert_eq!(list.len(), 1);
+        list.pop_front();
     }
 }

@@ -24,6 +24,56 @@ macro_rules! container_of {
     }};
 }
 
+/// 宏用于自动生成 `Adapter` 实现
+///
+/// # Example
+///
+/// ```rust
+/// use intrusive_linklist::{intrusive_adapter, Link};
+///
+/// pub struct MyNode {
+///     link: Link,
+///     data: i32,
+/// }
+///
+/// intrusive_adapter!(pub MyAdapter = MyNode { link: Link });
+///
+/// fn main() {
+///     let adapter = MyAdapter;
+/// }
+/// ```
+#[macro_export]
+macro_rules! intrusive_adapter {
+    ($vis:vis $Adapter:ident = $Node:ty { $link_field:ident : Link }) => {
+        $vis struct $Adapter;
+
+        unsafe impl $crate::Adapter for $Adapter {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::Link> {
+                let val_ptr = value.as_ptr();
+                // SAFETY: 调用者必须保证 value 指针有效且未被借用为 &mut（除非这里就在做转换）
+                // addr_of_mut! 不会在 stable 1.51 之前存在，但它是生成裸指针的安全方式
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::Link>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                // container_of 返回 *const T
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     #[repr(C)]
