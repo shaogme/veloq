@@ -1,6 +1,6 @@
-# intrusive-linklist
+# veloq-intrusive-linklist
 
-`intrusive-linklist` 是一个高性能、类型安全的 Rust **侵入式链表 (Intrusive Linked List)** 库。
+`veloq-intrusive-linklist` 是一个高性能、类型安全的 Rust **侵入式链表 (Intrusive Linked List)** 库。
 
 与标准库中的 `Vec` 或 `LinkedList` 不同，侵入式链表将“链接”本身嵌入到数据结构中。这意味着节点本身负责存储其在链表中的连接状态，从而避免了额外的内存分配，并允许在已知节点引用的情况下以 O(1) 的时间复杂度将节点从链表中移除。
 
@@ -24,7 +24,7 @@
 首先，你需要在你的结构体中包含一个 `Link` 字段。
 
 ```rust
-use intrusive_linklist::{Link, intrusive_adapter};
+use veloq_intrusive_linklist::{Link, intrusive_adapter};
 
 pub struct MyNode {
     pub data: i32,
@@ -39,7 +39,7 @@ intrusive_adapter!(pub MyAdapter = MyNode { link: Link });
 ### 2. 基本使用
 
 ```rust
-use intrusive_linklist::{LinkedList, Link};
+use veloq_intrusive_linklist::{LinkedList, Link};
 use std::boxed::Box;
 use std::pin::Pin;
 

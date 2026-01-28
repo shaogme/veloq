@@ -25,7 +25,6 @@ futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
-rustc-hash = "2.1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
@@ -34,6 +33,7 @@ libc = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true }
 veloq-wheel = { workspace = true }
+rustc-hash = "2.1.1"
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["html_reports"] }
