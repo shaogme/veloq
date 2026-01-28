@@ -144,17 +144,15 @@ mod flavor {
         }
 
         fn remove_send_wait(&self, node: Pin<&mut WaiterNode>) {
-            // 必须检查是否链接，否则 cursor 可能 panic
+            // Must acquire lock to check linkage safely to avoid race with notify
+            let mut lock = self.waiters.lock();
             if node.link.is_linked() {
-                let mut lock = self.waiters.lock();
-                if node.link.is_linked() {
-                    unsafe {
-                        // cursor_mut_from_ptr 需要 unsafe
-                        let ptr = NonNull::from(&*node);
-                        let mut cursor = lock.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                        self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                    }
+                unsafe {
+                    // cursor_mut_from_ptr 需要 unsafe
+                    let ptr = NonNull::from(&*node);
+                    let mut cursor = lock.cursor_mut_from_ptr(ptr);
+                    cursor.remove();
+                    self.waiter_count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
@@ -544,20 +542,17 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T,
     }
 }
 
-// Helper for recv removal (since logic is duplicated in Stream)
 fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
     shared: &Shared<T, F, Q>,
     node: Pin<&mut WaiterNode>,
 ) {
+    let mut lock = shared.recv_waiters.lock();
     if node.link.is_linked() {
-        let mut lock = shared.recv_waiters.lock();
-        if node.link.is_linked() {
-            unsafe {
-                let ptr = NonNull::from(&*node);
-                let mut cursor = lock.cursor_mut_from_ptr(ptr);
-                cursor.remove();
-                shared.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
-            }
+        unsafe {
+            let ptr = NonNull::from(&*node);
+            let mut cursor = lock.cursor_mut_from_ptr(ptr);
+            cursor.remove();
+            shared.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
