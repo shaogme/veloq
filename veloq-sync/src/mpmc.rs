@@ -9,7 +9,7 @@ use crate::{
     waker::{WaiterAdapter, WaiterNode},
 };
 use futures_core::stream::Stream;
-use intrusive_collections::LinkedList;
+use intrusive_linklist::LinkedList;
 use std::{
     future::Future,
     pin::Pin,
@@ -152,7 +152,8 @@ mod flavor {
                 if node.link.is_linked() {
                     unsafe {
                         // cursor_mut_from_ptr 需要 unsafe
-                        let mut cursor = lock.cursor_mut_from_ptr(node as *mut _);
+                        let ptr = NonNull::new_unchecked(node as *mut _);
+                        let mut cursor = lock.cursor_mut_from_ptr(ptr);
                         cursor.remove();
                         self.waiter_count.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -543,7 +544,8 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
         let mut lock = shared.recv_waiters.lock();
         if node.link.is_linked() {
             unsafe {
-                let mut cursor = lock.cursor_mut_from_ptr(node as *mut _);
+                let ptr = NonNull::new_unchecked(node as *mut _);
+                let mut cursor = lock.cursor_mut_from_ptr(ptr);
                 cursor.remove();
                 shared.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
             }

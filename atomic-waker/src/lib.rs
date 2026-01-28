@@ -48,7 +48,7 @@ use core::task::Waker;
 /// Here is a simple example providing a `Flag` that can be signalled manually
 /// when it is ready.
 ///
-/// ```
+/// ``` ignore
 /// use futures::future::Future;
 /// use futures::task::{Context, Poll, AtomicWaker};
 /// use std::sync::Arc;
@@ -259,7 +259,7 @@ impl AtomicWaker {
     ///
     /// Here is how `register` is used when implementing a flag.
     ///
-    /// ```
+    /// ``` ignore
     /// use futures::future::Future;
     /// use futures::task::{Context, Poll, AtomicWaker};
     /// use std::sync::atomic::AtomicBool;

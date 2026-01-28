@@ -2,7 +2,7 @@ use crate::shim::atomic::{AtomicUsize, Ordering};
 use crate::shim::cell::UnsafeCell;
 use crate::shim::lock::SpinLock;
 use crate::waker::{WaiterAdapter, WaiterNode};
-use intrusive_collections::LinkedList;
+use intrusive_linklist::LinkedList;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -29,7 +29,7 @@ const KIND_WRITER: usize = 1;
 
 impl<T> RwLock<T> {
     /// Creates a new `RwLock` with the given data.
-    pub fn new(data: T) -> Self {
+    pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
             waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
@@ -197,8 +197,9 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         // If there are waiters, and the first one is a reader, wake it up.
         // It will then likely wake subsequent readers (cascade).
         {
-            let waiters = lock.waiters.lock();
-            if let Some(node) = waiters.front().get() {
+            let mut waiters = lock.waiters.lock();
+            if let Some(node) = waiters.front_mut().get() {
+                let node = unsafe { node.as_ref() };
                 if node.kind == KIND_READER {
                     node.waker.wake();
                 }
@@ -277,7 +278,8 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                             // Remove ourselves if still linked
                             if this.node.link.is_linked() {
                                 unsafe {
-                                    let mut cursor = waiters.cursor_mut_from_ptr(&mut this.node);
+                                    let ptr = NonNull::new_unchecked(&mut this.node);
+                                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                     cursor.remove();
                                 }
                             }
@@ -290,7 +292,8 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                             }
 
                             // Cascade wake: if next is reader, wake it
-                            if let Some(next) = waiters.front().get() {
+                            if let Some(next) = waiters.front_mut().get() {
+                                let next = unsafe { next.as_ref() };
                                 if next.kind == KIND_READER {
                                     next.waker.wake();
                                 }
@@ -367,7 +370,8 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
             let mut waiters = self.lock.waiters.lock();
             if self.node.link.is_linked() {
                 unsafe {
-                    let mut cursor = waiters.cursor_mut_from_ptr(&mut self.node);
+                    let ptr = NonNull::new_unchecked(&mut self.node);
+                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
             }
@@ -424,7 +428,8 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                         let mut waiters = this.lock.waiters.lock();
                         if this.node.link.is_linked() {
                             unsafe {
-                                let mut cursor = waiters.cursor_mut_from_ptr(&mut this.node);
+                                let ptr = NonNull::new_unchecked(&mut this.node);
+                                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                 cursor.remove();
                             }
                         }
@@ -498,7 +503,8 @@ impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
             let mut waiters = self.lock.waiters.lock();
             if self.node.link.is_linked() {
                 unsafe {
-                    let mut cursor = waiters.cursor_mut_from_ptr(&mut self.node);
+                    let ptr = NonNull::new_unchecked(&mut self.node);
+                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
             }

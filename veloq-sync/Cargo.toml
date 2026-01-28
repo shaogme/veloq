@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossbeam-utils = { workspace = true }
-intrusive-collections = { workspace = true }
+intrusive-linklist = { path = "../intrusive-linklist" }
 atomic-waker = { path = "../atomic-waker" }
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }

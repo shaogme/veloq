@@ -1,8 +1,7 @@
 use futures_core::Future;
 use futures_core::stream::Stream;
-use intrusive_collections::{
-    Adapter, LinkedList, LinkedListLink, PointerOps, container_of, linked_list::LinkOps, offset_of,
-};
+use intrusive_linklist::{Adapter, Link, LinkedList, container_of, offset_of};
+
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -114,7 +113,7 @@ where
             channel,
             node: WaiterNode {
                 waker: RefCell::new(None),
-                link: LinkedListLink::new(),
+                link: Link::new(),
                 _p: PhantomPinned,
             },
             _action: std::marker::PhantomData,
@@ -174,7 +173,8 @@ fn remove_from_the_waiting_queue<T, A: WaiterAction>(
         return;
     }
 
-    let mut cursor = unsafe { A::get_list(state).cursor_mut_from_ptr(node.get_unchecked_mut()) };
+    let ptr = unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) };
+    let mut cursor = unsafe { A::get_list(state).cursor_mut_from_ptr(ptr) };
 
     cursor.remove();
 }
@@ -196,71 +196,32 @@ where
 #[derive(Debug)]
 struct WaiterNode {
     waker: RefCell<Option<Waker>>,
-    link: LinkedListLink,
+    link: Link,
     _p: PhantomPinned,
 }
 
-struct WaiterPointerOps;
-
-unsafe impl PointerOps for WaiterPointerOps {
-    type Value = WaiterNode;
-    type Pointer = NonNull<WaiterNode>;
-
-    unsafe fn from_raw(&self, value: *const Self::Value) -> Self::Pointer {
-        NonNull::new(value as *mut Self::Value).expect("Pointer to the value can not be null")
-    }
-
-    fn into_raw(&self, ptr: Self::Pointer) -> *const Self::Value {
-        ptr.as_ptr() as *const Self::Value
-    }
-}
-
-struct WaiterAdapter {
-    pointers_ops: WaiterPointerOps,
-    link_ops: LinkOps,
-}
+struct WaiterAdapter;
 
 impl WaiterAdapter {
-    pub const NEW: Self = WaiterAdapter {
-        pointers_ops: WaiterPointerOps,
-        link_ops: LinkOps,
-    };
+    pub const NEW: Self = WaiterAdapter;
 }
 
 unsafe impl Adapter for WaiterAdapter {
-    type LinkOps = LinkOps;
-    type PointerOps = WaiterPointerOps;
+    type Value = WaiterNode;
 
-    unsafe fn get_value(
-        &self,
-        link: <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr,
-    ) -> *const <Self::PointerOps as PointerOps>::Value {
-        container_of!(link.as_ptr(), WaiterNode, link)
-    }
-
-    unsafe fn get_link(
-        &self,
-        value: *const <Self::PointerOps as PointerOps>::Value,
-    ) -> <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr {
-        if value.is_null() {
-            panic!("Value pointer can not be null");
-        }
+    unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
+        let ptr = value.as_ptr() as *mut u8;
         unsafe {
-            let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
-            core::ptr::NonNull::new_unchecked(ptr as *mut _)
+            let link_ptr = ptr.add(offset_of!(WaiterNode, link)) as *mut Link;
+            NonNull::new_unchecked(link_ptr)
         }
     }
 
-    fn link_ops(&self) -> &Self::LinkOps {
-        &self.link_ops
-    }
-
-    fn link_ops_mut(&mut self) -> &mut Self::LinkOps {
-        &mut self.link_ops
-    }
-
-    fn pointer_ops(&self) -> &Self::PointerOps {
-        &self.pointers_ops
+    unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
+        let ptr = link.as_ptr();
+        // container_of macro has unsafe block internally, but let's be safe
+        let value_ptr = container_of!(ptr, WaiterNode, link) as *mut WaiterNode;
+        unsafe { NonNull::new_unchecked(value_ptr) }
     }
 }
 
@@ -455,7 +416,8 @@ fn wake_up_all(waiters: &mut LinkedList<WaiterAdapter>) {
     let mut cursor = waiters.front_mut();
     while !cursor.is_null() {
         {
-            let node = unsafe { Pin::new_unchecked(cursor.get().expect("Waiter queue check")) };
+            let mut node_ptr = cursor.get().expect("Waiter queue check");
+            let node = unsafe { Pin::new_unchecked(node_ptr.as_mut()) };
             node.waker
                 .borrow_mut()
                 .take()
@@ -499,7 +461,7 @@ impl<'a, T> ChannelStream<'a, T> {
             channel,
             node: Box::pin(WaiterNode {
                 waker: RefCell::new(None),
-                link: LinkedListLink::new(),
+                link: Link::new(),
                 _p: PhantomPinned,
             }),
         }

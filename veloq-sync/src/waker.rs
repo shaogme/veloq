@@ -1,12 +1,10 @@
 use atomic_waker::AtomicWaker;
-use intrusive_collections::{
-    Adapter, LinkedListLink, PointerOps, container_of, linked_list::LinkOps as ListOps, offset_of,
-};
+use intrusive_linklist::{Adapter, Link, container_of, offset_of};
 use std::{marker::PhantomPinned, ptr::NonNull};
 
 pub struct WaiterNode {
     pub(crate) waker: AtomicWaker,
-    pub(crate) link: LinkedListLink,
+    pub(crate) link: Link,
     pub(crate) kind: usize,
     _p: PhantomPinned,
 }
@@ -15,70 +13,35 @@ impl WaiterNode {
     pub fn new() -> Self {
         Self {
             waker: AtomicWaker::new(),
-            link: LinkedListLink::new(),
+            link: Link::new(),
             kind: 0,
             _p: PhantomPinned,
         }
     }
 }
 
-pub struct WaiterAdapter {
-    pointer_ops: WaiterPointerOps,
-    link_ops: ListOps,
-}
+pub struct WaiterAdapter;
 
 impl WaiterAdapter {
-    pub const NEW: Self = Self {
-        pointer_ops: WaiterPointerOps,
-        link_ops: ListOps,
-    };
+    pub const NEW: Self = Self;
 }
 
 unsafe impl Adapter for WaiterAdapter {
-    type LinkOps = ListOps;
-    type PointerOps = WaiterPointerOps;
-
-    unsafe fn get_value(
-        &self,
-        link: <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr,
-    ) -> *const <Self::PointerOps as PointerOps>::Value {
-        container_of!(link.as_ptr(), WaiterNode, link)
-    }
-
-    unsafe fn get_link(
-        &self,
-        value: *const <Self::PointerOps as PointerOps>::Value,
-    ) -> <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr {
-        unsafe {
-            let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
-            NonNull::new_unchecked(ptr as *mut _)
-        }
-    }
-
-    fn link_ops(&self) -> &Self::LinkOps {
-        &self.link_ops
-    }
-
-    fn link_ops_mut(&mut self) -> &mut Self::LinkOps {
-        &mut self.link_ops
-    }
-
-    fn pointer_ops(&self) -> &Self::PointerOps {
-        &self.pointer_ops
-    }
-}
-
-pub struct WaiterPointerOps;
-
-unsafe impl PointerOps for WaiterPointerOps {
     type Value = WaiterNode;
-    type Pointer = NonNull<WaiterNode>;
 
-    unsafe fn from_raw(&self, value: *const Self::Value) -> Self::Pointer {
-        NonNull::new(value as *mut _).expect("Pointer cannot be null")
+    unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
+        let ptr = link.as_ptr();
+        // container_of macro might use raw pointer arithmetic that creates intermediate invalid refs if not careful,
+        // but our implementation uses raw pointers.
+        let value_ptr = container_of!(ptr, WaiterNode, link) as *mut WaiterNode;
+        unsafe { NonNull::new_unchecked(value_ptr) }
     }
 
-    fn into_raw(&self, ptr: Self::Pointer) -> *const Self::Value {
-        ptr.as_ptr()
+    unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
+        let ptr = value.as_ptr() as *mut u8;
+        unsafe {
+            let link_ptr = ptr.add(offset_of!(WaiterNode, link)) as *mut Link;
+            NonNull::new_unchecked(link_ptr)
+        }
     }
 }

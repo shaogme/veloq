@@ -10,7 +10,7 @@ veloq-buf = { path = "../veloq-buf" }
 
 num_cpus = "1.17.0"
 crossbeam-utils = { workspace = true }
-intrusive-collections = { workspace = true }
+intrusive-linklist = { path = "../intrusive-linklist" }
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 atomic-waker = { path = "../atomic-waker" }

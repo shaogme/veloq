@@ -2,7 +2,7 @@ use crate::shim::atomic::{AtomicUsize, Ordering};
 use crate::shim::cell::UnsafeCell;
 use crate::shim::lock::SpinLock;
 use crate::waker::{WaiterAdapter, WaiterNode};
-use intrusive_collections::LinkedList;
+use intrusive_linklist::LinkedList;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -21,7 +21,7 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     /// Creates a new `Mutex` with the given data.
-    pub fn new(data: T) -> Self {
+    pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
             waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
@@ -163,7 +163,8 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                         let mut waiters = this.lock.waiters.lock();
                         if this.node.link.is_linked() {
                             unsafe {
-                                let mut cursor = waiters.cursor_mut_from_ptr(&mut this.node);
+                                let ptr = NonNull::new_unchecked(&mut this.node);
+                                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                 cursor.remove();
                             }
                         }
@@ -259,7 +260,8 @@ impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
             let mut waiters = self.lock.waiters.lock();
             if self.node.link.is_linked() {
                 unsafe {
-                    let mut cursor = waiters.cursor_mut_from_ptr(&mut self.node);
+                    let ptr = NonNull::new_unchecked(&mut self.node);
+                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
             }
