@@ -187,20 +187,19 @@ impl<T> Wheel<T> {
         self.tasks.get_mut(key).and_then(|entry| entry.item.take())
     }
 
-    /// Advance the wheel by the specified elapsed time and return all expired items.
+    /// Advance the wheel by the specified elapsed time and populate `expired` with expired items.
     ///
     /// This method is optimized to handle large time jumps efficiently by
     /// batching L0 processing and jumping to L1 cascade points.
     ///
-    /// 将时间轮推进指定的经过时间，并返回所有过期的项目。
+    /// 将时间轮推进指定的经过时间，并将过期的项目填充到 `expired` 中。
     ///
     /// 该方法经过优化，通过批量处理 L0 并跳转到 L1 级联点，可以高效地处理较大的时间跨度。
-    pub fn advance(&mut self, elapsed: Duration) -> Vec<T> {
+    pub fn advance(&mut self, elapsed: Duration, expired: &mut Vec<T>) {
         let ticks = self.delay_to_ticks(elapsed);
-        let mut expired = Vec::new();
 
         if ticks == 0 {
-            return expired;
+            return;
         }
 
         let mut remaining_ticks = ticks;
@@ -238,7 +237,7 @@ impl<T> Wheel<T> {
                 let tasks = &mut self.tasks;
                 for slot in &mut self.levels[0].slots {
                     if let Some(head) = slot.take() {
-                        Self::drain_list(tasks, head, &mut expired);
+                        Self::drain_list(tasks, head, expired);
                     }
                 }
             } else {
@@ -248,7 +247,7 @@ impl<T> Wheel<T> {
                     let target_tick = self.global_tick.wrapping_add(i);
                     let idx = (target_tick as usize) & self.levels[0].mask;
                     if let Some(head) = self.levels[0].slots[idx].take() {
-                        Self::drain_list(&mut self.tasks, head, &mut expired);
+                        Self::drain_list(&mut self.tasks, head, expired);
                     }
                 }
             }
@@ -263,12 +262,10 @@ impl<T> Wheel<T> {
                 let l1_idx = (l1_tick as usize) & self.levels[1].mask;
 
                 if let Some(head) = self.levels[1].slots[l1_idx].take() {
-                    self.cascade_list(head, &mut expired);
+                    self.cascade_list(head, expired);
                 }
             }
         }
-
-        expired
     }
 
     /// Calculate the duration until the next timed event triggers.
@@ -437,11 +434,12 @@ mod tests {
         let id = wheel.insert("task1", Duration::from_millis(20));
 
         // Advance 10ms - nothing should expire
-        let expired = wheel.advance(Duration::from_millis(10));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(10), &mut expired);
         assert!(expired.is_empty());
 
         // Advance another 10ms - should expire
-        let expired = wheel.advance(Duration::from_millis(10));
+        wheel.advance(Duration::from_millis(10), &mut expired);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], "task1");
 
@@ -460,7 +458,8 @@ mod tests {
         assert_eq!(checked, Some("task1"));
 
         // Advance past deadline, should get nothing
-        let expired = wheel.advance(Duration::from_millis(200));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(200), &mut expired);
         assert!(expired.is_empty());
     }
 
@@ -479,18 +478,19 @@ mod tests {
         wheel.insert("long_task", Duration::from_millis(150));
 
         // Advance 90ms. Global tick: 9. L0 filled.
-        let expired = wheel.advance(Duration::from_millis(90));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(90), &mut expired);
         assert!(expired.is_empty());
 
         // Advance 10ms. Global tick: 10. Cascade triggered (mod 10 == 0).
         // "long_task" deadline is 15 ticks. Current is 10.
         // It fits in L0 now? remaining = 5 ticks < 10. Yes.
         // It should be moved to L0.
-        let expired = wheel.advance(Duration::from_millis(10));
+        wheel.advance(Duration::from_millis(10), &mut expired);
         assert!(expired.is_empty()); // Still 50ms to go.
 
         // Advance 50ms. Global tick: 15. Expire.
-        let expired = wheel.advance(Duration::from_millis(50));
+        wheel.advance(Duration::from_millis(50), &mut expired);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], "long_task");
     }
@@ -510,7 +510,8 @@ mod tests {
         wheel.insert("long", Duration::from_millis(100));
 
         // Advance 200ms at once
-        let expired = wheel.advance(Duration::from_millis(200));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(200), &mut expired);
 
         assert_eq!(expired.len(), 3);
         assert!(expired.contains(&"short"));
@@ -531,7 +532,8 @@ mod tests {
         let t = wheel.next_timeout();
         assert_eq!(t, Some(Duration::from_millis(30)));
 
-        wheel.advance(Duration::from_millis(10));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(10), &mut expired);
         let t = wheel.next_timeout();
         assert_eq!(t, Some(Duration::from_millis(20)));
     }
@@ -568,7 +570,8 @@ mod tests {
         // Task 1: target 80, current 16. Remaining 64. 64 > 16 (L0).
         // New L1 tick = 80 / 16 = 5. Index 1. Re-queued to L1[1].
         // Task 2: target 150, current 16. Remaining 134. Re-queued to L1[1].
-        let expired = wheel.advance(Duration::from_millis(160));
+        let mut expired = Vec::new();
+        wheel.advance(Duration::from_millis(160), &mut expired);
         assert!(expired.is_empty());
 
         // Advance another 640ms (4 full L1 slots).
@@ -576,7 +579,7 @@ mod tests {
         // Task 1 matches exactly?
         // At tick 80 (L1 tick 5, index 1).
         // Cascade L1[1]. Task 1 deadline 80. 80 <= 80. Expired!
-        let expired = wheel.advance(Duration::from_millis(640));
+        wheel.advance(Duration::from_millis(640), &mut expired);
 
         let has_overflow_1 = expired.contains(&"overflow_on_round_1");
         assert!(has_overflow_1, "Expected overflow_on_round_1 to expire");
@@ -588,7 +591,7 @@ mod tests {
         // Current global tick 80. Task 2 deadline 150.
         // Remaining 70.
         // Advance 700ms. Total 1500.
-        let expired = wheel.advance(Duration::from_millis(700));
+        wheel.advance(Duration::from_millis(700), &mut expired);
         assert!(expired.contains(&"overflow_on_round_2"));
 
         assert!(wheel.cancel(id1).is_none());
