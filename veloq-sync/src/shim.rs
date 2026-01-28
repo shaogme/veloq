@@ -394,7 +394,7 @@ pub mod lock {
 
     #[cfg(not(feature = "loom"))]
     impl<T> SpinLock<T> {
-        pub fn new(data: T) -> Self {
+        pub const fn new(data: T) -> Self {
             Self {
                 locked: AtomicBool::new(false),
                 data: std::cell::UnsafeCell::new(data),

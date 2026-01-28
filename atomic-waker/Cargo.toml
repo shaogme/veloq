@@ -1,0 +1,14 @@
+[package]
+name = "atomic-waker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dependencies.loom]
+version = "0.7"
+features = ["futures"]
+optional = true
+
+
+loom = ["dep:loom"]

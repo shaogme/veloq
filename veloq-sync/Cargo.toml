@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 crossbeam-utils = { workspace = true }
 intrusive-collections = { workspace = true }
-atomic-waker = { workspace = true }
+atomic-waker = { path = "../atomic-waker" }
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 
@@ -20,4 +20,4 @@ optional = true
 
 [features]
 default = []
-loom = ["dep:loom"]
+loom = ["dep:loom", "atomic-waker/loom"]

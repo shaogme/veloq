@@ -2,6 +2,7 @@ pub mod mpmc;
 pub mod mpsc;
 pub mod mutex;
 pub mod oneshot;
+pub mod rwlock;
 pub(crate) mod shim;
 pub(crate) mod waker;
 

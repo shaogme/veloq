@@ -7,6 +7,7 @@ use std::{marker::PhantomPinned, ptr::NonNull};
 pub struct WaiterNode {
     pub(crate) waker: AtomicWaker,
     pub(crate) link: LinkedListLink,
+    pub(crate) kind: usize,
     _p: PhantomPinned,
 }
 
@@ -15,6 +16,7 @@ impl WaiterNode {
         Self {
             waker: AtomicWaker::new(),
             link: LinkedListLink::new(),
+            kind: 0,
             _p: PhantomPinned,
         }
     }

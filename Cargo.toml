@@ -5,14 +5,14 @@ members = [
     "veloq-wheel",
     "veloq-examples/disk-bench",
     "veloq-sync",
-    "veloq-buf",
+    "veloq-buf", 
+    "atomic-waker",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 crossbeam-utils = { version = "0.8", default-features = false }
 intrusive-collections = "0.10"
-atomic-waker = "1.1.2"
 futures-core = "0.3"
 crossbeam-queue = "0.3"
 libc = "0.2.178"
