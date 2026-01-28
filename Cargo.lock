@@ -71,7 +71,7 @@ dependencies = [
 name = "atomic-waker"
 version = "0.1.0"
 dependencies = [
- "loom",
+ "veloq-shim",
 ]
 
 [[package]]
@@ -374,7 +374,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 name = "intrusive-linklist"
 version = "0.1.0"
 dependencies = [
- "loom",
+ "veloq-shim",
 ]
 
 [[package]]
@@ -1057,6 +1057,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloq-shim"
+version = "0.1.0"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "veloq-sync"
 version = "0.1.0"
 dependencies = [
@@ -1067,6 +1074,7 @@ dependencies = [
  "intrusive-linklist",
  "loom",
  "tokio",
+ "veloq-shim",
 ]
 
 [[package]]

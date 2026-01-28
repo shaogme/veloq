@@ -7,6 +7,7 @@ edition = "2024"
 crossbeam-utils = { workspace = true }
 intrusive-linklist = { path = "../intrusive-linklist" }
 atomic-waker = { path = "../atomic-waker" }
+veloq-shim = { path = "../veloq-shim" }
 futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 
@@ -19,5 +20,5 @@ features = ["futures"]
 optional = true
 
 [features]
-default = []
-loom = ["dep:loom", "atomic-waker/loom", "intrusive-linklist/loom"]
+default = ["veloq-shim/alloc"]
+loom = ["dep:loom", "atomic-waker/loom", "intrusive-linklist/loom", "veloq-shim/loom", "veloq-shim/alloc"]

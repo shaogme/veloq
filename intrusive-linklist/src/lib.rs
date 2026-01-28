@@ -1,10 +1,9 @@
 mod cursor;
 mod list;
 mod macros;
-mod shim;
 
-use crate::shim::cell::UnsafeCell;
 use std::ptr::NonNull;
+use veloq_shim::cell::UnsafeCell;
 
 pub use cursor::Cursor;
 pub use cursor::CursorMut;
@@ -36,8 +35,6 @@ pub struct Link {
 impl Link {
     #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
-        use crate::shim::cell::UnsafeCell;
-
         Self {
             next: UnsafeCell::new(None),
             prev: UnsafeCell::new(None),

@@ -1,0 +1,15 @@
+[package]
+name = "veloq-shim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dependencies.loom]
+version = "0.7"
+features = ["futures"]
+optional = true
+
+[features]
+loom = ["dep:loom"]
+alloc = []

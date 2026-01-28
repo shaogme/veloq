@@ -9,13 +9,11 @@
     html_logo_url = "https://raw.githubusercontent.com/smol-rs/smol/master/assets/images/logo_fullsize_transparent.png"
 )]
 
-mod shim;
-
-use crate::shim::atomic::AtomicUsize;
-use crate::shim::atomic::Ordering::{AcqRel, Acquire, Release};
-use crate::shim::cell::UnsafeCell;
 use core::fmt;
 use core::task::Waker;
+use veloq_shim::atomic::AtomicUsize;
+use veloq_shim::atomic::Ordering::{AcqRel, Acquire, Release};
+use veloq_shim::cell::UnsafeCell;
 
 /// A synchronization primitive for task wakeup.
 ///
