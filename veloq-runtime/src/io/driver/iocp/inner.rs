@@ -37,6 +37,7 @@ pub struct IocpDriver {
     pub(crate) ops: OpRegistry<IocpOp, PlatformData>,
     pub(crate) extensions: Extensions,
     pub(crate) wheel: Wheel<usize>,
+    pub(crate) timer_buffer: Vec<usize>,
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
 
@@ -118,6 +119,7 @@ impl IocpDriver {
             ops,
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
+            timer_buffer: Vec::new(),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             rio_state,
@@ -152,8 +154,8 @@ impl IocpDriver {
         let elapsed = start.elapsed();
 
         // Process expired timers
-        let expired = self.wheel.advance(elapsed);
-        for user_data in expired {
+        self.wheel.advance(elapsed, &mut self.timer_buffer);
+        for &user_data in &self.timer_buffer {
             if let Some(op) = self.ops.get_mut(user_data) {
                 if !op.cancelled && op.result.is_none() {
                     op.result = Some(Ok(0));
@@ -165,6 +167,7 @@ impl IocpDriver {
                 op.platform_data = PlatformData::None;
             }
         }
+        self.timer_buffer.clear();
 
         // Determine user_data from overlapped or completion_key
         let user_data = if completion_key == RIO_EVENT_KEY {
