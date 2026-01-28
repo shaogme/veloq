@@ -65,3 +65,11 @@ jobs:
             cargo nextest run --test-threads 1 --run-ignored all
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+  ci-success:
+    name: CI Success
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Success
+        run: echo "All tests passed"
