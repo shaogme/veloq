@@ -4,11 +4,40 @@ use super::{
 };
 use crate::{ThreadMemory, nz};
 use crossbeam_queue::SegQueue;
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+
+// TLS Credit Cache
+// Stores (pointer_addr, credit)
+struct CreditCache(Vec<(usize, usize)>);
+
+impl Drop for CreditCache {
+    fn drop(&mut self) {
+        for &(addr, credit) in &self.0 {
+            if credit > 0 {
+                let ptr = addr as *mut SharedBuddyState;
+                // SAFETY: We hold credits, so the pointer is valid.
+                // We must return the credits to the global counter.
+                let state = unsafe { &*ptr };
+                // If we are the last ones (ref_count == credit), we must drop the pool.
+                if state.ref_count.fetch_sub(credit, Ordering::Release) == credit {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    unsafe { let _ = Box::from_raw(ptr); }
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static BUDDY_REF_CREDITS: RefCell<CreditCache> = RefCell::new(CreditCache(Vec::with_capacity(4)));
+}
+
+const BATCH_SIZE: usize = 64;
+const MAX_CREDIT: usize = 128;
 
 // Buddy System Constants
 const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
@@ -453,6 +482,7 @@ struct SharedBuddyState {
     allocator: UnsafeCell<BuddyAllocator>,
     return_queue: SegQueue<DeallocParams>,
     owner_id: thread::ThreadId,
+    ref_count: AtomicUsize,
 }
 
 // SAFETY: Synchronization is handled via owner_id checks and SegQueue
@@ -460,10 +490,35 @@ unsafe impl Send for SharedBuddyState {}
 unsafe impl Sync for SharedBuddyState {}
 
 /// 各种 BufferPool 实现的包装器
-#[derive(Clone)]
 pub struct BuddyPool {
-    inner: Arc<SharedBuddyState>,
+    inner: NonNull<SharedBuddyState>,
 }
+
+// Manual Clone for ref-counting
+impl Clone for BuddyPool {
+    fn clone(&self) -> Self {
+        unsafe {
+            self.inner.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { inner: self.inner }
+    }
+}
+
+// Manual Drop for ref-counting
+impl Drop for BuddyPool {
+    fn drop(&mut self) {
+        unsafe {
+            if self.inner.as_ref().ref_count.fetch_sub(1, Ordering::Release) == 1 {
+                std::sync::atomic::fence(Ordering::Acquire);
+                let _ = Box::from_raw(self.inner.as_ptr());
+            }
+        }
+    }
+}
+
+// Must implement Send/Sync because SharedBuddyState is Sync
+unsafe impl Send for BuddyPool {}
+unsafe impl Sync for BuddyPool {}
 
 pub struct BuddySpec {
     pub arena_size: NonZeroUsize,
@@ -515,30 +570,83 @@ static BUDDY_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    // 1. Recover the Pool Arc
-    let pool_arc = unsafe { Arc::from_raw(pool_data.as_ptr() as *const SharedBuddyState) };
+    // 1. Recover the Pool Pointer
+    let ptr = pool_data.as_ptr() as *mut SharedBuddyState;
+    // SAFETY: We hold a refcount (logically), so ptr is valid.
+    let state = unsafe { &*ptr };
 
     // 2. Adjust params to find original block start
-    let block_start_ptr = params.ptr; // params.ptr is already NonNull<u8>
+    let block_start_ptr = params.ptr;
     let order = params.context;
 
-    // 3. Check thread ownership
-    if thread::current().id() == pool_arc.owner_id {
+    let is_owner = thread::current().id() == state.owner_id;
+
+    // 3. Dealloc logic
+    if is_owner {
         // Local dealloc
-        let allocator = unsafe { &mut *pool_arc.allocator.get() };
+        // SAFETY: We checked ownership.
+        let allocator = unsafe { &mut *state.allocator.get() };
+        // SAFETY: ptr is valid and allocated from this pool.
         unsafe { allocator.dealloc(block_start_ptr, order) };
     } else {
         // Remote dealloc: push to queue
-        pool_arc.return_queue.push(params);
+        state.return_queue.push(params);
+    }
+
+    // 4. Ref Count Logic
+    if is_owner {
+        BUDDY_REF_CREDITS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let credits = &mut cache.0;
+            let addr = ptr as usize;
+
+            // Linear scan (faster than hash for small N)
+            let mut found = false;
+            for (p_addr, credit) in credits.iter_mut() {
+                if *p_addr == addr {
+                    *credit += 1;
+                    if *credit > MAX_CREDIT {
+                        // Return batch to global
+                        state.ref_count.fetch_sub(*credit, Ordering::Release);
+                        *credit = 0;
+                        // Note: We don't drop here because we just returned excess credit.
+                        // The strong count should still be > 0 if we are here.
+                    }
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                 // Not in cache, just atomic decrement
+                 if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    // SAFETY: RefCount is 0, we are the last owner.
+                    unsafe { let _ = Box::from_raw(ptr); }
+                 }
+            }
+        });
+    } else {
+        // Remote dealloc: always atomic decrement
+        if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            // SAFETY: RefCount is 0, we are the last owner.
+            unsafe { let _ = Box::from_raw(ptr); }
+        }
     }
 }
 
 unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize) {
     let raw = pool_data.as_ptr() as *const SharedBuddyState;
-    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(raw) });
-    let inner = unsafe { &*arc.allocator.get() };
+    // We don't touch refcount here, just access data
+    // SAFETY: pool_data implies a valid ref.
+    let inner = unsafe { &*raw };
+    // SAFETY: We are only reading global region, which is constant/safe.
+    // However, UnsafeCell::get() usage here assumes no concurrent mutable access to global_region?
+    // RawBuddyAllocator::global_region returns values from ThreadMemory, which is Sync.
+    let allocator = unsafe { &*inner.allocator.get() };
     // Use global region to calculate offset
-    let (global_base, _) = inner.global_region();
+    let (global_base, _) = allocator.global_region();
     (
         0,
         (buf.as_ptr() as usize).saturating_sub(global_base.as_ptr() as usize),
@@ -547,12 +655,16 @@ unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf)
 
 impl BuddyPool {
     pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+        let state = SharedBuddyState {
+            allocator: UnsafeCell::new(BuddyAllocator::new(memory)?),
+            return_queue: SegQueue::new(),
+            owner_id: thread::current().id(),
+            ref_count: AtomicUsize::new(1),
+        };
+
+        let ptr = Box::into_raw(Box::new(state));
         Ok(Self {
-            inner: Arc::new(SharedBuddyState {
-                allocator: UnsafeCell::new(BuddyAllocator::new(memory)?),
-                return_queue: SegQueue::new(),
-                owner_id: thread::current().id(),
-            }),
+            inner: unsafe { NonNull::new_unchecked(ptr) },
         })
     }
 }
@@ -560,14 +672,16 @@ impl BuddyPool {
 impl BackingPool for BuddyPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         // Enforce thread locality for allocation
-        if thread::current().id() != self.inner.owner_id {
+        let inner = unsafe { self.inner.as_ref() };
+
+        if thread::current().id() != inner.owner_id {
             panic!("BuddyPool::alloc_mem called from non-owner thread");
         }
 
-        let allocator = unsafe { &mut *self.inner.allocator.get() };
+        let allocator = unsafe { &mut *inner.allocator.get() };
 
         // Drain return queue
-        while let Some(params) = self.inner.return_queue.pop() {
+        while let Some(params) = inner.return_queue.pop() {
             unsafe { allocator.dealloc(params.ptr, params.context) };
         }
 
@@ -593,10 +707,53 @@ impl BackingPool for BuddyPool {
     }
 
     fn pool_data(&self) -> NonNull<()> {
-        unsafe {
-            let raw = Arc::into_raw(self.inner.clone());
-            NonNull::new_unchecked(raw as *mut ())
+        let ptr = self.inner.as_ptr();
+        let addr = ptr as usize;
+        let inner = unsafe { self.inner.as_ref() };
+
+        // Try to consume credit or refill
+        let consumed = BUDDY_REF_CREDITS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let credits = &mut cache.0;
+
+            // Try find
+            let mut found_idx = None;
+            for (i, (p, _)) in credits.iter().enumerate() {
+                if *p == addr {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                let credit = &mut credits[idx].1;
+                if *credit > 0 {
+                    *credit -= 1;
+                    return true; // Consumed local credit
+                } else {
+                     // Empty credit, need refill
+                     inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                     *credit = BATCH_SIZE - 1; // Keep 1 for this alloc
+                     return true; // Used new batch
+                }
+            } else {
+                // Not in cache. Can we insert?
+                if credits.len() < 4 {
+                    // Refill and insert
+                    inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                    credits.push((addr, BATCH_SIZE - 1));
+                    return true;
+                }
+            }
+            false
+        });
+
+        if !consumed {
+            // Cache full and not found. Fallback to atomic +1
+            inner.ref_count.fetch_add(1, Ordering::Relaxed);
         }
+
+        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
     }
 }
 
