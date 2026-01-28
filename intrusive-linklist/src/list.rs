@@ -17,6 +17,7 @@ unsafe impl<A: Adapter> Send for LinkedList<A> where A::Value: Send {}
 unsafe impl<A: Adapter> Sync for LinkedList<A> where A::Value: Sync {}
 
 impl<A: Adapter> LinkedList<A> {
+    #[inline]
     pub const fn new(adapter: A) -> Self {
         Self {
             head: None,
@@ -27,10 +28,12 @@ impl<A: Adapter> LinkedList<A> {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -39,6 +42,7 @@ impl<A: Adapter> LinkedList<A> {
     ///
     /// # Safety
     /// 必须保证 value 在链表中存在期间有效。
+    #[inline]
     pub unsafe fn push_back(&mut self, value: Pin<&mut A::Value>) {
         unsafe {
             // Unsafe: get_unchecked_mut is required to get a raw pointer for the adapter.
@@ -69,6 +73,7 @@ impl<A: Adapter> LinkedList<A> {
     }
 
     /// 从头部移除节点
+    #[inline]
     pub fn pop_front(&mut self) -> Option<Pin<&mut A::Value>> {
         unsafe {
             let head = self.head?;
@@ -97,12 +102,14 @@ impl<A: Adapter> LinkedList<A> {
     }
 
     /// 获取头部 Cursor (只读)
+    #[inline]
     pub fn front(&self) -> Cursor<'_, A> {
         let head = self.head;
         Cursor::new(self, head)
     }
 
     /// 获取头部 Cursor (可变)
+    #[inline]
     pub fn front_mut(&mut self) -> CursorMut<'_, A> {
         let head = self.head;
         CursorMut::new(self, head)
@@ -112,6 +119,7 @@ impl<A: Adapter> LinkedList<A> {
     ///
     /// # Safety
     /// ptr 必须指向链表中的有效节点。
+    #[inline]
     pub unsafe fn cursor_mut_from_ptr(&mut self, ptr: NonNull<A::Value>) -> CursorMut<'_, A> {
         let link = unsafe { self.adapter.get_link(ptr) };
         CursorMut::new(self, Some(link))
@@ -123,6 +131,7 @@ impl<A: Adapter> LinkedList<A> {
     ///
     /// # Safety
     /// 必须保证 value 在 Guard 存活期间有效。
+    #[inline]
     pub unsafe fn push_back_scoped<'a>(
         &'a mut self,
         mut value: Pin<&mut A::Value>,

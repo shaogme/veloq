@@ -52,11 +52,13 @@ impl Link {
     }
 
     /// 检查节点是否链接在某个列表中。
+    #[inline]
     pub fn is_linked(&self) -> bool {
         unsafe { self.linked.with(|l| *l) }
     }
 
     /// 强制断开连接（unsafe，需确保已从列表中移除）
+    #[inline]
     pub(crate) unsafe fn unsafe_unlink(&self) {
         unsafe {
             self.next.with_mut(|n| *n = None);

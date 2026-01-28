@@ -9,17 +9,20 @@ pub struct Cursor<'a, A: Adapter> {
 }
 
 impl<'a, A: Adapter> Cursor<'a, A> {
+    #[inline]
     pub(crate) fn new(list: &'a LinkedList<A>, current: Option<NonNull<Link>>) -> Self {
         Self { list, current }
     }
 
     /// 获取当前指向元素的原始指针
+    #[inline]
     pub fn get_raw(&self) -> Option<NonNull<A::Value>> {
         self.current
             .map(|link| unsafe { self.list.adapter.get_value(link) })
     }
 
     /// 获取当前指向的元素引用
+    #[inline]
     pub fn get(&self) -> Option<&A::Value> {
         self.current.map(|link| unsafe {
             let value_ptr = self.list.adapter.get_value(link);
@@ -28,6 +31,7 @@ impl<'a, A: Adapter> Cursor<'a, A> {
     }
 
     // 移动到下一个
+    #[inline]
     pub fn move_next(&mut self) {
         if let Some(curr) = self.current {
             unsafe {
@@ -38,6 +42,7 @@ impl<'a, A: Adapter> Cursor<'a, A> {
         }
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         self.current.is_none()
     }
@@ -49,17 +54,20 @@ pub struct CursorMut<'a, A: Adapter> {
 }
 
 impl<'a, A: Adapter> CursorMut<'a, A> {
+    #[inline]
     pub(crate) fn new(list: &'a mut LinkedList<A>, current: Option<NonNull<Link>>) -> Self {
         Self { list, current }
     }
 
     /// 获取当前指向元素的原始指针
+    #[inline]
     pub fn get_raw(&self) -> Option<NonNull<A::Value>> {
         self.current
             .map(|link| unsafe { self.list.adapter.get_value(link) })
     }
 
     /// 获取当前指向的元素引用
+    #[inline]
     pub fn get(&self) -> Option<&A::Value> {
         self.current.map(|link| unsafe {
             let value_ptr = self.list.adapter.get_value(link);
@@ -70,6 +78,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
     /// 获取当前指向的元素可变引用（Pinned）
     ///
     /// 返回 Pin<&mut T> 以防止节点在内存中被移动，这对侵入式链表至关重要。
+    #[inline]
     pub fn get_mut(&mut self) -> Option<Pin<&mut A::Value>> {
         self.current.map(|link| unsafe {
             let value_ptr = self.list.adapter.get_value(link);
@@ -79,6 +88,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
 
     /// 移除当前指向的元素，并将游标移动到下一个元素。
     /// 返回被移除的元素。
+    #[inline]
     pub fn remove(&mut self) -> Option<Pin<&mut A::Value>> {
         let current_link_ptr = self.current?;
 
@@ -119,6 +129,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
     }
 
     // 移动到下一个
+    #[inline]
     pub fn move_next(&mut self) {
         if let Some(curr) = self.current {
             unsafe {
@@ -129,6 +140,7 @@ impl<'a, A: Adapter> CursorMut<'a, A> {
         }
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         self.current.is_none()
     }
