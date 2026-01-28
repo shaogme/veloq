@@ -1,7 +1,9 @@
 pub mod mpmc;
 pub mod mpsc;
+pub mod mutex;
 pub mod oneshot;
 pub(crate) mod shim;
+pub(crate) mod waker;
 
 use std::fmt;
 

@@ -284,7 +284,7 @@ pub mod queue {
 
 pub mod cell {
     #[cfg(not(feature = "loom"))]
-    pub struct UnsafeCell<T> {
+    pub struct UnsafeCell<T: ?Sized> {
         cell: std::cell::UnsafeCell<T>,
     }
 
@@ -295,7 +295,10 @@ pub mod cell {
                 cell: std::cell::UnsafeCell::new(value),
             }
         }
+    }
 
+    #[cfg(not(feature = "loom"))]
+    impl<T: ?Sized> UnsafeCell<T> {
         pub unsafe fn with_mut<F, R>(&self, f: F) -> R
         where
             F: FnOnce(&mut T) -> R,
@@ -309,10 +312,69 @@ pub mod cell {
         {
             unsafe { f(&*self.cell.get()) }
         }
+
+        pub fn get(&self) -> *const T {
+            self.cell.get() as *const T
+        }
+
+        pub fn get_mut(&self) -> *mut T {
+            self.cell.get()
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    impl<T> UnsafeCell<T> {
+        pub fn into_inner(self) -> T {
+            self.cell.into_inner()
+        }
     }
 
     #[cfg(feature = "loom")]
-    pub use loom::cell::UnsafeCell;
+    pub struct UnsafeCell<T: ?Sized> {
+        inner: loom::cell::UnsafeCell<T>,
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T> UnsafeCell<T> {
+        pub fn new(data: T) -> Self {
+            Self {
+                inner: loom::cell::UnsafeCell::new(data),
+            }
+        }
+
+        pub fn into_inner(self) -> T {
+            self.inner.into_inner()
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T: ?Sized> UnsafeCell<T> {
+        pub fn get(&self) -> *const T {
+            self.inner.get().with(|ptr| ptr)
+        }
+
+        pub fn get_mut(&self) -> *mut T {
+            self.inner.get_mut().with(|ptr| ptr)
+        }
+
+        pub unsafe fn with<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&T) -> R,
+        {
+            // SAFETY: Caller guarantees safety related to the reference usage.
+            // Loom tracks the immutable access duration of the closure.
+            self.inner.get().with(|ptr| unsafe { f(&*ptr) })
+        }
+
+        pub unsafe fn with_mut<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            // SAFETY: Caller guarantees safety related to the reference usage.
+            // Loom tracks the mutable access duration of the closure.
+            self.inner.get_mut().with(|ptr| unsafe { f(&mut *ptr) })
+        }
+    }
 }
 
 pub mod lock {
