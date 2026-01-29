@@ -39,14 +39,13 @@ services:
       - "2223:22"
     profiles:
       - standalone
-
-  # Helper service to update flake.lock on the host
-  # Usage: docker-compose run --rm flake-update
-  flake-update:
+  # Helper service to update npins dependencies on the host
+  # Usage: docker-compose run --rm npins-update
+  npins-update:
     profiles:
       - tools
     image: nixos/nix:latest
     volumes:
       - ./docker:/work
     working_dir: /work
-    entrypoint: /bin/sh -c "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && nix flake update && chmod 666 flake.lock"
+    entrypoint: /bin/sh -c "nix-env -iA nixpkgs.npins && npins update && chmod -R 777 npins"

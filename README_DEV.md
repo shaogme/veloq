@@ -1,23 +1,11 @@
 # Docker Development Environment
 
-This directory contains the configuration for a Docker-based Linux development environment, powered by **Nix Flakes** for reproducible builds.
-
-## 0. Initial Setup (One-time)
-
-Before building the image for the first time, you must generate the `flake.lock` file to pin your dependencies. We provide a helper container for this:
-
-```bash
-# Generate docker/flake.lock
-docker-compose run --rm flake-update
-```
-
-If you ever need to update your dependencies (e.g., to get a newer Rust version), simply run this command again and rebuild.
+This directory contains the configuration for a Docker-based Linux development environment, powered by **Nix** for reproducible builds.
 
 ## 1. Prerequisites
 
 - Docker Desktop installed and running.
-- **Nix Support**: The environment now uses Nix flakes for reproducible builds.
-- **Windows Users**: You can run this setup directly from PowerShell or WSL2. No need to install Nix on the host unless you want to use the `flake-update` command natively.
+- **Windows Users**: You can run this setup directly from PowerShell or WSL2.
 
 
 ## 2. Start the Environment
