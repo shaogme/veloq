@@ -30,6 +30,7 @@ categories = ["asynchronous", "network-programming"]
 # Internal Crates
 veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
+veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }

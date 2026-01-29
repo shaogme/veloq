@@ -1,0 +1,20 @@
+[package]
+name = "veloq-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+futures-core = { workspace = true }
+veloq-intrusive-linklist = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -14,14 +14,13 @@ readme.workspace = true
 [dependencies]
 veloq-bitset = { workspace = true }
 veloq-sync = { workspace = true }
+veloq-local = { workspace = true }
 veloq-buf = { workspace = true }
-veloq-intrusive-linklist = { workspace = true }
 veloq-atomic-waker = { workspace = true }
 
 num_cpus = "1.17.0"
 crossbeam-utils = { workspace = true }
 
-futures-core = { workspace = true }
 crossbeam-queue = { workspace = true }
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
