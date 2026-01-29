@@ -82,7 +82,6 @@ impl<const S: u16> NotU16<S> {
     /// `n` must not equal `S`.
     #[inline]
     pub const unsafe fn new_unchecked(n: u16) -> Self {
-        #[cfg(debug_assertions)]
         debug_assert!(n != S, "Value must not be the sentinel value");
         Self(unsafe { NonZeroU16::new_unchecked(n ^ S) })
     }

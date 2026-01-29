@@ -286,17 +286,6 @@ impl<T> Clone for LocalChannel<T> {
 
 impl<T> Drop for LocalChannel<T> {
     fn drop(&mut self) {
-        // 当 LocalChannel 被回收时，意味着它是最后一个引用（或 Sender/Receiver 已经被 Drop）。
-        // 实际上 LocalChannel 只有在 Sender 和 Receiver 都被 Drop 后，或者
-        // 手动 clone 的 LocalChannel 句柄被 Drop 后才会真正释放 State。
-        // State 的生命周期由 Rc 控制。
-        // 原则是：只要 State 的 push/recv 功能不再可用，waiters 就应该为空。
-
-        // 由于 Sender 和 Receiver 在 Drop 时会分别清理 send_waiters 和 recv_waiters，
-        // 理论上这里如果 State 还在（通过 Rc），列表应该已经被正确管理。
-        // 如果 LocalChannel 是通过 Sender/Receiver 持有的，当它们 Drop 时会清理。
-        // 我们只在调试模式下断言。
-
         #[cfg(debug_assertions)]
         {
             let should_check = Rc::strong_count(&self.state) == 1;
