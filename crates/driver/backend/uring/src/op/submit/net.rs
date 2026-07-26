@@ -1,5 +1,5 @@
 use crate::{
-    driver::UringDriver,
+    driver::SqeEnv,
     error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
     op::{
@@ -16,89 +16,77 @@ use super::{invalid_buf_io_range, resolve_socket_fd};
 pub(crate) unsafe fn make_sqe_recv(
     _kernel: &mut KernelRef<Recv>,
     val: &mut Recv,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
-    let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_recv")?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_recv")?;
     Ok(opcode::Recv::new(fixed_fd, ptr, len).build())
 }
 
 pub(crate) unsafe fn make_sqe_send(
     _kernel: &mut KernelRef<OpSend>,
     val: &mut OpSend,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
-    let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_send")?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_send")?;
     Ok(opcode::Send::new(fixed_fd, ptr, len).build())
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv(
     _kernel: &mut KernelRef<UdpRecv>,
     val: &mut UdpRecv,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        val.fd,
-        "uring.op.submit.make_sqe_udp_recv",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_udp_recv")?;
     Ok(opcode::Recv::new(fixed_fd, ptr, len).build())
 }
 
 pub(crate) unsafe fn make_sqe_udp_send(
     _kernel: &mut KernelRef<UdpSend>,
     val: &mut UdpSend,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        val.fd,
-        "uring.op.submit.make_sqe_udp_send",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_udp_send")?;
     Ok(opcode::Send::new(fixed_fd, ptr, len).build())
 }
 
 pub(crate) unsafe fn make_sqe_connect(
     _kernel: &mut KernelRef<Connect>,
     val: &mut Connect,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        val.fd,
-        "uring.op.submit.make_sqe_connect",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_connect")?;
     Ok(opcode::Connect::new(fixed_fd, &val.addr.0 as *const _ as *const _, val.addr_len).build())
 }
 
 pub(crate) unsafe fn make_sqe_udp_connect(
     _kernel: &mut KernelRef<UdpConnect>,
     val: &mut UdpConnect,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
+        env.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_udp_connect",
     )?;
@@ -108,14 +96,10 @@ pub(crate) unsafe fn make_sqe_udp_connect(
 pub(crate) unsafe fn make_sqe_accept(
     _kernel: &mut AcceptPayload,
     val: &mut Accept,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        val.fd,
-        "uring.op.submit.make_sqe_accept",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, val.fd, "uring.op.submit.make_sqe_accept")?;
     Ok(opcode::Accept::new(
         fixed_fd,
         &mut val.addr.0 as *mut _ as *mut _,
@@ -153,7 +137,7 @@ pub(crate) unsafe fn on_complete_accept(
 pub(crate) unsafe fn make_sqe_send_to(
     kernel: &mut SendToPayload,
     user: &mut SendTo,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let (ptr, len) = user
@@ -172,18 +156,14 @@ pub(crate) unsafe fn make_sqe_send_to(
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
     kernel.msghdr.msg_iovlen = 1;
 
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        user.fd,
-        "uring.op.submit.make_sqe_send_to",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, user.fd, "uring.op.submit.make_sqe_send_to")?;
     Ok(opcode::SendMsg::new(fixed_fd, &kernel.msghdr as *const _).build())
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv_from(
     kernel: &mut UdpRecvFromPayload,
     user: &mut UdpRecvFrom,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = user.fd;
@@ -200,11 +180,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
     kernel.msghdr.msg_iovlen = 1;
 
-    let fixed_fd = resolve_socket_fd(
-        &driver.file_slots,
-        fd,
-        "uring.op.submit.make_sqe_udp_recv_from",
-    )?;
+    let fixed_fd = resolve_socket_fd(env.file_slots, fd, "uring.op.submit.make_sqe_udp_recv_from")?;
     Ok(opcode::RecvMsg::new(fixed_fd, &mut kernel.msghdr as *mut _).build())
 }
 

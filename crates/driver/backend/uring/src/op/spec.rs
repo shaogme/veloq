@@ -3,7 +3,7 @@ mod net;
 
 use crate::{
     OwnedRawHandle,
-    driver::UringDriver,
+    driver::SqeEnv,
     error::{UringError, UringResult},
     op::{
         Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
@@ -32,7 +32,7 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry>;
 
@@ -95,7 +95,7 @@ pub(crate) trait UringOpErasure: UringOpSpec {
 pub(crate) unsafe fn make_sqe_shim<S>(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry>
 where
@@ -107,7 +107,7 @@ where
     let user = S::user_payload_mut(payload).ok_or_else(|| {
         UringError::InvalidState.report("uring.op.spec.make_sqe", "user payload mismatch")
     })?;
-    unsafe { S::make_sqe(kernel, user, driver, token) }
+    unsafe { S::make_sqe(kernel, user, env, token) }
 }
 
 pub(crate) unsafe fn on_complete_shim<S>(
@@ -297,10 +297,10 @@ impl UringOpSpec for Wakeup {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_wakeup(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_wakeup(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -322,10 +322,10 @@ impl UringOpSpec for Timeout {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_timeout(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_timeout(kernel, payload, env, token) }
     }
 
     fn get_timeout(_kernel: &Self::KernelPayload, payload: &Self) -> Option<Duration> {

@@ -1,8 +1,10 @@
 use crate::{
     config::{RawHandle, UringRawHandle},
-    driver::{UringDriver, lifecycle::UringSubmissionState},
+    driver::{UringDriver, env::SubmitEnv, lifecycle::UringSubmissionState},
     error::{UringError, UringResult},
-    op::{Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt},
+    op::{
+        Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, UringSlotSpec,
+    },
 };
 use diagweave::prelude::*;
 use io_uring::opcode;
@@ -13,7 +15,7 @@ use veloq_driver_core::{
     driver::{
         CompletionToken, DriverSubmitResult, OpToken, RegisterFd, SubmitStatus, SubmitTokenContext,
     },
-    slot::{CheckedSlotView, InFlightWaiting, SlotAccessError},
+    slot::{CheckedSlotView, InFlightWaiting, SlotAccessError, SubmissionGuard},
 };
 
 fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
@@ -30,43 +32,45 @@ fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<Uring
         .attach_note("slot access failed during uring submission")
 }
 
-impl<'a> UringDriver<'a> {
-    pub(crate) unsafe fn submit_from_slot_raw(
-        driver: *mut UringDriver,
-        token: OpToken,
-        slot: Slot<'_, Reserved>,
-    ) -> UringResult<bool> {
-        let driver = unsafe { &mut *driver };
-        let user_data = token.index();
-        let mut sub_guard = slot
-            .start_submission_with(None)
-            .map_err(|err| slot_access_report("driver.submit_from_slot_raw.start", err))?;
-        let strategy = sub_guard
-            .slot
-            .as_mut()
-            .ok_or_else(|| {
-                UringError::InvalidState.report(
-                    "driver.submit_from_slot_raw",
-                    "submission guard slot missing",
-                )
-            })?
-            .op_mut()
-            .map_err(|err| slot_access_report("driver.submit_from_slot_raw.strategy", err))?
-            .vtable
-            .strategy;
+fn guard_slot_mut<'g, 'a>(
+    guard: &'g mut SubmissionGuard<'a, UringSlotSpec>,
+    scope: &'static str,
+) -> UringResult<&'g mut Slot<'a, Reserved>> {
+    guard
+        .slot
+        .as_mut()
+        .ok_or_else(|| UringError::InvalidState.report(scope, "submission guard slot missing"))
+}
 
-        match strategy {
-            SubmissionStrategy::SubmitSqe => {
-                let mut chunks = [ChunkId::ZERO; 4];
-                let (count, sqe) = {
-                    let driver_ptr = driver as *mut UringDriver;
-                    let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw",
-                            "submission guard slot missing",
-                        )
-                    })?;
-                    slot.with_op_and_payload_mut(|op, payload| {
+/// Turns a reserved slot's op into an SQE (or a wheel entry) and hands it to the kernel.
+///
+/// Takes the driver split in two: `slot` borrows out of `UringDriver::ops`, `env` covers every
+/// other field the path needs. Both halves stay live at once — `make_sqe` reads the registered
+/// file table while holding the op, and the SQE push happens while the slot's platform data is
+/// still being updated — which is exactly why the split is a borrow-checked projection rather
+/// than a `&mut UringDriver` reconstructed from a raw pointer.
+pub(crate) fn submit_from_slot(
+    env: &mut SubmitEnv<'_, '_>,
+    token: OpToken,
+    slot: Slot<'_, Reserved>,
+) -> UringResult<bool> {
+    let user_data = token.index();
+    let mut sub_guard = slot
+        .start_submission_with(None)
+        .map_err(|err| slot_access_report("driver.submit_from_slot.start", err))?;
+    let strategy = guard_slot_mut(&mut sub_guard, "driver.submit_from_slot")?
+        .op_mut()
+        .map_err(|err| slot_access_report("driver.submit_from_slot.strategy", err))?
+        .vtable
+        .strategy;
+
+    match strategy {
+        SubmissionStrategy::SubmitSqe => {
+            let mut chunks = [ChunkId::ZERO; 4];
+            let (count, sqe) = {
+                let sqe_env = env.sqe_env();
+                guard_slot_mut(&mut sub_guard, "driver.submit_from_slot")?
+                    .with_op_and_payload_mut(|op, payload| {
                         let vtable = op.vtable;
                         let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
                         let completion_token = CompletionToken::user(token);
@@ -74,239 +78,148 @@ impl<'a> UringDriver<'a> {
                             (vtable.make_sqe)(
                                 op,
                                 payload,
-                                &mut *driver_ptr,
+                                &sqe_env,
                                 SubmitTokenContext::new(token, completion_token),
                             )
-                            .attach_note("driver.submit_from_slot_raw.make_sqe")?
+                            .attach_note("driver.submit_from_slot.make_sqe")?
                             .user_data(completion_token.raw())
                         };
                         Ok::<_, Report<UringError>>((count, sqe))
                     })
                     .map_err(|err| {
-                        slot_access_report("driver.submit_from_slot_raw.op_payload", err)
+                        slot_access_report("driver.submit_from_slot.op_payload", err)
                     })??
-                };
+            };
 
-                for &chunk_id in chunks.iter().take(count) {
-                    let index = chunk_id.as_usize();
-                    let is_registered = driver.registered_chunks.get(index).map_err(|e| {
-                        UringError::InvalidState
-                            .to_report()
-                            .push_ctx("scope", "driver.submit_from_slot_raw.bitset_get")
-                            .with_ctx("chunk_index", index)
-                            .with_ctx("bitset_error", format!("{e:?}"))
-                            .attach_note("BitSet get failed")
-                    })?;
+            for &chunk_id in chunks.iter().take(count) {
+                env.ensure_chunk_registered(
+                    chunk_id,
+                    user_data,
+                    "driver.submit_from_slot.ensure_chunk_registered",
+                )?;
+            }
 
-                    if !is_registered
-                        && let Some(info) = driver.registrar.resolve_chunk_info(chunk_id)
-                    {
-                        if let Err(e) = driver.register_chunk_internal(
-                            info.id,
-                            info.ptr.as_ptr(),
-                            info.len.get(),
-                        ) {
-                            if driver.registration_mode.is_strict() {
-                                return Err(e
-                                    .with_ctx("chunk_id", chunk_id.raw())
-                                    .with_ctx("user_data", user_data)
-                                    .attach_note("strict mode lazy register failed"));
-                            }
-                            return Err(e);
-                        }
-                    } else if !is_registered {
-                        driver.registration_stats.submission_missing_chunk_info = driver
-                            .registration_stats
-                            .submission_missing_chunk_info
-                            .saturating_add(1);
-                        if driver.registration_mode.is_strict() {
-                            return UringError::InvalidState
-                                .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
-                                .with_ctx("chunk_id", chunk_id.raw())
-                                .with_ctx("user_data", user_data)
-                                .attach_note(
-                                    "strict mode missing chunk info for lazy registration",
-                                );
-                        }
-                        return UringError::InvalidInput
-                            .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
-                            .with_ctx("chunk_id", chunk_id.raw())
-                            .with_ctx("user_data", user_data)
-                            .attach_note("missing chunk info for lazy registration");
-                    }
-                }
+            let pushed = env.push_entry(sqe);
+            guard_slot_mut(&mut sub_guard, "driver.submit_from_slot")?
+                .platform_mut()
+                .submission_state = if pushed {
+                UringSubmissionState::KernelSubmitted
+            } else {
+                UringSubmissionState::Queued
+            };
+            let _ = sub_guard.persist();
 
-                let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                    UringError::InvalidState.report(
-                        "driver.submit_from_slot_raw",
-                        "submission guard slot missing",
-                    )
+            if pushed {
+                trace!(user_data, "Submitted to SQ");
+            } else {
+                debug!(user_data, "SQ full");
+            }
+            Ok(pushed)
+        }
+        SubmissionStrategy::SoftwareTimer => {
+            let duration_opt = guard_slot_mut(&mut sub_guard, "driver.submit_from_slot.timer")?
+                .with_op_and_payload_mut(|op, payload| {
+                    let vtable = op.vtable;
+                    unsafe { (vtable.get_timeout)(op, payload) }
+                })
+                .map_err(|err| {
+                    slot_access_report("driver.submit_from_slot.timer.op_payload", err)
                 })?;
-                if driver.push_entry(sqe) {
-                    slot.platform_mut().submission_state = UringSubmissionState::KernelSubmitted;
-                    let _ = sub_guard.persist();
-                    trace!(user_data, "Submitted to SQ");
-                    Ok(true)
-                } else {
-                    slot.platform_mut().submission_state = UringSubmissionState::Queued;
-                    let _ = sub_guard.persist();
-                    debug!(user_data, "SQ full");
-                    Ok(false)
-                }
-            }
-            SubmissionStrategy::SoftwareTimer => {
-                let duration_opt = {
-                    let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw.timer",
-                            "submission guard slot missing",
-                        )
-                    })?;
-                    slot.with_op_and_payload_mut(|op, payload| {
-                        let vtable = op.vtable;
-                        unsafe { (vtable.get_timeout)(op, payload) }
-                    })
-                    .map_err(|err| {
-                        slot_access_report("driver.submit_from_slot_raw.timer.op_payload", err)
-                    })?
-                };
-                if let Some(duration) = duration_opt {
-                    let task_id = driver.wheel.insert(token, duration);
-                    if let Some(platform) = driver.ops.platform_mut(token) {
-                        platform.timer_id = Some(task_id);
-                        platform.submission_state = UringSubmissionState::Timer;
-                    }
-                    let _ = sub_guard.persist();
-                    trace!(user_data, ?duration, "Registered software timer");
-                    Ok(true)
-                } else {
-                    Err(UringError::InvalidInput.report(
-                        "driver.submit_from_slot_raw.timer_duration",
-                        "Timer duration missing",
-                    ))
-                }
-            }
+            let Some(duration) = duration_opt else {
+                return Err(UringError::InvalidInput.report(
+                    "driver.submit_from_slot.timer_duration",
+                    "Timer duration missing",
+                ));
+            };
+
+            let task_id = env.wheel.insert(token, duration);
+            let platform =
+                guard_slot_mut(&mut sub_guard, "driver.submit_from_slot.timer")?.platform_mut();
+            platform.timer_id = Some(task_id);
+            platform.submission_state = UringSubmissionState::Timer;
+            let _ = sub_guard.persist();
+            trace!(user_data, ?duration, "Registered software timer");
+            Ok(true)
         }
     }
+}
 
+/// Retries a backlogged submission whose SQE never made it into a full ring.
+pub(crate) fn submit_queued_from_slot(
+    env: &mut SubmitEnv<'_, '_>,
+    token: OpToken,
+    mut slot: Slot<'_, InFlightWaiting>,
+) -> UringResult<bool> {
+    let user_data = token.index();
+    if slot.platform().submission_state != UringSubmissionState::Queued {
+        return Ok(true);
+    }
+
+    let strategy = slot
+        .op_mut()
+        .map_err(|err| slot_access_report("driver.submit_queued_from_slot.strategy", err))?
+        .vtable
+        .strategy;
+    if strategy != SubmissionStrategy::SubmitSqe {
+        return UringError::InvalidState
+            .push_ctx("scope", "driver.submit_queued_from_slot.strategy")
+            .with_ctx("user_data", user_data)
+            .with_ctx("strategy", format!("{strategy:?}"))
+            .attach_note("queued uring backlog entry is not an SQE operation");
+    }
+
+    let mut chunks = [ChunkId::ZERO; 4];
+    let (count, sqe) = {
+        let sqe_env = env.sqe_env();
+        slot.with_op_and_payload_mut(|op, payload| {
+            let vtable = op.vtable;
+            let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+            let completion_token = CompletionToken::user(token);
+            let sqe = unsafe {
+                (vtable.make_sqe)(
+                    op,
+                    payload,
+                    &sqe_env,
+                    SubmitTokenContext::new(token, completion_token),
+                )
+                .attach_note("driver.submit_queued_from_slot.make_sqe")?
+                .user_data(completion_token.raw())
+            };
+            Ok::<_, Report<UringError>>((count, sqe))
+        })
+        .map_err(|err| slot_access_report("driver.submit_queued_from_slot.op_payload", err))??
+    };
+
+    for &chunk_id in chunks.iter().take(count) {
+        env.ensure_chunk_registered(
+            chunk_id,
+            user_data,
+            "driver.submit_queued_from_slot.ensure_chunk_registered",
+        )?;
+    }
+
+    if env.push_entry(sqe) {
+        slot.platform_mut().submission_state = UringSubmissionState::KernelSubmitted;
+        trace!(user_data, "Submitted queued backlog entry to SQ");
+        Ok(true)
+    } else {
+        slot.platform_mut().submission_state = UringSubmissionState::Queued;
+        debug!(user_data, "SQ still full for queued backlog entry");
+        Ok(false)
+    }
+}
+
+impl<'a> UringDriver<'a> {
     pub(crate) fn submit_from_slot_token(&mut self, token: OpToken) -> UringResult<bool> {
-        let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.checked_slot_view(token)? {
+        let (ops, mut env) = self.split_for_submit();
+        let slot = match ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
                 return Err(UringError::InvalidState
                     .report("driver.submit_from_slot_index", "op missing in slot"));
             }
         };
-        unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) }
-    }
-
-    pub(crate) unsafe fn submit_queued_from_slot_raw(
-        driver: *mut UringDriver,
-        token: OpToken,
-        mut slot: Slot<'_, InFlightWaiting>,
-    ) -> UringResult<bool> {
-        let driver = unsafe { &mut *driver };
-        let user_data = token.index();
-        if slot.platform().submission_state != UringSubmissionState::Queued {
-            return Ok(true);
-        }
-
-        let strategy = slot
-            .op_mut()
-            .map_err(|err| slot_access_report("driver.submit_queued_from_slot_raw.strategy", err))?
-            .vtable
-            .strategy;
-        if strategy != SubmissionStrategy::SubmitSqe {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.submit_queued_from_slot_raw.strategy")
-                .with_ctx("user_data", user_data)
-                .with_ctx("strategy", format!("{strategy:?}"))
-                .attach_note("queued uring backlog entry is not an SQE operation");
-        }
-
-        let mut chunks = [ChunkId::ZERO; 4];
-        let (count, sqe) = {
-            let driver_ptr = driver as *mut UringDriver;
-            slot.with_op_and_payload_mut(|op, payload| {
-                let vtable = op.vtable;
-                let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
-                let completion_token = CompletionToken::user(token);
-                let sqe = unsafe {
-                    (vtable.make_sqe)(
-                        op,
-                        payload,
-                        &mut *driver_ptr,
-                        SubmitTokenContext::new(token, completion_token),
-                    )
-                    .attach_note("driver.submit_queued_from_slot_raw.make_sqe")?
-                    .user_data(completion_token.raw())
-                };
-                Ok::<_, Report<UringError>>((count, sqe))
-            })
-            .map_err(|err| {
-                slot_access_report("driver.submit_queued_from_slot_raw.op_payload", err)
-            })??
-        };
-
-        for &chunk_id in chunks.iter().take(count) {
-            let index = chunk_id.as_usize();
-            let is_registered = driver.registered_chunks.get(index).map_err(|e| {
-                UringError::InvalidState
-                    .to_report()
-                    .push_ctx("scope", "driver.submit_queued_from_slot_raw.bitset_get")
-                    .with_ctx("chunk_index", index)
-                    .with_ctx("bitset_error", format!("{e:?}"))
-                    .attach_note("BitSet get failed")
-            })?;
-
-            if !is_registered && let Some(info) = driver.registrar.resolve_chunk_info(chunk_id) {
-                if let Err(e) =
-                    driver.register_chunk_internal(info.id, info.ptr.as_ptr(), info.len.get())
-                {
-                    if driver.registration_mode.is_strict() {
-                        return Err(e
-                            .with_ctx("chunk_id", chunk_id.raw())
-                            .with_ctx("user_data", user_data)
-                            .attach_note("strict mode lazy register failed"));
-                    }
-                    return Err(e);
-                }
-            } else if !is_registered {
-                driver.registration_stats.submission_missing_chunk_info = driver
-                    .registration_stats
-                    .submission_missing_chunk_info
-                    .saturating_add(1);
-                if driver.registration_mode.is_strict() {
-                    return UringError::InvalidState
-                        .push_ctx(
-                            "scope",
-                            "driver.submit_queued_from_slot_raw.missing_chunk_info",
-                        )
-                        .with_ctx("chunk_id", chunk_id.raw())
-                        .with_ctx("user_data", user_data)
-                        .attach_note("strict mode missing chunk info for lazy registration");
-                }
-                return UringError::InvalidInput
-                    .push_ctx(
-                        "scope",
-                        "driver.submit_queued_from_slot_raw.missing_chunk_info",
-                    )
-                    .with_ctx("chunk_id", chunk_id.raw())
-                    .with_ctx("user_data", user_data)
-                    .attach_note("missing chunk info for lazy registration");
-            }
-        }
-
-        if driver.push_entry(sqe) {
-            slot.platform_mut().submission_state = UringSubmissionState::KernelSubmitted;
-            trace!(user_data, "Submitted queued backlog entry to SQ");
-            Ok(true)
-        } else {
-            slot.platform_mut().submission_state = UringSubmissionState::Queued;
-            debug!(user_data, "SQ still full for queued backlog entry");
-            Ok(false)
-        }
+        submit_from_slot(&mut env, token, slot)
     }
 
     pub(crate) fn submit_waker(&mut self) -> UringResult<()> {
@@ -372,27 +285,9 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> bool {
-        trace!("Pushing SQE user_data={}", entry.get_user_data());
-        let mut sq = self.ring.submission();
-
-        if unsafe { sq.push(&entry) }.is_ok() {
-            return true;
-        }
-
-        drop(sq);
-        // push 失败意味着用户态 SQ 环被已填充、内核尚未消费的条目占满。要腾出空间只能
-        // 让内核消费它们，即带 `to_submit > 0` 进 `io_uring_enter`——单纯 GETEVENTS 只
-        // 收割 CQ，一条 SQE 都不会被消费，重试必然再次失败并白付一次系统调用。
-        let _ = self.ring.submit();
-
-        let mut sq = self.ring.submission();
-        if unsafe { sq.push(&entry) }.is_ok() {
-            return true;
-        }
-
-        debug!("SQ full even after flush");
-        false
+        self.submit_env().push_entry(entry)
     }
 
     pub(crate) fn submit_sqe_internal(
@@ -402,48 +297,58 @@ impl<'a> UringDriver<'a> {
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
         let user_data = token.index();
-        let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.checked_slot_view(token) {
-            Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
-                if slot.has_op() {
-                    let mut slot = slot;
-                    match slot.op_mut() {
-                        Ok(slot_op) => *slot_op = op,
-                        Err(err) => {
-                            return DriverSubmitResult::failed(
-                                slot_access_report("uring.driver.submit_sqe_internal.op_mut", err),
-                                SubmitStatus::Void,
-                            );
+        let outcome = {
+            let (ops, mut env) = self.split_for_submit();
+            let slot = match ops.checked_slot_view(token) {
+                Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
+                    if slot.has_op() {
+                        let mut slot = slot;
+                        match slot.op_mut() {
+                            Ok(slot_op) => *slot_op = op,
+                            Err(err) => {
+                                return DriverSubmitResult::failed(
+                                    slot_access_report(
+                                        "uring.driver.submit_sqe_internal.op_mut",
+                                        err,
+                                    ),
+                                    SubmitStatus::Void,
+                                );
+                            }
                         }
-                    }
-                    slot
-                } else {
-                    match slot.init_op_with(op, |_| {}) {
-                        Ok(slot) => slot,
-                        Err(err) => {
-                            return DriverSubmitResult::failed(
-                                slot_access_report("uring.driver.submit_sqe_internal.init_op", err),
-                                SubmitStatus::Void,
-                            );
+                        slot
+                    } else {
+                        match slot.init_op_with(op, |_| {}) {
+                            Ok(slot) => slot,
+                            Err(err) => {
+                                return DriverSubmitResult::failed(
+                                    slot_access_report(
+                                        "uring.driver.submit_sqe_internal.init_op",
+                                        err,
+                                    ),
+                                    SubmitStatus::Void,
+                                );
+                            }
                         }
                     }
                 }
-            }
-            Ok(_) => {
-                return DriverSubmitResult::failed(
-                    UringError::InvalidState.report(
-                        "uring.driver.submit_sqe_internal",
-                        "Op slot missing in registry",
-                    ),
-                    SubmitStatus::Void,
-                );
-            }
-            Err(report) => {
-                return DriverSubmitResult::failed(report, SubmitStatus::Void);
-            }
+                Ok(_) => {
+                    return DriverSubmitResult::failed(
+                        UringError::InvalidState.report(
+                            "uring.driver.submit_sqe_internal",
+                            "Op slot missing in registry",
+                        ),
+                        SubmitStatus::Void,
+                    );
+                }
+                Err(report) => {
+                    return DriverSubmitResult::failed(report, SubmitStatus::Void);
+                }
+            };
+
+            submit_from_slot(&mut env, token, slot)
         };
 
-        match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
+        match outcome {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(user_data, "SQ full, pushing to backlog");
@@ -474,54 +379,58 @@ impl<'a> UringDriver<'a> {
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
         let user_data = token.index();
-        let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.checked_slot_view(token) {
-            Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
-                if slot.has_op() {
-                    let mut slot = slot;
-                    match slot.op_mut() {
-                        Ok(slot_op) => *slot_op = op,
-                        Err(err) => {
-                            return DriverSubmitResult::failed(
-                                slot_access_report(
-                                    "uring.driver.submit_timer_internal.op_mut",
-                                    err,
-                                ),
-                                SubmitStatus::Void,
-                            );
+        let outcome = {
+            let (ops, mut env) = self.split_for_submit();
+            let slot = match ops.checked_slot_view(token) {
+                Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
+                    if slot.has_op() {
+                        let mut slot = slot;
+                        match slot.op_mut() {
+                            Ok(slot_op) => *slot_op = op,
+                            Err(err) => {
+                                return DriverSubmitResult::failed(
+                                    slot_access_report(
+                                        "uring.driver.submit_timer_internal.op_mut",
+                                        err,
+                                    ),
+                                    SubmitStatus::Void,
+                                );
+                            }
                         }
-                    }
-                    slot
-                } else {
-                    match slot.init_op_with(op, |_| {}) {
-                        Ok(slot) => slot,
-                        Err(err) => {
-                            return DriverSubmitResult::failed(
-                                slot_access_report(
-                                    "uring.driver.submit_timer_internal.init_op",
-                                    err,
-                                ),
-                                SubmitStatus::Void,
-                            );
+                        slot
+                    } else {
+                        match slot.init_op_with(op, |_| {}) {
+                            Ok(slot) => slot,
+                            Err(err) => {
+                                return DriverSubmitResult::failed(
+                                    slot_access_report(
+                                        "uring.driver.submit_timer_internal.init_op",
+                                        err,
+                                    ),
+                                    SubmitStatus::Void,
+                                );
+                            }
                         }
                     }
                 }
-            }
-            Ok(_) => {
-                return DriverSubmitResult::failed(
-                    UringError::InvalidState.report(
-                        "uring.driver.submit_timer_internal",
-                        "Op slot missing in registry",
-                    ),
-                    SubmitStatus::Void,
-                );
-            }
-            Err(report) => {
-                return DriverSubmitResult::failed(report, SubmitStatus::Void);
-            }
+                Ok(_) => {
+                    return DriverSubmitResult::failed(
+                        UringError::InvalidState.report(
+                            "uring.driver.submit_timer_internal",
+                            "Op slot missing in registry",
+                        ),
+                        SubmitStatus::Void,
+                    );
+                }
+                Err(report) => {
+                    return DriverSubmitResult::failed(report, SubmitStatus::Void);
+                }
+            };
+
+            submit_from_slot(&mut env, token, slot)
         };
 
-        match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
+        match outcome {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(

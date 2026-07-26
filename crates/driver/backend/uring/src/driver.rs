@@ -36,10 +36,12 @@ use veloq_driver_core::{
 };
 
 mod completion;
+mod env;
 mod lifecycle;
 mod registration;
 mod submission;
 
+pub(crate) use env::SqeEnv;
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{
     FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,

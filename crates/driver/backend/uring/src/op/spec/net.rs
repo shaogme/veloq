@@ -1,7 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::UringRawHandle,
-    driver::UringDriver,
+    driver::SqeEnv,
     error::UringResult,
     op::{
         Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, payload,
@@ -29,10 +29,10 @@ impl UringOpSpec for Recv {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_recv(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_recv(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -53,10 +53,10 @@ impl UringOpSpec for OpSend {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_send(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_send(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -77,10 +77,10 @@ impl UringOpSpec for UdpRecv {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_udp_recv(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_udp_recv(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -101,10 +101,10 @@ impl UringOpSpec for UdpSend {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_udp_send(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_udp_send(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -125,10 +125,10 @@ impl UringOpSpec for Connect {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_connect(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_connect(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -149,10 +149,10 @@ impl UringOpSpec for UdpConnect {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_udp_connect(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_udp_connect(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -173,10 +173,10 @@ impl UringOpSpec for Accept {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_accept(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_accept(kernel, payload, env, token) }
     }
 
     unsafe fn on_complete(
@@ -214,10 +214,10 @@ impl UringOpSpec for SendTo {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_send_to(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_send_to(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -238,10 +238,10 @@ impl UringOpSpec for UdpRecvFrom {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_udp_recv_from(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_udp_recv_from(kernel, payload, env, token) }
     }
 
     unsafe fn on_complete(

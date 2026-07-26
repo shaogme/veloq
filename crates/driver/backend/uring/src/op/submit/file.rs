@@ -1,5 +1,5 @@
 use crate::{
-    driver::{RegisteredFileEntry, UringDriver},
+    driver::{RegisteredFileEntry, SqeEnv},
     error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
@@ -17,7 +17,7 @@ use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd};
 pub(crate) unsafe fn make_sqe_read_fixed(
     _kernel: &mut KernelRef<ReadFixed>,
     rw_op: &mut ReadFixed,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
@@ -27,19 +27,13 @@ pub(crate) unsafe fn make_sqe_read_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
+        env.file_slots,
         rw_op.fd,
         "uring.op.submit.make_sqe_read_fixed",
     )?;
 
-    let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
-        driver
-            .registered_chunks
-            .get(region_info.id.as_usize())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let is_registered =
+        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
@@ -54,7 +48,7 @@ pub(crate) unsafe fn make_sqe_read_fixed(
 pub(crate) unsafe fn make_sqe_read_raw(
     _kernel: &mut KernelRef<ReadRaw>,
     rw_op: &mut ReadRaw,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
@@ -64,14 +58,8 @@ pub(crate) unsafe fn make_sqe_read_raw(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
-    let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
-        driver
-            .registered_chunks
-            .get(region_info.id.as_usize())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let is_registered =
+        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
@@ -88,7 +76,7 @@ pub(crate) unsafe fn make_sqe_read_raw(
 pub(crate) unsafe fn make_sqe_write_fixed(
     _kernel: &mut KernelRef<WriteFixed>,
     rw_op: &mut WriteFixed,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
@@ -98,19 +86,13 @@ pub(crate) unsafe fn make_sqe_write_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
+        env.file_slots,
         rw_op.fd,
         "uring.op.submit.make_sqe_write_fixed",
     )?;
 
-    let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
-        driver
-            .registered_chunks
-            .get(region_info.id.as_usize())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let is_registered =
+        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
@@ -127,7 +109,7 @@ pub(crate) unsafe fn make_sqe_write_fixed(
 pub(crate) unsafe fn make_sqe_write_raw(
     _kernel: &mut KernelRef<WriteRaw>,
     rw_op: &mut WriteRaw,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
@@ -137,14 +119,8 @@ pub(crate) unsafe fn make_sqe_write_raw(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
-    let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
-        driver
-            .registered_chunks
-            .get(region_info.id.as_usize())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let is_registered =
+        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
@@ -161,12 +137,12 @@ pub(crate) unsafe fn make_sqe_write_raw(
 pub(crate) unsafe fn make_sqe_close(
     _kernel: &mut KernelRef<Close>,
     close_op: &mut Close,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let idx = close_op.fd.fixed_index() as usize;
     if let Some(RegisteredFileEntry::BorrowedFd { .. }) =
-        driver.file_slots.get(idx).and_then(|s| s.entry.as_ref())
+        env.file_slots.get(idx).and_then(|s| s.entry.as_ref())
     {
         return Err(UringError::InvalidInput
             .report(
@@ -178,7 +154,7 @@ pub(crate) unsafe fn make_sqe_close(
             .attach_note("borrowed fd Close rejected"));
     }
     let fixed_fd = resolve_any_fd(
-        &driver.file_slots,
+        env.file_slots,
         close_op.fd,
         "uring.op.submit.make_sqe_close",
     )?;
@@ -188,7 +164,7 @@ pub(crate) unsafe fn make_sqe_close(
 pub(crate) unsafe fn make_sqe_fsync(
     _kernel: &mut KernelRef<Fsync>,
     fsync_op: &mut Fsync,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
@@ -198,7 +174,7 @@ pub(crate) unsafe fn make_sqe_fsync(
     };
 
     let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
+        env.file_slots,
         fsync_op.fd,
         "uring.op.submit.make_sqe_fsync",
     )?;
@@ -208,7 +184,7 @@ pub(crate) unsafe fn make_sqe_fsync(
 pub(crate) unsafe fn make_sqe_fsync_raw(
     _kernel: &mut KernelRef<FsyncRaw>,
     fsync_op: &mut FsyncRaw,
-    _driver: &mut UringDriver,
+    _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
@@ -224,7 +200,7 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
 pub(crate) unsafe fn make_sqe_sync_range(
     _kernel: &mut KernelRef<SyncFileRange>,
     sync_op: &mut SyncFileRange,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let nbytes = if sync_op.nbytes > u32::MAX as u64 {
@@ -242,7 +218,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
     };
 
     let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
+        env.file_slots,
         sync_op.fd,
         "uring.op.submit.make_sqe_sync_range",
     )?;
@@ -255,7 +231,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
 pub(crate) unsafe fn make_sqe_sync_range_raw(
     _kernel: &mut KernelRef<SyncFileRangeRaw>,
     sync_op: &mut SyncFileRangeRaw,
-    _driver: &mut UringDriver,
+    _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let nbytes = if sync_op.nbytes > u32::MAX as u64 {
@@ -282,11 +258,11 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
 pub(crate) unsafe fn make_sqe_fallocate(
     _kernel: &mut KernelRef<Fallocate>,
     fallocate_op: &mut Fallocate,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
+        env.file_slots,
         fallocate_op.fd,
         "uring.op.submit.make_sqe_fallocate",
     )?;
@@ -299,7 +275,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
 pub(crate) unsafe fn make_sqe_fallocate_raw(
     _kernel: &mut KernelRef<FallocateRaw>,
     fallocate_op: &mut FallocateRaw,
-    _driver: &mut UringDriver,
+    _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = fallocate_op.fd.as_fd();
@@ -312,7 +288,7 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
 pub(crate) unsafe fn make_sqe_open(
     _kernel: &mut OpenPayload,
     user: &mut Open,
-    _driver: &mut UringDriver,
+    _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let path_ptr = user.path.as_slice().as_ptr() as *const _;

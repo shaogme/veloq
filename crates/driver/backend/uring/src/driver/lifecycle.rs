@@ -2,6 +2,7 @@ use crate::{
     driver::{
         PendingCancel, UringDriver,
         completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
+        submission::submit_queued_from_slot,
     },
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
@@ -281,12 +282,14 @@ impl<'a> UringDriver<'a> {
                     }
                 },
                 BacklogAction::SubmitQueued => {
-                    let driver_ptr = self as *mut UringDriver;
-                    let result = match self.ops.checked_slot_view(token)? {
-                        CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => unsafe {
-                            Self::submit_queued_from_slot_raw(driver_ptr, token, slot)
-                        },
-                        _ => Ok(true),
+                    let result = {
+                        let (ops, mut env) = self.split_for_submit();
+                        match ops.checked_slot_view(token)? {
+                            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
+                                submit_queued_from_slot(&mut env, token, slot)
+                            }
+                            _ => Ok(true),
+                        }
                     };
                     match result {
                         Ok(true) => {

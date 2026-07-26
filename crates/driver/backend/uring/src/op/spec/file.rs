@@ -1,7 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::UringRawHandle,
-    driver::UringDriver,
+    driver::SqeEnv,
     error::UringResult,
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw,
@@ -30,10 +30,10 @@ impl UringOpSpec for ReadFixed {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_read_fixed(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_read_fixed(kernel, payload, env, token) }
     }
 
     fn resolve_chunks(
@@ -62,10 +62,10 @@ impl UringOpSpec for ReadRaw {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_read_raw(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_read_raw(kernel, payload, env, token) }
     }
 
     fn resolve_chunks(
@@ -94,10 +94,10 @@ impl UringOpSpec for WriteFixed {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_write_fixed(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_write_fixed(kernel, payload, env, token) }
     }
 
     fn resolve_chunks(
@@ -126,10 +126,10 @@ impl UringOpSpec for WriteRaw {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_write_raw(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_write_raw(kernel, payload, env, token) }
     }
 
     fn resolve_chunks(
@@ -159,10 +159,10 @@ impl UringOpSpec for Close {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_close(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_close(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -183,10 +183,10 @@ impl UringOpSpec for Fsync {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_fsync(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_fsync(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -207,10 +207,10 @@ impl UringOpSpec for FsyncRaw {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_fsync_raw(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_fsync_raw(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -231,10 +231,10 @@ impl UringOpSpec for SyncFileRange {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_sync_range(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_sync_range(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -255,10 +255,10 @@ impl UringOpSpec for SyncFileRangeRaw {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_sync_range_raw(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_sync_range_raw(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -279,10 +279,10 @@ impl UringOpSpec for Fallocate {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_fallocate(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_fallocate(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -303,10 +303,10 @@ impl UringOpSpec for FallocateRaw {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_fallocate_raw(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_fallocate_raw(kernel, payload, env, token) }
     }
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
@@ -327,10 +327,10 @@ impl UringOpSpec for Open {
     unsafe fn make_sqe(
         kernel: &mut Self::KernelPayload,
         payload: &mut Self,
-        driver: &mut UringDriver,
+        env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry> {
-        unsafe { submit::make_sqe_open(kernel, payload, driver, token) }
+        unsafe { submit::make_sqe_open(kernel, payload, env, token) }
     }
 
     fn completion_cleanup(

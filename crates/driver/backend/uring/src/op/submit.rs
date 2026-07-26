@@ -6,7 +6,7 @@ pub(super) use net::*;
 
 use crate::{
     config::{IoFd, RawHandleKind},
-    driver::{FileSlot, UringDriver, resolve_registered_fixed_fd},
+    driver::{FileSlot, SqeEnv, resolve_registered_fixed_fd},
     error::{UringError, UringResult},
     op::{
         Timeout, Wakeup,
@@ -90,7 +90,7 @@ pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupG
 pub(crate) unsafe fn make_sqe_timeout(
     kernel: &mut TimeoutPayload,
     user: &mut Timeout,
-    _driver: &mut UringDriver,
+    _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     kernel.ts = types::Timespec::new()
@@ -104,13 +104,9 @@ pub(crate) unsafe fn make_sqe_timeout(
 pub(crate) unsafe fn make_sqe_wakeup(
     kernel: &mut WakeupPayload,
     user: &mut Wakeup,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fixed_fd = resolve_file_fd(
-        &driver.file_slots,
-        user.fd,
-        "uring.op.submit.make_sqe_wakeup",
-    )?;
+    let fixed_fd = resolve_file_fd(env.file_slots, user.fd, "uring.op.submit.make_sqe_wakeup")?;
     Ok(opcode::Read::new(fixed_fd, kernel.buf.as_mut_ptr(), 8).build())
 }

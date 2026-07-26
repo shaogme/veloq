@@ -2,7 +2,7 @@
 
 use crate::{
     diagnostics::UringCompletionDiagnostics,
-    driver::{UringDriver, UringOpState},
+    driver::{SqeEnv, UringOpState},
     error::{UringError, UringResult},
 };
 use io_uring::squeue;
@@ -32,10 +32,15 @@ pub(crate) use payload::{
 // VTable Definition
 // ============================================================================
 
+/// Builds the SQE for one operation.
+///
+/// `env` is deliberately narrower than `&mut UringDriver`: the op and payload handed in are
+/// borrowed out of the driver's slot registry, so an implementation that could reach the
+/// registry again would alias them.
 pub(crate) type MakeSqeFn = unsafe fn(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
-    driver: &mut UringDriver,
+    env: &SqeEnv<'_>,
     token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry>;
 pub(crate) type OnCompleteFn = unsafe fn(
