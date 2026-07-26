@@ -20,14 +20,13 @@ use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::{
     SockAddrStorage, Socket,
+    driver::Driver,
     op::{
-        Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, Send as OpSend,
+        Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, RecvProvided,
+        Send as OpSend,
     },
     socket_addr_to_storage,
 };
-
-#[cfg(target_os = "linux")]
-use veloq_driver_native::{driver::Driver, op::RecvProvided};
 
 #[derive(Clone)]
 pub struct GenericTcpListener<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
@@ -189,7 +188,9 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     /// 查的是**当前 worker** 的驱动。所有 worker 用同一份配置构造，所以答案一致；真正会
     /// 让它变成 `false` 的是内核不支持（`IORING_REGISTER_PBUF_RING` 要 5.19），而那对整个
     /// 进程是一样的。
-    #[cfg(target_os = "linux")]
+    ///
+    /// IOCP 的 `capabilities()` 恒为全 `false`，所以这一条在那里总是失败——**同一个判据**，
+    /// 不是另写一条平台分支。
     fn ensure_provided_buffers(&self) -> Result<()> {
         if self
             .ctx
@@ -197,12 +198,6 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
         {
             return Ok(());
         }
-        Err(NetError::ProvidedBuffersUnavailable)?
-    }
-
-    /// IOCP 没有 provided buffer，这条路径永远不可用。
-    #[cfg(not(target_os = "linux"))]
-    fn ensure_provided_buffers(&self) -> Result<()> {
         Err(NetError::ProvidedBuffersUnavailable)?
     }
 
@@ -214,7 +209,6 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     /// [`NetError::ProvidedBuffersUnavailable`]。
     ///
     /// 返回的 `FixedBuf` 的长度已经是内核实际写入的字节数；读到 0 字节表示对端关闭。
-    #[cfg(target_os = "linux")]
     async fn recv_provided_direct(&self) -> Result<FixedBuf> {
         self.ensure_provided_buffers()?;
 
@@ -245,16 +239,8 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     /// 见 [`RecvStream`]。
     ///
     /// 对端关闭时流正常结束。流在当前 worker 上提交，与这个 socket 上的其它操作一样。
-    #[cfg(target_os = "linux")]
     pub fn recv_multi(&self) -> Result<RecvStream<'rt, 'reg, S, P>> {
         RecvStream::new(self.ctx, self.inner.clone(), self.submitter)
-    }
-
-    /// IOCP 没有 provided buffer，恒返回 [`NetError::ProvidedBuffersUnavailable`]。签名与
-    /// Linux 一致，调用方不必写 `cfg`。
-    #[cfg(not(target_os = "linux"))]
-    pub fn recv_multi(&self) -> Result<RecvStream<'rt, 'reg, S, P>> {
-        Err(NetError::ProvidedBuffersUnavailable)?
     }
 
     async fn send_subset_direct(
@@ -347,17 +333,8 @@ impl<'rt, 'reg> LocalTcpStream<'rt, 'reg> {
 
     /// 接收一段数据，buffer 由内核从 provided buffer 环里挑（见
     /// [`crate::config::Config::uring_provided_buffers`]）。
-    #[cfg(target_os = "linux")]
     pub async fn recv_provided(&self) -> Result<FixedBuf> {
         self.recv_provided_direct().await
-    }
-
-    /// IOCP 没有 provided buffer，恒返回
-    /// [`NetError::ProvidedBuffersUnavailable`]。签名与 Linux 一致，调用方不必写 `cfg`。
-    #[cfg(not(target_os = "linux"))]
-    pub async fn recv_provided(&self) -> Result<FixedBuf> {
-        self.ensure_provided_buffers()?;
-        unreachable!("ensure_provided_buffers always fails off io_uring")
     }
 }
 
@@ -411,7 +388,6 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
     /// 环是 per-worker 的，所以操作照例路由到持有这个 socket 的 worker 上——用户拿到的
     /// `FixedBuf` 属于**那个** worker 的池，跨 worker drop 走池自己的归还路径，与其它任何
     /// `FixedBuf` 没有区别。
-    #[cfg(target_os = "linux")]
     pub async fn recv_provided(&self) -> Result<FixedBuf> {
         self.ensure_provided_buffers()?;
 
@@ -422,14 +398,6 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
         let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.trans()?;
         provided.buf.ok_or(NetError::ProvidedBufferMissing).trans()
-    }
-
-    /// IOCP 没有 provided buffer，恒返回
-    /// [`NetError::ProvidedBuffersUnavailable`]。签名与 Linux 一致，调用方不必写 `cfg`。
-    #[cfg(not(target_os = "linux"))]
-    pub async fn recv_provided(&self) -> Result<FixedBuf> {
-        self.ensure_provided_buffers()?;
-        unreachable!("ensure_provided_buffers always fails off io_uring")
     }
 }
 

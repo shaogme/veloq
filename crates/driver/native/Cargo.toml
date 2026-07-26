@@ -28,6 +28,7 @@ veloq-wheel.workspace = true
 veloq-blocking.workspace = true
 veloq-std.workspace = true
 futures-core.workspace = true
+diagweave.workspace = true
 
 crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true

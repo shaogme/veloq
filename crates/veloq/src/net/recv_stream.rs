@@ -8,8 +8,13 @@
 //! 但与 accept 有一处根本不同：**两条路径都要求 provided buffer 环**。这不是设计选择而是
 //! 内核语义——`IORING_OP_RECV` 的 multishot 变体强制 `IOSQE_BUFFER_SELECT`（一个调用方交
 //! 出来的 buffer 装不下多条完成的数据），而 `Emulated` 那一侧必须与它语义等价，也就不能反
-//! 过来向调用方要 buffer。于是 IOCP 上这条流根本不存在，[`RecvStream`] 在那里是一个没有值
-//! 的类型。
+//! 过来向调用方要 buffer。于是 IOCP 上这条流**建不起来**：[`TcpStream::recv_multi`] 在那
+//! 里恒返回 [`NetError::ProvidedBuffersUnavailable`]，两条路径一条都走不了。
+//!
+//! 类型本身在两个平台上是同一个，判据是运行期的 `capabilities().provided_buffers` 而不是
+//! `#[cfg]`——见 `RecvMode` 上的注释。
+//!
+//! [`TcpStream::recv_multi`]: crate::net::TcpStream::recv_multi
 //!
 //! 收益就是 provided buffer 的收益：**buffer 只在数据到达时才与连接绑定**。一万个挂着
 //! `recv_multi()` 的空闲连接不占任何接收缓冲，而一万个挂着 `recv()` 的连接各压一个。
@@ -21,41 +26,30 @@ use std::{
     task::{Context, Poll},
 };
 
+use diagweave::{prelude::*, report::Report};
 use futures_core::Stream;
 use veloq_buf::FixedBuf;
-use veloq_driver_native::op::OpSubmitter;
-
-use crate::{
-    error::Result,
-    net::common::{InnerSocket, SocketTokenPtr},
-    runtime::context::Ctx,
-};
-
-#[cfg(target_os = "linux")]
-use diagweave::{prelude::*, report::Report};
-
-#[cfg(target_os = "linux")]
 use veloq_driver_native::{
     driver::{Driver, DriverCapability, PlatformSlotSpec},
     error::Error as DriverError,
-    op::{Op, OpItem, OpResult, RecvMulti, RecvProvided},
-};
-
-#[cfg(target_os = "linux")]
-use crate::net::{
-    error::NetError,
     multishot::{is_buffer_ring_exhausted, is_capability_rejected},
+    op::{Op, OpItem, OpResult, OpSubmitter, RecvMulti, RecvProvided},
 };
 
-#[cfg(not(target_os = "linux"))]
-use std::{convert::Infallible, marker::PhantomData};
+use crate::{
+    error::Result,
+    net::{
+        common::{InnerSocket, SocketTokenPtr},
+        error::NetError,
+    },
+    runtime::context::Ctx,
+};
 
 /// 一条完成产出的东西，两条路径共用。
 ///
 /// `RecvMulti` 与 `RecvProvided` 的 `Output` / `Completion` 逐个相同（都是 `ProvidedBuf`
 /// 加 `usize`），所以这个别名对两者都成立——「产物不是提交物」这件事两者一样，不一样的只是
 /// 「一次提交产出几条」。
-#[cfg(target_os = "linux")]
 type ProvidedItem = OpItem<RecvProvided, PlatformSlotSpec>;
 
 /// 环被掏空后连着重 arm 多少次仍然立刻 `-ENOBUFS`，就把错误交给用户。
@@ -63,10 +57,15 @@ type ProvidedItem = OpItem<RecvProvided, PlatformSlotSpec>;
 /// 重 arm 本身是必需的：`-ENOBUFS` 那条 CQE 不带 `IORING_CQE_F_MORE`，内核顺带把整个
 /// multishot 也终止了。但只重 arm 不设上限，遇上「消费方长期跟不上」就会变成一个安静的忙
 /// 循环——每次唤醒提交一次、立刻再失败一次。到了上限就说明这不是抖动，用户该知道。
-#[cfg(target_os = "linux")]
 const MAX_EXHAUSTED_REARMS: u32 = 8;
 
-#[cfg(target_os = "linux")]
+/// 选哪条路是**运行期**的事，不是编译期的事。
+///
+/// 与 [`AcceptStream`](crate::net::AcceptStream) 里的 `AcceptMode` 同理：三个变体在两个平
+/// 台上都在，IOCP 的 `capabilities()` 恒为全 `false`，于是 `RecvStream::new` 在那里根本走
+/// 不到构造这个枚举的那一步。IOCP 后端为 `RecvMulti` / `RecvProvided` 提供了提交即失败的
+/// 实现（见 `veloq-driver-iocp` 的 `impl_iocp_unsupported_op!`），单是为了让类型在两个平台
+/// 上对称。
 enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
     /// 一次提交，多条完成：句柄本身就是流。
     Native(S::Stream<RecvMulti>),
@@ -90,7 +89,6 @@ enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
 ///
 /// 与所有其它操作一样，这条流在**创建它的那个 worker** 上提交——socket 的注册描述符是
 /// per-worker 的，provided buffer 环也是。
-#[cfg(target_os = "linux")]
 pub struct RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: SocketTokenPtr<'rt, 'reg>>
 {
     mode: RecvMode<'rt, 'reg, S>,
@@ -105,18 +103,6 @@ pub struct RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: Socket
     exhausted_streak: u32,
 }
 
-/// IOCP 上这条流没有值。
-///
-/// 类型在两个平台上都在，[`crate::net::TcpStream::recv_multi`] 的签名因此也一样，调用方不
-/// 必写 `cfg`；但它在这里恒返回 `Err(ProvidedBuffersUnavailable)`。用一个不可居留的类型
-/// 表达「构造不出来」，而不是留一堆永远走不到的分支等人去读注释。
-#[cfg(not(target_os = "linux"))]
-pub enum RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: SocketTokenPtr<'rt, 'reg>> {
-    /// 唯一的变体带着一个 [`Infallible`]，所以整个类型不可居留。
-    Never(Infallible, PhantomData<(S, InnerSocket<'rt, 'reg, P>)>),
-}
-
-#[cfg(target_os = "linux")]
 impl<'rt, 'reg, S, P> RecvStream<'rt, 'reg, S, P>
 where
     S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
@@ -284,7 +270,6 @@ where
 }
 
 /// 一条完成之后这条流该做什么。
-#[cfg(target_os = "linux")]
 enum Flow {
     /// 交给用户。
     Yield(Result<FixedBuf>),
@@ -294,7 +279,6 @@ enum Flow {
     End,
 }
 
-#[cfg(target_os = "linux")]
 impl<'rt, 'reg, S, P> Stream for RecvStream<'rt, 'reg, S, P>
 where
     S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
@@ -318,22 +302,6 @@ where
                 Flow::Retry => continue,
                 Flow::End => return Poll::Ready(None),
             }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl<'rt, 'reg, S, P> Stream for RecvStream<'rt, 'reg, S, P>
-where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
-    P: SocketTokenPtr<'rt, 'reg>,
-{
-    type Item = Result<FixedBuf>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // 这个类型不可居留，所以这个函数没有可达的实现。
-        match &*self {
-            RecvStream::Never(never, _) => match *never {},
         }
     }
 }

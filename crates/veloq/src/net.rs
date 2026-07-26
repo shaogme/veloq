@@ -6,9 +6,6 @@ pub mod socket;
 pub mod tcp;
 pub mod udp;
 
-#[cfg(target_os = "linux")]
-pub(crate) mod multishot;
-
 pub use accept_stream::AcceptStream;
 pub use recv_stream::RecvStream;
 pub use socket::{TcpSocket, UdpSocketBuilder};

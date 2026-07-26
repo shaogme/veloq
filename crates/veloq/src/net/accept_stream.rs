@@ -28,19 +28,11 @@ use diagweave::prelude::*;
 use futures_core::Stream;
 use veloq_driver_native::{
     OwnedRawHandle, SockAddrStorage,
-    driver::{Driver, PlatformSlotSpec},
-    op::{Accept, Op, OpItem, OpSubmitter},
-};
-
-#[cfg(target_os = "linux")]
-use veloq_driver_native::{
-    driver::DriverCapability,
-    op::{AcceptMulti, OpResult},
+    driver::{Driver, DriverCapability, PlatformSlotSpec},
+    multishot::is_capability_rejected,
+    op::{Accept, AcceptMulti, Op, OpItem, OpResult, OpSubmitter},
     peer_addr_of_handle,
 };
-
-#[cfg(target_os = "linux")]
-use crate::net::multishot::is_capability_rejected;
 
 use crate::{
     error::Result,
@@ -52,19 +44,17 @@ use crate::{
     runtime::context::Ctx,
 };
 
-#[cfg(target_os = "linux")]
 type NativeItem = OpItem<AcceptMulti, PlatformSlotSpec>;
 type EmulatedItem = OpItem<Accept, PlatformSlotSpec>;
 
-/// `Native` 只在有 multishot 后端的平台上存在。
+/// 选哪条路是**运行期**的事，不是编译期的事。
 ///
-/// 这处 `cfg` 分的是**实现**，不是用户可见的 API：[`AcceptStream`] 的类型与 `Stream` 项
-/// 在两个平台上完全一致，IOCP 只是恒走 `Emulated`（它的 `capabilities().accept_multi`
-/// 永远是 `false`）。把变体也一并 `cfg` 掉，是为了不要求 IOCP 后端去实现一套永远不会被
-/// 提交的 `AcceptMulti` op。
+/// 两个变体在两个平台上都在。IOCP 的 `capabilities().accept_multi` 恒为 `false`，所以
+/// `Native` 在那里永远构造不出来——但它构造得**出类型**，代价只是一段编译出来却走不到的
+/// 分支，换来的是这个文件里一处 `#[cfg]` 都不需要。IOCP 后端为此给 `AcceptMulti` 提供了
+/// 一个提交即失败的实现（见 `veloq-driver-iocp` 的 `impl_iocp_unsupported_op!`）。
 enum AcceptMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
     /// 一次提交，多条完成：句柄本身就是流。
-    #[cfg(target_os = "linux")]
     Native(S::Stream<AcceptMulti>),
     /// 每取一条都重新提交一次单发 accept。`None` 表示当前没有在途的那一次。
     ///
@@ -95,7 +85,6 @@ pub struct AcceptStream<
     ///
     /// 「内核不认识 multishot accept」只可能在**第一条**完成上表现出来，所以降级判据仅在
     /// 这个标志还是 `false` 时生效；此后同样的 `-EINVAL` 是真错误，照原样交给用户。
-    #[cfg(target_os = "linux")]
     native_delivered: bool,
 }
 
@@ -115,12 +104,10 @@ where
             inner,
             submitter,
             ctx,
-            #[cfg(target_os = "linux")]
             native_delivered: false,
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn arm(
         ctx: Ctx<'rt, 'reg>,
         inner: &InnerSocket<'rt, 'reg, P>,
@@ -132,20 +119,6 @@ where
         }
         let fd = inner.fd();
         AcceptMode::Native(ctx.submit_stream(&submitter, Op::new(AcceptMulti { fd })))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn arm(
-        _ctx: Ctx<'rt, 'reg>,
-        _inner: &InnerSocket<'rt, 'reg, P>,
-        _submitter: S,
-        native: bool,
-    ) -> AcceptMode<'rt, 'reg, S> {
-        debug_assert!(
-            !native,
-            "a backend without multishot accept must not report the capability"
-        );
-        AcceptMode::Emulated { pending: None }
     }
 
     /// 把一个刚被 accept 出来的描述符包装成流对外产出的那一项。
@@ -165,7 +138,6 @@ where
     }
 
     /// `Native` 的一项：新连接的 fd 来自 CQE，对端地址要另外问内核。
-    #[cfg(target_os = "linux")]
     fn native_item(
         &self,
         item: NativeItem,
@@ -194,7 +166,6 @@ where
     ///
     /// 返回 `true` 表示这一项**不该**交给用户：能力已经在 driver 上关掉、模式换成了
     /// `Emulated`，调用方重来一轮就会走单发 accept 拿到同一个连接。
-    #[cfg(target_os = "linux")]
     fn downgraded(&mut self, item: &NativeItem) -> bool {
         if self.native_delivered {
             return false;
@@ -219,29 +190,26 @@ where
     /// 重新提交一次单发 accept，本轮照样交得出一项。降级至多发生一次（此后 `mode` 已经是
     /// `Emulated`），所以这里没有循环也不会漏。
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
-        #[cfg(target_os = "linux")]
-        {
-            let polled = match &mut self.mode {
-                // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
-                AcceptMode::Native(stream) => unsafe { Pin::new_unchecked(stream) }.poll_next(cx),
-                AcceptMode::Emulated { .. } => Poll::Ready(None),
-            };
-            match polled {
-                Poll::Ready(Some(item)) => {
-                    if !self.downgraded(&item) {
-                        self.native_delivered = true;
-                        return Poll::Ready(Step::Native(item));
-                    }
+        let polled = match &mut self.mode {
+            // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
+            AcceptMode::Native(stream) => unsafe { Pin::new_unchecked(stream) }.poll_next(cx),
+            AcceptMode::Emulated { .. } => Poll::Ready(None),
+        };
+        match polled {
+            Poll::Ready(Some(item)) => {
+                if !self.downgraded(&item) {
+                    self.native_delivered = true;
+                    return Poll::Ready(Step::Native(item));
                 }
-                // `Emulated` 用 `Ready(None)` 表示「这一轮不归 Native」，所以只有真的处在
-                // `Native` 时它才意味着流结束。
-                Poll::Ready(None) => {
-                    if matches!(self.mode, AcceptMode::Native(_)) {
-                        return Poll::Ready(Step::Ended);
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
             }
+            // `Emulated` 用 `Ready(None)` 表示「这一轮不归 Native」，所以只有真的处在
+            // `Native` 时它才意味着流结束。
+            Poll::Ready(None) => {
+                if matches!(self.mode, AcceptMode::Native(_)) {
+                    return Poll::Ready(Step::Ended);
+                }
+            }
+            Poll::Pending => return Poll::Pending,
         }
 
         self.poll_emulated(cx)
@@ -251,7 +219,6 @@ where
     fn poll_emulated(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         let pending = match &mut self.mode {
             AcceptMode::Emulated { pending } => pending,
-            #[cfg(target_os = "linux")]
             AcceptMode::Native(_) => {
                 unreachable!("poll_emulated runs only once the mode settled on Emulated")
             }
@@ -302,9 +269,7 @@ where
         };
 
         let item = match step {
-            #[cfg(target_os = "linux")]
             Step::Ended => return Poll::Ready(None),
-            #[cfg(target_os = "linux")]
             Step::Native(item) => this.native_item(item),
             Step::Emulated(result) => this.emulated_item(result),
         };
@@ -314,11 +279,9 @@ where
 
 /// 一轮 `poll_step` 从后端拿到的原始结果。
 enum Step {
-    #[cfg(target_os = "linux")]
     Native(NativeItem),
     Emulated(EmulatedItem),
-    /// 后端句柄的流空了：这条 accept 流也就结束了。`Emulated` 永远走不到这里（单发流总有
-    /// 那一项），所以它跟着 `Native` 一起只在 io_uring 上存在。
-    #[cfg(target_os = "linux")]
+    /// 后端句柄的流空了：这条 accept 流也就结束了。`Emulated` 永远走不到这里——单发流总有
+    /// 那一项。
     Ended,
 }

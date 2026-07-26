@@ -7,9 +7,10 @@ use crate::{
     error::{IocpError, IocpResult},
     net::addr::SockAddrStorage,
     op::{
-        Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
-        ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
-        UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw, spec::PayloadBinding,
+        Accept, AcceptMulti, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend,
+        Open, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided, SendTo, SyncFileRange,
+        SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed,
+        WriteRaw, spec::PayloadBinding,
     },
 };
 
@@ -39,6 +40,12 @@ pub enum IocpUserPayload {
     UdpRecvFrom(UdpRecvFrom),
     Open(Open),
     Wakeup(Wakeup),
+    /// 下面三个操作 IOCP 提交不了（见 `op.rs` 的 `impl_iocp_unsupported_op!`）。变体仍然
+    /// 要在：提交路径先把 payload 擦除进 slot、再由 `submit` 同步失败把它原样取回，所以
+    /// 即使一条完成都不会产生，这一趟往返也是走完整的。
+    AcceptMulti(AcceptMulti),
+    RecvProvided(RecvProvided),
+    RecvMulti(RecvMulti),
 }
 
 unsafe impl Send for IocpUserPayload {}
@@ -67,6 +74,12 @@ pub(crate) enum IocpOpPayload {
     UdpRecvFrom(UdpRecvFromPayload),
     Open(OpenPayload),
     Wakeup(KernelRef<Wakeup>),
+    /// 一个 IOCP 提交不了的操作的内核 payload。
+    ///
+    /// 没有字段，因为没有内核请求可以描述：它唯一的用途是让 `IocpKernelOp` 有个能被构造出
+    /// 来的形状，好让提交路径走到 `submit` 那一步同步失败。三个不支持的操作共用它，也共用
+    /// 同一张 vtable。
+    Unsupported,
 }
 
 /// Reference to a kernel operation.

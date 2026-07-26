@@ -1458,6 +1458,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
+ "diagweave",
  "futures-core",
  "io-uring",
  "libc",
