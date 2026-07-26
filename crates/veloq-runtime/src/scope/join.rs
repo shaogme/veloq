@@ -238,16 +238,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         header: &GenericTaskHeader<St>,
         cx: &mut Context<'_>,
     ) -> RuntimeResult<()> {
-        if let Some(node) = waker_node {
-            let mut node = node.as_mut();
-            if !node.waker.will_wake(cx.waker()) {
-                unsafe {
-                    node.as_mut().get_unchecked_mut().waker = cx.waker().clone();
-                    header.register_completion(node.as_mut());
-                }
-            }
-            return Ok(());
-        } else {
+        if waker_node.is_none() {
             let node_ptr = unsafe {
                 arena.alloc_raw(
                     Layout::new::<GenericWakerNode<St>>(),
@@ -274,18 +265,19 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                 Pin::new_unchecked(&mut *(node_ptr.as_ptr() as *mut GenericWakerNode<St>))
             };
             *waker_node = Some(node_ref);
-            unsafe {
-                if let Some(node) = waker_node.as_mut() {
-                    header.register_completion(node.as_mut());
-                } else {
-                    return Err(RuntimeError::InvariantViolation {
-                        site: "JoinHandle::register_waker_on",
-                        detail: "waker node missing after initialization".into(),
-                    }
-                    .to_report());
-                }
-            }
         }
+
+        let Some(node) = waker_node.as_mut() else {
+            return Err(RuntimeError::InvariantViolation {
+                site: "JoinHandle::register_waker_on",
+                detail: "waker node missing after initialization".into(),
+            }
+            .to_report());
+        };
+
+        // 「刷新 waker + 入链」统一由 `register_completion` 完成：它自带 `is_linked()`
+        // 保护，重复注册不会破坏侵入式链表（RUNTIME_REVIEW §1.2）。
+        unsafe { header.register_completion(node.as_mut(), cx.waker()) };
         Ok(())
     }
 }
@@ -314,6 +306,11 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 let header = task.header();
                 if header.is_completed() {
                     let Some(res) = gate.take_result_erased() else {
+                        // 任务在入队失败后被 `abandon_before_enqueue` 终结：没有结果，
+                        // 但状态是可判别的取消（RUNTIME_REVIEW §4.4）。
+                        if header.is_locally_cancelled() {
+                            return Poll::Ready(JoinOutcome::TaskErr(TaskError::Cancelled));
+                        }
                         return Poll::Ready(JoinOutcome::RuntimeErr(
                             RuntimeError::TaskResultUnavailable {
                                 stage: "JoinHandle::poll(Direct)",
@@ -427,11 +424,10 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> Drop
             };
 
             if let Some(task) = task {
-                let header = task.header();
-                if !header.is_completed() {
-                    unsafe {
-                        header.remove_waker(node_ptr);
-                    }
+                // 无条件摘链：任务已完成也可能正处在「COMPLETED 已置位、链表尚未清空」
+                // 的窗口里，此时提前返回会留下悬垂节点（RUNTIME_REVIEW §1.5）。
+                unsafe {
+                    task.header().remove_waker(node_ptr);
                 }
             }
         }

@@ -9,6 +9,12 @@ set! {
             worker_count: usize,
         },
 
+        #[display("worker count {worker_count} exceeds the supported maximum {max_worker_count}")]
+        WorkerCountTooLarge {
+            worker_count: usize,
+            max_worker_count: usize,
+        },
+
         #[display("failed to dispatch job to worker {target_worker} (current: {current_worker})")]
         DispatchFailed {
             target_worker: usize,

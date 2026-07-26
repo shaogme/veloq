@@ -354,25 +354,41 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.fetch_and(!STATE_POLLING, Ordering::Release);
     }
 
+    /// 注册（或刷新）一个完成通知节点。
+    ///
+    /// 语义与 `GenericScopeCompletion::register` 对齐：节点已在链表中时只更新 waker，
+    /// **绝不重复 `push_back`** —— 重复入链会覆盖节点的 prev/next，把链表变成自环或
+    /// 断链，随后 `notify_completion_wakers` 的遍历会死循环（RUNTIME_REVIEW §1.2）。
+    ///
     /// # Safety
     ///
     /// The caller must ensure that the `node` remains valid and pinned at its current memory location
     /// until it is either woken or explicitly removed from the task's waker list.
-    pub(crate) unsafe fn register_completion(&self, node: Pin<&mut GenericWakerNode<S>>) {
+    pub(crate) unsafe fn register_completion(
+        &self,
+        mut node: Pin<&mut GenericWakerNode<S>>,
+        waker: &Waker,
+    ) {
         if self.is_completed() {
-            node.waker.wake_by_ref();
+            waker.wake_by_ref();
             return;
         }
 
         let mut wakers = self.wakers.lock();
         if self.is_completed() {
             drop(wakers);
-            node.waker.wake_by_ref();
+            waker.wake_by_ref();
             return;
         }
 
         unsafe {
-            wakers.push_back(node);
+            let node_ref = node.as_mut().get_unchecked_mut();
+            if !node_ref.waker.will_wake(waker) {
+                node_ref.waker = waker.clone();
+            }
+            if !node_ref.link.is_linked() {
+                wakers.push_back(node);
+            }
         }
     }
 
@@ -385,9 +401,25 @@ impl<S: Storage> GenericTaskHeader<S> {
             return;
         }
 
-        let mut wakers = self.wakers.lock();
-        while let Some(node) = wakers.pop_front() {
-            node.waker.wake_by_ref();
+        self.notify_completion_wakers();
+    }
+
+    /// 摘下并唤醒全部完成等待者。
+    ///
+    /// waker 一律在**释放锁之后**才被调用：`wake` 会执行任意用户/运行时代码，可能
+    /// 重入 `register_completion` / `remove_waker`，持锁唤醒有重入死锁风险
+    /// （RUNTIME_REVIEW §1.9）。
+    fn notify_completion_wakers(&self) {
+        let mut ready = Vec::new();
+        {
+            let mut wakers = self.wakers.lock();
+            while let Some(node) = wakers.pop_front() {
+                ready.push(node.as_ref().get_ref().waker.clone());
+            }
+        }
+
+        for waker in ready {
+            waker.wake();
         }
     }
 
@@ -430,6 +462,61 @@ impl<S: Storage> GenericTaskHeader<S> {
             "acknowledge_completion without scope obligation"
         );
         self.scope_completion_ref().task_done();
+    }
+
+    /// `acknowledge_completion` 的幂等版本：只有真正翻转 ACK 标记的一方结算 scope。
+    ///
+    /// 用于「任务被放弃」这类防御路径 —— 那里无法静态断定义务是否已被结算，
+    /// 因此不能使用带 `debug_assert!` 的 `acknowledge_completion`。
+    pub(crate) fn try_acknowledge_completion(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & STATE_SCOPE_OBLIGATED == 0 || state & STATE_SCOPE_ACKED != 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | STATE_SCOPE_ACKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.scope_completion_ref().task_done();
+                    return true;
+                }
+                Err(s) => state = s,
+            }
+        }
+    }
+
+    /// 任务在入队失败 / 入队前置校验失败后被放弃。
+    ///
+    /// 这条路径上任务永远不会被 poll，也没有任何队列引用会被归还，因此必须在这里
+    /// 终结它：标记取消 + 完成、唤醒 join 等待者、归还任务自身的引用，并在引用计数
+    /// 归零时结算 scope 义务。否则 scope 的 `remaining` 永不归零，`wait_all` 会永久
+    /// 挂起（RUNTIME_REVIEW §4.4）。
+    ///
+    /// 调用者必须先归还 `STATE_QUEUED` 持有的引用（`clear_queued`）；仍处于
+    /// `QUEUED` 或已 `COMPLETED` 的任务由出队 / 完成路径负责结算，此处直接跳过。
+    pub(crate) fn abandon_before_enqueue(&self) {
+        let old = self.state.fetch_or(
+            STATE_CANCELLED | STATE_READY | STATE_COMPLETED,
+            Ordering::AcqRel,
+        );
+        if old & (STATE_COMPLETED | STATE_QUEUED) != 0 {
+            return;
+        }
+
+        self.notify_completion_wakers();
+        if self.decrement_ref_count() {
+            self.try_acknowledge_completion();
+        }
+    }
+
+    /// 任务自身是否被显式取消（不考虑所属 scope 的取消状态）。
+    #[inline]
+    pub(crate) fn is_locally_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0
     }
 
     pub fn is_ready(&self) -> bool {
@@ -545,12 +632,14 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 尝试将一个 waker 节点从任务的 waker 列表中移除。
     ///
+    /// 这里**不能**用 `is_completed()` 做提前返回：`mark_completed_and_notify` 先置位
+    /// `COMPLETED`、之后才拿锁清链，窗口内提前返回会把一个仍然在链表里的节点留下，
+    /// 等 arena 释放后链表中就是悬垂指针（RUNTIME_REVIEW §1.5）。正确性由锁 +
+    /// `is_linked()` 保证。
+    ///
     /// # Safety
     /// `node` 指向的节点必须是由 `register_completion` 注册的相同节点。
     pub(crate) unsafe fn remove_waker(&self, node: NonNull<GenericWakerNode<S>>) {
-        if self.is_completed() {
-            return;
-        }
         let mut wakers = self.wakers.lock();
         if unsafe { node.as_ref().link.is_linked() } {
             unsafe {
@@ -604,5 +693,119 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 impl<S: Storage> Drop for GenericTaskHeader<S> {
     fn drop(&mut self) {
         self.wake_token.deactivate_and_wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veloq_intrusive_linklist::Link;
+
+    static TEST_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
+        wake: |_| {},
+        wake_by_ref: |_| {},
+        poll: |_, _| Ok(true),
+        drop: |_| {},
+    };
+
+    struct WakeCounter {
+        count: AtomicU32,
+    }
+
+    static COUNTER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| unsafe {
+            Arc::increment_strong_count(p as *const WakeCounter);
+            RawWaker::new(p, &COUNTER_VTABLE)
+        },
+        |p| unsafe {
+            let counter = Arc::from_raw(p as *const WakeCounter);
+            counter.count.fetch_add(1, Ordering::AcqRel);
+        },
+        |p| unsafe {
+            let counter = ManuallyDrop::new(Arc::from_raw(p as *const WakeCounter));
+            counter.count.fetch_add(1, Ordering::AcqRel);
+        },
+        |p| unsafe {
+            drop(Arc::from_raw(p as *const WakeCounter));
+        },
+    );
+
+    fn counting_waker(counter: &Arc<WakeCounter>) -> Waker {
+        let raw = Arc::into_raw(Arc::clone(counter)) as *const ();
+        unsafe { Waker::from_raw(RawWaker::new(raw, &COUNTER_VTABLE)) }
+    }
+
+    fn new_node(waker: &Waker) -> GenericWakerNode<AtomicStorage> {
+        GenericWakerNode {
+            waker: waker.clone(),
+            link: Link::new(),
+            marker: PhantomData,
+        }
+    }
+
+    /// 同一个节点用不同 waker 重复注册时只能在链表中出现一次，否则链表成环，
+    /// `mark_completed_and_notify` 的遍历会死循环（RUNTIME_REVIEW §1.2）。
+    #[test]
+    fn register_completion_is_idempotent_for_linked_node() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let first = Arc::new(WakeCounter {
+            count: AtomicU32::new(0),
+        });
+        let second = Arc::new(WakeCounter {
+            count: AtomicU32::new(0),
+        });
+
+        let mut node = new_node(&counting_waker(&first));
+        let mut node = unsafe { Pin::new_unchecked(&mut node) };
+
+        unsafe {
+            header.register_completion(node.as_mut(), &counting_waker(&first));
+            header.register_completion(node.as_mut(), &counting_waker(&second));
+        }
+
+        header.mark_completed_and_notify();
+
+        assert_eq!(first.count.load(Ordering::Acquire), 0);
+        assert_eq!(second.count.load(Ordering::Acquire), 1);
+        assert!(!node.link.is_linked());
+    }
+
+    /// `remove_waker` 在任务已完成时也必须真正摘链，不能提前返回
+    /// （RUNTIME_REVIEW §1.5）。
+    #[test]
+    fn remove_waker_unlinks_even_after_completion() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let counter = Arc::new(WakeCounter {
+            count: AtomicU32::new(0),
+        });
+
+        let mut node = new_node(&counting_waker(&counter));
+        let mut node = unsafe { Pin::new_unchecked(&mut node) };
+        unsafe { header.register_completion(node.as_mut(), &counting_waker(&counter)) };
+        assert!(node.link.is_linked());
+
+        // 模拟 `mark_completed_and_notify` 置位 COMPLETED 与清链之间的窗口。
+        header.state.fetch_or(STATE_COMPLETED, Ordering::AcqRel);
+
+        let node_ptr = unsafe { NonNull::from(node.as_mut().get_unchecked_mut()) };
+        unsafe { header.remove_waker(node_ptr) };
+        assert!(!node.link.is_linked());
+    }
+
+    /// 入队失败后被放弃的任务必须结算 scope 义务并变为已完成。
+    #[test]
+    fn abandon_before_enqueue_settles_obligation() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        header.claim_scope_obligation();
+
+        header.abandon_before_enqueue();
+
+        assert!(header.is_completed());
+        assert!(header.is_locally_cancelled());
+        assert!(header.is_scope_acknowledged());
+
+        // 幂等：重复调用不会再次结算。
+        header.abandon_before_enqueue();
+        assert!(!header.try_acknowledge_completion());
     }
 }

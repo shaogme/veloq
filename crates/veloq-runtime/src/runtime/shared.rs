@@ -24,8 +24,8 @@ use crate::{
 pub(crate) mod infra;
 
 use infra::{
-    AtomicBitset, GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
-    TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
+    AtomicBitset, GlobalInjector, IdleController, IdleSlots, IdleStack, NUMAGroup,
+    RuntimeProgressCoordinator, TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
 
 /// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
@@ -68,6 +68,9 @@ pub(crate) struct Receivers {
     pub(crate) deques: Vec<Worker<SendTaskRef>>,
 }
 
+/// 运行时支持的 worker 数量上界（不含）：worker id 需要能被编码进 idle 栈的低 32 位。
+pub(crate) const MAX_WORKER_COUNT: usize = IdleStack::MAX_WORKERS;
+
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
@@ -76,7 +79,6 @@ pub(crate) fn init_runtime_components(
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
-    let mut next_idle = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
         unparkers.push(Unparker::new());
@@ -95,7 +97,6 @@ pub(crate) fn init_runtime_components(
             local_queue,
             stealer,
         ));
-        next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
     // NUMA detection
@@ -143,7 +144,7 @@ pub(crate) fn init_runtime_components(
         TopologyContext {
             groups,
             worker_to_group,
-            next_idle,
+            idle_slots: IdleSlots::new(worker_count_val),
         },
         Receivers { deques },
     )
@@ -214,6 +215,18 @@ impl RuntimeSharedBase {
         .with_category("runtime.dispatch")
     }
 
+    /// 入队失败后放弃任务：先归还 `STATE_QUEUED` 持有的引用，再终结任务本体，
+    /// 确保 scope 义务一定被结算（RUNTIME_REVIEW §4.4）。
+    fn abandon_queued_task<H: TaskHandleRef>(task: &H) {
+        let header = task.header();
+        if header.clear_queued() {
+            // 队列引用恰好是最后一个引用，直接结算。
+            header.try_acknowledge_completion();
+        } else {
+            header.abandon_before_enqueue();
+        }
+    }
+
     /// 将本地任务入队当前线程的本地队列。
     pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().is_completed() {
@@ -224,14 +237,10 @@ impl RuntimeSharedBase {
             worker.local_count.fetch_add(1, Ordering::Release);
             if let Err(task) = worker.local_queue.push(task) {
                 worker.local_count.fetch_sub(1, Ordering::Release);
-                if task.header().clear_queued() {
-                    task.header().acknowledge_completion();
-                }
+                Self::abandon_queued_task(&task);
             } else if let Err(err) = task.header().notify_runtime_active() {
                 worker.local_count.fetch_sub(1, Ordering::Release);
-                if task.header().clear_queued() {
-                    task.header().acknowledge_completion();
-                }
+                Self::abandon_queued_task(&task);
                 return Err(err);
             }
         }
@@ -240,6 +249,7 @@ impl RuntimeSharedBase {
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
         if self.validate_worker_id(worker_id).is_err() {
+            task.header().abandon_before_enqueue();
             return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
         let header = task.header();
@@ -255,9 +265,7 @@ impl RuntimeSharedBase {
             worker.pinned_count.fetch_add(1, Ordering::Release);
             if let Err(task) = worker.pinned_queue.push(task) {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
-                if task.header().clear_queued() {
-                    task.header().acknowledge_completion();
-                }
+                Self::abandon_queued_task(&task);
                 return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
             self.wake_worker(worker_id);
@@ -338,6 +346,9 @@ impl RuntimeSharedBase {
 
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         if self.validate_worker_id(worker_id).is_err() {
+            // 任务不会进入任何队列，必须在此结算 scope 义务，否则 `remaining`
+            // 永不归零，`wait_all` 永久挂起（RUNTIME_REVIEW §4.4）。
+            task.header().abandon_before_enqueue();
             return;
         }
         if task.header().is_completed() {
@@ -415,6 +426,7 @@ impl<T> RuntimeShared<T> {
 
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         if self.base.validate_worker_id(worker_id).is_err() {
+            task.header().abandon_before_enqueue();
             return;
         }
         if task.header().is_completed() {

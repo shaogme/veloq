@@ -30,7 +30,7 @@ pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, S
 
 use guard::ScopeTaskGuard;
 use router::{
-    RoutedJobCell, RoutedSpawnReady, RoutedSpawnState, dispatch_routed,
+    RoutedJobCell, RoutedJobCellOwner, RoutedSpawnReady, RoutedSpawnState, dispatch_routed,
     handle_enqueue_pinned_outcome, install_routed_pinned_task, make_spawn_to_access,
     new_failed_routed_state,
 };
@@ -463,9 +463,10 @@ impl<'rt, 'scope, 'env, TExtra>
         };
         let job_ptr = job_ptr.as_ptr() as *mut RoutedJobCell<F>;
         unsafe { write(job_ptr, RoutedJobCell::new(job)) };
-        let job_ptr: SendPtr<RoutedJobCell<F>> =
-            SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
-        let mut job_ptr_for_job = job_ptr;
+        // job cell 的所有权自此完全交给守卫，并随闭包一起移交给目标 worker。
+        let job_owner = unsafe {
+            RoutedJobCellOwner::new(&self.arena, NonNull::new_unchecked(job_ptr), job_layout)
+        };
 
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
@@ -474,17 +475,14 @@ impl<'rt, 'scope, 'env, TExtra>
             state.clone(),
             worker_id,
             move |guard| {
-                let arena = unsafe { arena_ptr.as_ref() };
+                let mut job_owner = job_owner;
                 if state_for_job.is_cancel_requested() {
-                    unsafe {
-                        arena.drop_object_raw(job_ptr_for_job.as_ptr() as *mut u8, job_layout)
-                    };
                     state_for_job.fail_task(TaskError::Cancelled);
                     guard.settle();
                     return;
                 }
 
-                let job = match unsafe { job_ptr_for_job.as_mut().take() } {
+                let job = match job_owner.take_job() {
                     Ok(job) => job,
                     Err(err) => {
                         state_for_job.fail_runtime(err);
@@ -494,8 +492,6 @@ impl<'rt, 'scope, 'env, TExtra>
                 };
                 let future = job();
 
-                unsafe { arena.drop_object_raw(job_ptr_for_job.as_ptr() as *mut u8, job_layout) };
-
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail_task(TaskError::Cancelled);
                     guard.settle();
@@ -504,7 +500,7 @@ impl<'rt, 'scope, 'env, TExtra>
 
                 install_routed_pinned_task(
                     unsafe { &*runtime_ptr.as_ptr() },
-                    arena,
+                    unsafe { arena_ptr.as_ref() },
                     guard,
                     worker_id,
                     state_for_job,
@@ -512,12 +508,6 @@ impl<'rt, 'scope, 'env, TExtra>
                 );
             },
         );
-        if state.has_failed_outcome() {
-            unsafe {
-                self.arena
-                    .drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout)
-            };
-        }
 
         JoinHandle::new_routed(self, state)
     }

@@ -1,7 +1,7 @@
 use crate::{
     error::{Result as RuntimeResult, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeCtx, RuntimeShared},
-    scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
+    scope::{GenericScopeCompletion, SendPtr, guard::ScopeTaskGuard},
     task::{
         Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
         SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
@@ -70,6 +70,65 @@ impl<F> RoutedJobCell<F> {
             }
             .to_report()
         })
+    }
+}
+
+/// `spawn_boxed_to` 中 job cell 的**唯一**所有者。
+///
+/// cell 分配在 scope arena 上，所有权随被路由的闭包一起移交给目标 worker：无论闭包
+/// 正常结束、提前返回还是 unwind，cell 都由本守卫释放；若 `route_to` 投递失败，闭包
+/// （连同守卫）会被原地丢弃，同样完成释放。
+///
+/// 这样就不再需要主线程按「结果状态」反推所有权 —— 结果状态并不携带「cell 归谁释放」
+/// 的信息，那正是双重释放的根因（RUNTIME_REVIEW §1.1）。
+pub(crate) struct RoutedJobCellOwner<F> {
+    arena: SendPtr<GenericArena<AtomicStorage>>,
+    cell: SendPtr<RoutedJobCell<F>>,
+    layout: Layout,
+    released: bool,
+}
+
+impl<F> RoutedJobCellOwner<F> {
+    /// # Safety
+    ///
+    /// `cell` 必须是 `arena` 上刚写入完成的 `RoutedJobCell<F>`，`layout` 与其分配布局
+    /// 一致，且 `arena` 的存活期必须覆盖本守卫。
+    pub(crate) unsafe fn new(
+        arena: &GenericArena<AtomicStorage>,
+        cell: NonNull<RoutedJobCell<F>>,
+        layout: Layout,
+    ) -> Self {
+        Self {
+            arena: SendPtr::new(NonNull::from(arena)),
+            cell: SendPtr::new(cell),
+            layout,
+            released: false,
+        }
+    }
+
+    /// 取出 job 并立刻释放 cell（cell 的用途已尽，不必等到守卫析构）。
+    pub(crate) fn take_job(&mut self) -> RuntimeResult<F> {
+        let job = unsafe { self.cell.as_mut().take() };
+        self.release();
+        job
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        unsafe {
+            self.arena
+                .as_ref()
+                .drop_object_raw(self.cell.as_ptr() as *mut u8, self.layout);
+        }
+    }
+}
+
+impl<F> Drop for RoutedJobCellOwner<F> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

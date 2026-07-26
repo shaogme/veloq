@@ -26,7 +26,7 @@ pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
 use primitives::{Signal, create_waker};
-use shared::{Receivers, init_runtime_components};
+use shared::{MAX_WORKER_COUNT, Receivers, init_runtime_components};
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -85,6 +85,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         let mut deques = receivers.deques;
 
         let thread_errors = Mutex::new(None);
+        // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
+        // 它把主线程从 `signal.wait()` 里叫回来，否则错误永远不会被报告
+        // （RUNTIME_REVIEW §1.11）。
+        let signal = Arc::new(Signal::new(true));
 
         let res: Result<R> = veloq_std::thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
@@ -104,6 +108,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 };
                 let worker_factory_ref = &worker_factory;
                 let thread_errors_ref = &thread_errors;
+                let signal_ref = &signal;
 
                 let context = RuntimeTlsInner {
                     worker_id,
@@ -130,12 +135,21 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                             Ok(())
                         })();
 
-                        if let Err(err) = init_res {
+                        // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：
+                        // 主线程可能正阻塞在 `signal.wait()` 上等一个再也不会到来的事件。
+                        let report_fatal = |err| {
                             let mut guard =
                                 thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
                             if guard.is_none() {
                                 *guard = Some(err);
                             }
+                            drop(guard);
+                            shared_ref.shutdown();
+                            signal_ref.notify();
+                        };
+
+                        if let Err(err) = init_res {
+                            report_fatal(err);
                             return;
                         }
 
@@ -145,11 +159,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         if let Err(err) =
                             shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)
                         {
-                            let mut guard =
-                                thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(err);
-                            }
+                            report_fatal(err);
                         }
                     })
                     .map_err(|e| RuntimeError::ThreadSpawnFailed { source: e })?;
@@ -190,7 +200,6 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 return Err(err);
             }
 
-            let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
 
@@ -353,6 +362,15 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         let worker_count = self.worker_count.unwrap_or_else(|| {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
+        // worker id 会被编码进 idle 栈 head 的低 32 位，必须在构造期就拒绝越界的规模，
+        // 而不是让 `IdleStack` 静默截断（RUNTIME_REVIEW §1.3）。
+        if worker_count.get() >= MAX_WORKER_COUNT {
+            return RuntimeError::WorkerCountTooLarge {
+                worker_count: worker_count.get(),
+                max_worker_count: MAX_WORKER_COUNT - 1,
+            }
+            .trans();
+        }
         let (registry, topo, receivers) =
             init_runtime_components(worker_count, self.queue_capacity);
         let shared = RuntimeShared::new(

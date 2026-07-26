@@ -57,113 +57,175 @@ pub(crate) struct NUMAGroup {
     pub(crate) idle_stack: IdleStack,
 }
 
+/// 每个 worker 在 idle 栈中的槽位。
+///
+/// `next` 是 Treiber 栈的后继索引；`in_stack` 标记该 worker 的条目当前是否**物理挂在**
+/// 某个栈上。这个标记把「一个 worker 在栈中最多存在一个条目」变成不变式，因此
+/// `next[worker]` 不会在条目还留在栈里时被下一次 `push` 覆盖 —— 覆盖正是链表成环、
+/// `pop_idle` 死循环的根因（RUNTIME_REVIEW §1.3）。
+pub(crate) struct IdleSlots {
+    next: Box<[AtomicUsize]>,
+    in_stack: AtomicBitset,
+}
+
+impl IdleSlots {
+    pub(crate) fn new(worker_count: usize) -> Self {
+        let mut next = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            next.push(AtomicUsize::new(IdleStack::NO_NEXT));
+        }
+        Self {
+            next: next.into_boxed_slice(),
+            in_stack: AtomicBitset::new(worker_count),
+        }
+    }
+
+    /// 声明「本 worker 的条目即将入栈」；条目已在栈中时返回 `false`。
+    #[inline]
+    fn try_enter(&self, worker_id: usize) -> bool {
+        self.in_stack.try_set(worker_id)
+    }
+
+    /// 条目已被物理摘除。只允许摘链的一方调用。
+    #[inline]
+    fn mark_removed(&self, worker_id: usize) {
+        self.in_stack.clear(worker_id);
+    }
+}
+
+/// NUMA 组内的 idle worker 栈：Treiber 栈，节点就是 worker 自身。
 pub(crate) struct IdleStack {
+    /// 高 32 位是**单调递增**的 generation（防 ABA），低 32 位是栈顶 worker id。
     head: AtomicU64,
 }
 
 impl IdleStack {
-    const EMPTY: u64 = u64::MAX;
+    /// 低 32 位的空栈哨兵，同时限定了可编码的 worker id 上界。
+    const EMPTY_ID: u32 = u32::MAX;
+    /// 可编码的 worker 数量上界（不含）。
+    pub(crate) const MAX_WORKERS: usize = Self::EMPTY_ID as usize;
+    /// `IdleSlots::next` 中表示「无后继」。
+    pub(crate) const NO_NEXT: usize = usize::MAX;
 
     pub(crate) fn new() -> Self {
         Self {
-            head: AtomicU64::new(Self::EMPTY),
+            head: AtomicU64::new(Self::pack(0, Self::EMPTY_ID)),
         }
     }
 
-    pub(crate) fn push(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) {
+    #[inline]
+    const fn pack(generation: u32, worker_id: u32) -> u64 {
+        ((generation as u64) << 32) | worker_id as u64
+    }
+
+    #[inline]
+    const fn head_id(head: u64) -> u32 {
+        head as u32
+    }
+
+    #[inline]
+    const fn head_generation(head: u64) -> u32 {
+        (head >> 32) as u32
+    }
+
+    /// 计算摘除栈顶 `top_id` 后的新 head。generation 只递增、不因空栈复位，
+    /// 避免重新打开 ABA 窗口。
+    #[inline]
+    fn head_after_removing(head: u64, slots: &IdleSlots, top_id: usize) -> u64 {
+        let next = slots.next[top_id].load(Ordering::Acquire);
+        let next_id = if next == Self::NO_NEXT {
+            Self::EMPTY_ID
+        } else {
+            next as u32
+        };
+        Self::pack(Self::head_generation(head).wrapping_add(1), next_id)
+    }
+
+    pub(crate) fn push(&self, worker_id: usize, slots: &IdleSlots) {
+        debug_assert!(
+            worker_id < Self::MAX_WORKERS,
+            "worker id {worker_id} 超出 idle 栈可编码范围"
+        );
+        if !slots.try_enter(worker_id) {
+            // 条目仍在栈中（`leave_idle` 没能摘链留下的陈旧条目），直接复用。
+            return;
+        }
+
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            let generation = if head == Self::EMPTY {
-                0
-            } else {
-                (head >> 32) + 1
+            let next = match Self::head_id(head) {
+                Self::EMPTY_ID => Self::NO_NEXT,
+                top_id => top_id as usize,
             };
-            let new_head = (generation << 32) | (worker_id as u64);
+            slots.next[worker_id].store(next, Ordering::Release);
 
-            let old_top_id = if head == Self::EMPTY {
-                usize::MAX
-            } else {
-                (head & 0xFFFFFFFF) as usize
-            };
-            next_ptrs[worker_id].store(old_top_id, Ordering::Release);
-
+            let new_head = Self::pack(
+                Self::head_generation(head).wrapping_add(1),
+                worker_id as u32,
+            );
             match self.head.compare_exchange_weak(
                 head,
                 new_head,
-                Ordering::Release,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return,
                 Err(h) => head = h,
             }
         }
     }
 
-    pub(crate) fn pop(&self, next_ptrs: &[AtomicUsize]) -> Option<usize> {
+    pub(crate) fn pop(&self, slots: &IdleSlots) -> Option<usize> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            if head == Self::EMPTY {
-                return None;
-            }
-            let worker_id = (head & 0xFFFFFFFF) as usize;
-            let next_id = next_ptrs[worker_id].load(Ordering::Acquire);
-
-            let new_head = if next_id == usize::MAX {
-                Self::EMPTY
-            } else {
-                let next_gen = (head >> 32) + 1;
-                (next_gen << 32) | (next_id as u64)
+            let worker_id = match Self::head_id(head) {
+                Self::EMPTY_ID => return None,
+                top_id => top_id as usize,
             };
-
+            let new_head = Self::head_after_removing(head, slots, worker_id);
             match self.head.compare_exchange_weak(
                 head,
                 new_head,
-                Ordering::Release,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(worker_id),
+                Ok(_) => {
+                    slots.mark_removed(worker_id);
+                    return Some(worker_id);
+                }
                 Err(h) => head = h,
             }
         }
     }
 
     /// 仅当栈顶为 `worker_id` 时弹出（`leave_idle` 快路径）。
-    pub(crate) fn try_pop_self(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) -> bool {
+    pub(crate) fn try_pop_self(&self, worker_id: usize, slots: &IdleSlots) -> bool {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            if head == Self::EMPTY {
+            if Self::head_id(head) as usize != worker_id {
                 return false;
             }
-            let top_id = (head & 0xFFFFFFFF) as usize;
-            if top_id != worker_id {
-                return false;
-            }
-            let next_id = next_ptrs[worker_id].load(Ordering::Acquire);
-            let new_head = if next_id == usize::MAX {
-                Self::EMPTY
-            } else {
-                let next_gen = (head >> 32) + 1;
-                (next_gen << 32) | (next_id as u64)
-            };
+            let new_head = Self::head_after_removing(head, slots, worker_id);
             match self.head.compare_exchange_weak(
                 head,
                 new_head,
-                Ordering::Release,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    slots.mark_removed(worker_id);
+                    return true;
+                }
                 Err(h) => head = h,
             }
         }
     }
 
     /// 弹出仍标记为 idle 的 worker；跳过栈中已失效（stale）的条目。
-    pub(crate) fn pop_idle(
-        &self,
-        idle_mask: &AtomicBitset,
-        next_ptrs: &[AtomicUsize],
-    ) -> Option<usize> {
-        while let Some(worker_id) = self.pop(next_ptrs) {
+    ///
+    /// 每次 `pop` 都会真正缩短栈（并清掉对应的 `in_stack` 位），所以循环必定终止。
+    pub(crate) fn pop_idle(&self, idle_mask: &AtomicBitset, slots: &IdleSlots) -> Option<usize> {
+        while let Some(worker_id) = self.pop(slots) {
             if idle_mask.is_set(worker_id) {
                 return Some(worker_id);
             }
@@ -224,7 +286,7 @@ impl WorkerRegistry {
 pub(crate) struct TopologyContext {
     pub(crate) groups: Vec<NUMAGroup>,
     pub(crate) worker_to_group: Vec<usize>,
-    pub(crate) next_idle: Vec<AtomicUsize>,
+    pub(crate) idle_slots: IdleSlots,
 }
 
 impl TopologyContext {
@@ -399,7 +461,7 @@ impl IdleController {
         registry: &WorkerRegistry,
     ) -> bool {
         let group = &topo.groups[group_idx];
-        if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
+        if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.idle_slots) {
             registry.unpark(worker_id);
             return true;
         }
@@ -442,7 +504,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let seq = base.idle.event_count.load();
 
         if base.idle.idle_mask.try_set(self.worker_id) {
-            group.idle_stack.push(self.worker_id, &base.topo.next_idle);
+            group.idle_stack.push(self.worker_id, &base.topo.idle_slots);
         }
 
         if self.should_retry(seq, completion) {
@@ -486,11 +548,126 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         Ok(())
     }
 
+    /// 离开 idle 状态。
+    ///
+    /// 先清 `idle_mask`（这才是「是否可被唤醒」的权威标记），再尝试摘除栈顶的自身条目。
+    /// 摘不掉时条目会作为陈旧条目留在栈里，由 `pop_idle` 惰性丢弃 —— `IdleSlots` 的
+    /// `in_stack` 位保证它不会被重复入栈（RUNTIME_REVIEW §1.3）。
     fn leave_idle(&self, group_idx: usize) {
         let base = &self.shared.base;
         base.idle.idle_mask.clear(self.worker_id);
         base.topo.groups[group_idx]
             .idle_stack
-            .try_pop_self(self.worker_id, &base.topo.next_idle);
+            .try_pop_self(self.worker_id, &base.topo.idle_slots);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicBitset, IdleSlots, IdleStack};
+
+    fn fixture(worker_count: usize) -> (IdleStack, IdleSlots, AtomicBitset) {
+        (
+            IdleStack::new(),
+            IdleSlots::new(worker_count),
+            AtomicBitset::new(worker_count),
+        )
+    }
+
+    #[test]
+    fn idle_stack_pops_in_lifo_order() {
+        let (stack, slots, mask) = fixture(3);
+        for id in 0..3 {
+            assert!(mask.try_set(id));
+            stack.push(id, &slots);
+        }
+
+        assert_eq!(stack.pop_idle(&mask, &slots), Some(2));
+        assert_eq!(stack.pop_idle(&mask, &slots), Some(1));
+        assert_eq!(stack.pop_idle(&mask, &slots), Some(0));
+        assert_eq!(stack.pop_idle(&mask, &slots), None);
+    }
+
+    #[test]
+    fn idle_stack_pop_idle_skips_stale_entries() {
+        let (stack, slots, mask) = fixture(3);
+        for id in 0..3 {
+            assert!(mask.try_set(id));
+            stack.push(id, &slots);
+        }
+
+        // worker 2 / 0 已离开 idle，只有 worker 1 仍可被唤醒。
+        mask.clear(2);
+        mask.clear(0);
+        assert_eq!(stack.pop_idle(&mask, &slots), Some(1));
+        assert_eq!(stack.pop_idle(&mask, &slots), None);
+    }
+
+    #[test]
+    fn idle_stack_try_pop_self_only_removes_top() {
+        let (stack, slots, mask) = fixture(2);
+        assert!(mask.try_set(0));
+        stack.push(0, &slots);
+        assert!(mask.try_set(1));
+        stack.push(1, &slots);
+
+        // 栈顶是 1，worker 0 摘不掉自己。
+        assert!(!stack.try_pop_self(0, &slots));
+        assert!(stack.try_pop_self(1, &slots));
+        assert!(stack.try_pop_self(0, &slots));
+        assert_eq!(stack.pop(&slots), None);
+    }
+
+    /// RUNTIME_REVIEW §1.3 的回归用例：陈旧条目 + 重复入栈曾把链表变成环，
+    /// 使 `pop_idle` 永远返回不了 `None`（死循环）。
+    #[test]
+    fn idle_stack_stale_entry_never_forms_cycle() {
+        let (stack, slots, mask) = fixture(2);
+
+        // 1) worker 0 进入 idle。
+        assert!(mask.try_set(0));
+        stack.push(0, &slots);
+        // 2) worker 1 进入 idle，栈为 [1 -> 0]。
+        assert!(mask.try_set(1));
+        stack.push(1, &slots);
+        // 3) worker 0 被唤醒：栈顶是 1，条目摘不掉，留在栈中。
+        mask.clear(0);
+        assert!(!stack.try_pop_self(0, &slots));
+        // 4) worker 0 再次进入 idle：条目已在栈中，不会重复入栈覆盖 next 指针。
+        assert!(mask.try_set(0));
+        stack.push(0, &slots);
+
+        // 两个 worker 都不再 idle：pop_idle 必须能走到栈底并返回 None。
+        mask.clear(0);
+        mask.clear(1);
+        assert_eq!(stack.pop_idle(&mask, &slots), None);
+        assert_eq!(stack.pop(&slots), None);
+    }
+
+    #[test]
+    fn idle_stack_generation_never_resets_on_empty() {
+        use std::sync::atomic::Ordering;
+
+        let (stack, slots, _mask) = fixture(1);
+        stack.push(0, &slots);
+        assert_eq!(stack.pop(&slots), Some(0));
+
+        let generation_after_first_cycle = stack.head.load(Ordering::Acquire) >> 32;
+        assert!(generation_after_first_cycle > 0);
+
+        // 空栈后再次入栈：generation 必须继续递增，不能复位到 0 重新打开 ABA 窗口。
+        stack.push(0, &slots);
+        assert!(stack.head.load(Ordering::Acquire) >> 32 > generation_after_first_cycle);
+    }
+
+    #[test]
+    fn idle_stack_push_is_idempotent_while_entry_is_linked() {
+        let (stack, slots, mask) = fixture(1);
+        assert!(mask.try_set(0));
+        stack.push(0, &slots);
+        stack.push(0, &slots);
+
+        assert_eq!(stack.pop(&slots), Some(0));
+        assert_eq!(stack.pop(&slots), None);
     }
 }
