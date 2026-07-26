@@ -295,14 +295,26 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         let _ = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
-        if self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::InFlightReady {
+        let cell = &self.shared.slots[user_data];
+        if cell.state(Ordering::Acquire) == SlotState::InFlightReady {
+            // `reset` 只重置状态位，不动 `completion_data`。已就绪的完成必须在这里
+            // 取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot 里，直到该
+            // slot 下一次被 `record_completion` 覆盖才释放——slot 若不再被复用就是
+            // 永久泄漏。
             self.shared.clear_ready_completion();
+            let record_data = cell.completion_with_record_data(mem::take);
+            self.shared.run_discarded_record_cleanup(record_data);
         }
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);
         self.active_count = self.active_count.saturating_sub(1);
     }
 
+    /// 强制把 slot 收回 `Idle` 并推进到 `next_generation`，**丢弃**其上任何已就绪的
+    /// 完成（连同其 payload 与 cleanup）。
+    ///
+    /// 与 [`Self::remove`] 的区别是后者保留 `InFlightReady` 状态，让已到达的完成仍
+    /// 可被 detached future 消费。释放一个尚未提交的预留 slot 应当用 `remove`。
     pub fn recycle(&mut self, token: OpToken, next_generation: u32) -> bool {
         let (user_data, generation) = token.parts();
         let local = match self.local.get(user_data) {

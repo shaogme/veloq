@@ -182,7 +182,7 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
-        let _ = self.ops.recycle(token, token.generation().wrapping_add(1));
+        let _ = self.ops.remove(token);
     }
 
     fn submit_op_raw(

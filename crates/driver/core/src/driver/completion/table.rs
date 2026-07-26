@@ -163,8 +163,10 @@ where
         outcome
     }
 
+    /// 丢弃一条已就绪但不会再被消费的完成：归还 payload、丢掉 detail，并执行
+    /// `cleanup`（完成式 I/O 下内核可能仍持有其中的资源）。
     #[inline]
-    fn run_discarded_record_cleanup(&self, record_data: slot::CompletionData<Spec>) {
+    pub(crate) fn run_discarded_record_cleanup(&self, record_data: slot::CompletionData<Spec>) {
         match record_data {
             slot::CompletionData::User {
                 event: _,

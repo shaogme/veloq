@@ -168,6 +168,14 @@ pub trait Driver {
     #[doc(hidden)]
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<SlotPayload<Self::SlotSpec>>;
 
+    /// 释放一个**未成功提交**的预留 slot（`ReservedOpSlot` 未 `persist` 就被丢弃，
+    /// 或 `recover_payload` 取回 payload 之后）。
+    ///
+    /// 实现者必须保证：
+    /// - slot 归还 free list、`active_count` 递减，且重复调用是幂等的；
+    /// - **保留**该 slot 上已就绪的完成（`InFlightReady`），不要强制推进 generation
+    ///   把它冲掉——detached future 仍可能来消费它。`OpRegistry::remove` 满足该语义，
+    ///   `OpRegistry::recycle` 不满足（它会丢弃已就绪的完成）。
     #[doc(hidden)]
     fn release_op_slot_raw(&mut self, token: OpToken);
 
