@@ -173,9 +173,10 @@ pub trait Driver {
     ///
     /// 实现者必须保证：
     /// - slot 归还 free list、`active_count` 递减，且重复调用是幂等的；
-    /// - **保留**该 slot 上已就绪的完成（`InFlightReady`），不要强制推进 generation
-    ///   把它冲掉——detached future 仍可能来消费它。`OpRegistry::remove` 满足该语义，
-    ///   `OpRegistry::recycle` 不满足（它会丢弃已就绪的完成）。
+    /// - **保留**该 slot 信箱里已就绪的完成（`SlotStatus::ready`），不要清掉标志位、
+    ///   也不要强制推进 generation 把它冲掉——detached future 仍可能来消费它。
+    ///   `OpRegistry::remove` 满足该语义，`OpRegistry::recycle` 不满足（它会丢弃已就绪
+    ///   的完成）。
     #[doc(hidden)]
     fn release_op_slot_raw(&mut self, token: OpToken);
 

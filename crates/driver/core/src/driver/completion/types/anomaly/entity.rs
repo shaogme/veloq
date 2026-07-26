@@ -66,9 +66,9 @@ impl CompletionAnomaly {
         }
     }
 
-    pub fn state(self) -> Option<slot::SlotState> {
+    pub fn status(self) -> Option<slot::SlotStatus> {
         match self {
-            Self::StaleGeneration { state, .. } | Self::SlotState { state, .. } => Some(state),
+            Self::StaleGeneration { status, .. } | Self::SlotState { status, .. } => Some(status),
             Self::UnknownSlot { .. }
             | Self::BackendContext { .. }
             | Self::BackendSpecific { .. } => None,
@@ -134,14 +134,14 @@ impl CompletionAnomaly {
         token: CompletionToken,
         index: usize,
         generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     ) -> Self {
         Self::SlotState {
             reason,
             token,
             index,
             generation,
-            state,
+            status,
             snapshot: None,
             raw: None,
         }
@@ -161,14 +161,14 @@ impl CompletionAnomaly {
         index: usize,
         expected_generation: Generation,
         actual_generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     ) -> Self {
         Self::StaleGeneration {
             token,
             index,
             expected_generation,
             actual_generation,
-            state,
+            status,
             raw: None,
         }
     }
@@ -177,14 +177,14 @@ impl CompletionAnomaly {
         token: CompletionToken,
         index: usize,
         generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     ) -> Self {
         Self::slot_state(
             CompletionAnomalyReason::NonActiveSlot,
             token,
             index,
             generation,
-            state,
+            status,
         )
     }
 
@@ -395,7 +395,7 @@ impl CompletionAnomaly {
                 token,
                 index: snapshot.index,
                 generation: snapshot.generation,
-                state: snapshot.state,
+                status: snapshot.status,
                 snapshot: Some(snapshot),
                 raw,
             },

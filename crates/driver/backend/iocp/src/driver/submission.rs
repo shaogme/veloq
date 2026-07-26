@@ -149,7 +149,7 @@ fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpE
         .push_ctx("scope", scope)
         .with_ctx("slot_index", err.snapshot.index)
         .with_ctx("slot_generation", err.snapshot.generation)
-        .with_ctx("slot_state", format!("{:?}", err.snapshot.state))
+        .with_ctx("slot_status", format!("{:?}", err.snapshot.status))
         .with_ctx("slot_has_op", err.snapshot.has_op)
         .with_ctx("slot_has_payload", err.snapshot.has_payload)
         .with_ctx("slot_access_action", format!("{:?}", err.action))

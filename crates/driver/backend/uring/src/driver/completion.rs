@@ -561,7 +561,7 @@ impl<'a> UringDriver<'a> {
             .with_ctx("expected_generation", request.target.generation())
             .with_ctx("actual_index", snapshot.index)
             .with_ctx("actual_generation", snapshot.generation)
-            .with_ctx("slot_state", format!("{:?}", snapshot.state))
+            .with_ctx("slot_status", format!("{:?}", snapshot.status))
             .with_ctx("raw_cqe_res", raw.res)
             .with_ctx("raw_cqe_flags", raw.flags)
             .attach_note(

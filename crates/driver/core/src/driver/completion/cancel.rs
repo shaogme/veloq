@@ -1,7 +1,7 @@
 use crate::slot::{self, CheckedSlotView, SlotView};
 
-use super::routing::slot_view_kind;
-use super::{CompletionAnomalyKind, CompletionAnomalyReason, OpToken};
+use super::routing::{SlotLookupFailure, slot_view_kind};
+use super::{CompletionAnomalyKind, OpToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelMode {
@@ -70,23 +70,27 @@ pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
     token: OpToken,
     view: CheckedSlotView<'a, Spec>,
 ) -> (CancelTargetGoneReason, CompletionAnomalyKind) {
-    let kind = match slot_view_kind(token, view) {
+    match slot_view_kind(token, view) {
         Ok(slot) => {
             let snapshot = match slot {
                 SlotView::Reserved(slot) => slot.snapshot(),
                 SlotView::InFlightWaiting(slot) => slot.snapshot(),
                 SlotView::InFlightOrphaned(slot) => slot.snapshot(),
             };
-            CompletionAnomalyKind::non_active(snapshot.index, token.generation(), snapshot.state)
+            (
+                CancelTargetGoneReason::Missing,
+                CompletionAnomalyKind::non_active(
+                    snapshot.index,
+                    token.generation(),
+                    snapshot.status,
+                ),
+            )
         }
-        Err(kind) => kind,
-    };
-    let reason = match kind.reason() {
-        CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
-        CompletionAnomalyReason::UnknownSlot
-        | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::BackendContextUnknown
-        | CompletionAnomalyReason::BackendSpecific(_) => CancelTargetGoneReason::Missing,
-    };
-    (reason, kind)
+        Err(failure @ (SlotLookupFailure::Missing(_) | SlotLookupFailure::NonActive(_))) => {
+            (CancelTargetGoneReason::Missing, failure.kind())
+        }
+        Err(failure @ SlotLookupFailure::Stale(_)) => {
+            (CancelTargetGoneReason::Stale, failure.kind())
+        }
+    }
 }

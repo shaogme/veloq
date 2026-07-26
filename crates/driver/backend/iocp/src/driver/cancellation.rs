@@ -175,7 +175,7 @@ impl<'a> IocpDriver<'a> {
             .with_ctx("expected_generation", token.generation())
             .with_ctx("actual_index", snapshot.index)
             .with_ctx("actual_generation", snapshot.generation)
-            .with_ctx("slot_state", format!("{:?}", snapshot.state))
+            .with_ctx("slot_status", format!("{:?}", snapshot.status))
             .attach_note(
                 "The kernel confirmed that the cancellation request returned ERROR_NOT_FOUND \
                  (indicating the operation was already completed or not found in the kernel queue), \

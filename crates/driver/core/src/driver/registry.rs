@@ -116,10 +116,9 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             self.local_free_head = self.shared.slots[idx].next_free.load(Ordering::Relaxed);
 
             let slot = &self.shared.slots[idx];
-            let state = slot.state(Ordering::Acquire);
-            if state != SlotState::Idle {
-                // Detached completions may temporarily keep slots in READY/WAITING states.
-                // Those slots are not safe to recycle yet.
+            if !slot.status(Ordering::Acquire).is_idle() {
+                // 仍在途、或信箱里压着一条未被消费的完成（detached future 随时可能来
+                // 取），两种情况都还不能复用这个 slot。
                 deferred_non_idle.push(idx);
                 continue;
             }
@@ -236,7 +235,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             return false;
         };
         let core = slot.load_core_state(Ordering::Acquire);
-        core.generation() == generation && core.state() != SlotState::Idle
+        core.generation() == generation && !core.status().is_idle()
     }
 
     pub fn active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
@@ -246,7 +245,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             .enumerate()
             .filter_map(|(index, slot)| {
                 let core = slot.load_core_state(Ordering::Acquire);
-                (core.state() != SlotState::Idle)
+                (!core.status().is_idle())
                     .then(|| OpToken::from_registry_parts(index, core.generation()).ok())
                     .flatten()
             })
@@ -296,11 +295,11 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         local.storage.reset();
 
         let cell = &self.shared.slots[user_data];
-        if cell.state(Ordering::Acquire) == SlotState::InFlightReady {
-            // `reset` 只重置状态位，不动 `completion_data`。已就绪的完成必须在这里
-            // 取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot 里，直到该
-            // slot 下一次被 `record_completion` 覆盖才释放——slot 若不再被复用就是
-            // 永久泄漏。
+        if cell.status(Ordering::Acquire).ready {
+            // `reset` 会清掉 `ready` 标志位，但不动 `completion_data`。已就绪的完成
+            // 必须在这里取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot
+            // 里，直到该 slot 下一次被 `record_completion` 覆盖才释放——slot 若不再
+            // 被复用就是永久泄漏。
             self.shared.clear_ready_completion();
             let record_data = cell.completion_with_record_data(mem::take);
             self.shared.run_discarded_record_cleanup(record_data);
@@ -313,8 +312,9 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     /// 强制把 slot 收回 `Idle` 并推进到 `next_generation`，**丢弃**其上任何已就绪的
     /// 完成（连同其 payload 与 cleanup）。
     ///
-    /// 与 [`Self::remove`] 的区别是后者保留 `InFlightReady` 状态，让已到达的完成仍
-    /// 可被 detached future 消费。释放一个尚未提交的预留 slot 应当用 `remove`。
+    /// 与 [`Self::remove`] 的区别是后者只把生命周期归还成 `Idle`、保留信箱上的 `ready`
+    /// 标志位，让已到达的完成仍可被 detached future 消费。释放一个尚未提交的预留 slot
+    /// 应当用 `remove`。
     pub fn recycle(&mut self, token: OpToken, next_generation: Generation) -> bool {
         let (user_data, generation) = token.parts();
         let local = match self.local.get(user_data) {

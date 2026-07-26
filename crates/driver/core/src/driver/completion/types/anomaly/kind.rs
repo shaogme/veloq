@@ -14,21 +14,25 @@ impl CompletionAnomalyKind {
         index: usize,
         expected: Generation,
         actual: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     ) -> Self {
         Self::Stale {
             index,
             expected,
             actual,
-            state,
+            status,
         }
     }
 
-    pub const fn non_active(index: usize, generation: Generation, state: slot::SlotState) -> Self {
+    pub const fn non_active(
+        index: usize,
+        generation: Generation,
+        status: slot::SlotStatus,
+    ) -> Self {
         Self::NonActive {
             index,
             generation,
-            state,
+            status,
         }
     }
 
@@ -139,9 +143,9 @@ impl CompletionAnomalyKind {
         }
     }
 
-    pub fn state(self) -> Option<slot::SlotState> {
+    pub fn status(self) -> Option<slot::SlotStatus> {
         match self {
-            Self::Stale { state, .. } | Self::NonActive { state, .. } => Some(state),
+            Self::Stale { status, .. } | Self::NonActive { status, .. } => Some(status),
             Self::UnknownSlot { .. }
             | Self::BackendContext { .. }
             | Self::BackendSpecific { .. } => None,
@@ -180,13 +184,13 @@ impl CompletionAnomalyKind {
                 index,
                 expected,
                 actual,
-                state,
-            } => CompletionAnomaly::stale(token, index, expected, actual, state),
+                status,
+            } => CompletionAnomaly::stale(token, index, expected, actual, status),
             Self::NonActive {
                 index,
                 generation,
-                state,
-            } => CompletionAnomaly::non_active(token, index, generation, state),
+                status,
+            } => CompletionAnomaly::non_active(token, index, generation, status),
 
             Self::BackendContext {
                 backend,

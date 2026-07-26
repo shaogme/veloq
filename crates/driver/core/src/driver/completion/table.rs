@@ -86,18 +86,18 @@ fn mutation_generation_mismatch(
     idx: usize,
     expected_generation: Generation,
     actual_generation: Generation,
-    state: slot::SlotState,
+    status: slot::SlotStatus,
 ) -> CompletionMutationOutcome {
     if actual_generation.is_newer_than(expected_generation) {
         CompletionMutationOutcome::Rejected(AnomalyOutcome::Stale(CompletionAnomalyKind::stale(
             idx,
             expected_generation,
             actual_generation,
-            state,
+            status,
         )))
     } else {
         CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(
-            CompletionAnomalyKind::non_active(idx, expected_generation, state),
+            CompletionAnomalyKind::non_active(idx, expected_generation, status),
         ))
     }
 }
@@ -106,10 +106,10 @@ fn mutation_generation_mismatch(
 fn mutation_non_active(
     idx: usize,
     generation: Generation,
-    state: slot::SlotState,
+    status: slot::SlotStatus,
 ) -> CompletionMutationOutcome {
     CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(
-        CompletionAnomalyKind::non_active(idx, generation, state),
+        CompletionAnomalyKind::non_active(idx, generation, status),
     ))
 }
 
@@ -210,52 +210,64 @@ where
         }
         let cell = &self.slots[idx];
 
-        let finalizing = loop {
+        // 判定顺序统一为 generation → finalizing → ready → state：前两项是「这条完成
+        // 该不该由我处理」，`ready` 是信箱维度（已有一条未消费的记录就不能覆盖），最后
+        // 才轮到 slot 的生命周期。
+        let claimed = loop {
             let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
+            let status = current.status();
             let cell_gen = current.generation();
 
             if generation.is_older_than(cell_gen) {
                 return self.rejected_completion(
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
-                        CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
+                        CompletionAnomalyKind::stale(idx, generation, cell_gen, status),
                     )),
                     event,
                     packet,
                 );
             }
             if generation.is_newer_than(cell_gen) {
-                let outcome = if state == slot::SlotState::Idle {
+                let outcome = if status.is_idle() {
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
-                        CompletionAnomalyKind::non_active(idx, generation, state),
+                        CompletionAnomalyKind::non_active(idx, generation, status),
                     ))
                 } else {
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
-                        CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
+                        CompletionAnomalyKind::stale(idx, generation, cell_gen, status),
                     ))
                 };
                 return self.rejected_completion(outcome, event, packet);
             }
 
-            match state {
+            if status.finalizing {
+                spin_yield();
+                continue;
+            }
+            if status.ready {
+                return self.rejected_completion(
+                    RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
+                        CompletionAnomalyKind::non_active(idx, generation, status),
+                    )),
+                    event,
+                    packet,
+                );
+            }
+
+            match status.state {
                 slot::SlotState::InFlightWaiting => match cell.core_state.compare_exchange(
                     current,
-                    current
-                        .with_state(slot::SlotState::Finalizing)
-                        .with_generation(generation),
+                    current.with_finalizing(true).with_generation(generation),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => break current.with_state(slot::SlotState::Finalizing),
+                    Ok(_) => break current.with_finalizing(true),
                     Err(_) => continue,
                 },
-                slot::SlotState::Idle
-                | slot::SlotState::Reserved
-                | slot::SlotState::InFlightReady
-                | slot::SlotState::ReservedValue => {
+                slot::SlotState::Idle | slot::SlotState::Reserved => {
                     return self.rejected_completion(
                         RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
-                            CompletionAnomalyKind::non_active(idx, generation, state),
+                            CompletionAnomalyKind::non_active(idx, generation, status),
                         )),
                         event,
                         packet,
@@ -267,10 +279,6 @@ where
                         event,
                         packet,
                     );
-                }
-                slot::SlotState::Finalizing => {
-                    spin_yield();
-                    continue;
                 }
             }
         };
@@ -290,9 +298,12 @@ where
         cell.completion_flags
             .store(event.flags(), Ordering::Release);
         self.note_ready_completion();
+        // 发布：清掉 finalizing、立起 ready。生命周期状态**保持不变**——slot 的归还由
+        // driver 线程随后的 `finalize_*` → `free()` 负责，两件事互不依赖。
         cell.core_state.store(
-            finalizing
-                .with_state(slot::SlotState::InFlightReady)
+            claimed
+                .with_finalizing(false)
+                .with_ready(true)
                 .with_generation(generation),
             Ordering::Release,
         );
@@ -315,35 +326,30 @@ where
         let cell = &self.slots[idx];
 
         let current = cell.load_core_state(Ordering::Acquire);
-        let state = current.state();
+        let status = current.status();
         let cell_gen = current.generation();
 
         if cell_gen.is_newer_than(generation) {
-            let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
+            let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, status);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
         if cell_gen.is_older_than(generation) {
-            let kind = CompletionAnomalyKind::non_active(idx, generation, state);
+            let kind = CompletionAnomalyKind::non_active(idx, generation, status);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
-        if state != slot::SlotState::InFlightReady {
-            return match state {
-                slot::SlotState::InFlightWaiting | slot::SlotState::Finalizing => {
-                    Ok(PollRecordResult::Pending)
-                }
-                slot::SlotState::Idle
-                | slot::SlotState::Reserved
-                | slot::SlotState::InFlightOrphaned
-                | slot::SlotState::ReservedValue => {
-                    let kind = CompletionAnomalyKind::non_active(idx, generation, state);
-                    self.diagnostics.record_anomaly_kind(kind, attach);
-                    Ok(PollRecordResult::Unavailable { kind, attach })
-                }
-                slot::SlotState::InFlightReady => unreachable!(),
+        if !status.ready {
+            // 消费方不自旋：发布中（`finalizing`）与在途一样按 Pending 处理，发布完成
+            // 后 `record_completion` 会唤醒已注册的 waker。
+            return if status.finalizing || status.state == slot::SlotState::InFlightWaiting {
+                Ok(PollRecordResult::Pending)
+            } else {
+                let kind = CompletionAnomalyKind::non_active(idx, generation, status);
+                self.diagnostics.record_anomaly_kind(kind, attach);
+                Ok(PollRecordResult::Unavailable { kind, attach })
             };
         }
 
@@ -352,6 +358,7 @@ where
             .compare_exchange(
                 current,
                 current
+                    .with_ready(false)
                     .with_state(slot::SlotState::Idle)
                     .with_generation(generation.next()),
                 Ordering::AcqRel,
@@ -382,7 +389,7 @@ where
                     .to_report()
                     .push_ctx("scope", "try_take_record")
                     .attach_note(format!(
-                        "corrupt slot state: InFlightReady slot completion data is empty. index: {}, generation: {}",
+                        "corrupt slot state: mailbox marked ready but holds no record. index: {}, generation: {}",
                         idx, generation
                     ));
                 Err(Spec::Error::from_core_report(report))
@@ -398,39 +405,39 @@ where
         let cell = &self.slots[idx];
 
         let current = cell.load_core_state(Ordering::Acquire);
-        let state = current.state();
+        let status = current.status();
         let cell_gen = current.generation();
 
         if cell_gen != generation {
             return self.recorded_mutation(
                 token,
-                mutation_generation_mismatch(idx, generation, cell_gen, state),
+                mutation_generation_mismatch(idx, generation, cell_gen, status),
             );
         }
 
         cell.completion_waker.register(waker);
 
         let current_after = cell.load_core_state(Ordering::Acquire);
-        let state_after = current_after.state();
+        let status_after = current_after.status();
         let generation_after = current_after.generation();
         if generation_after != generation {
             return self.recorded_mutation(
                 token,
-                mutation_generation_mismatch(idx, generation, generation_after, state_after),
+                mutation_generation_mismatch(idx, generation, generation_after, status_after),
             );
         }
-        if current_after.state() == slot::SlotState::InFlightReady && generation_after == generation
-        {
+        if status_after.ready {
+            // 注册与发布竞速：记录已就绪，自己唤醒自己，避免丢唤醒。
             waker.wake_by_ref();
             return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
         }
 
-        let outcome = match state_after {
-            slot::SlotState::InFlightWaiting
-            | slot::SlotState::InFlightReady
-            | slot::SlotState::Finalizing => CompletionMutationOutcome::Applied,
-            state => mutation_non_active(idx, generation, state),
-        };
+        let outcome =
+            if status_after.finalizing || status_after.state == slot::SlotState::InFlightWaiting {
+                CompletionMutationOutcome::Applied
+            } else {
+                mutation_non_active(idx, generation, status_after)
+            };
         self.recorded_mutation(token, outcome)
     }
 
@@ -443,37 +450,34 @@ where
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
+            let status = current.status();
             let cell_generation = current.generation();
 
             if cell_generation != generation {
                 return self.recorded_mutation(
                     token,
-                    mutation_generation_mismatch(idx, generation, cell_generation, state),
+                    mutation_generation_mismatch(idx, generation, cell_generation, status),
                 );
             }
 
-            if state == slot::SlotState::InFlightReady {
+            if status.finalizing {
+                spin_yield();
+                continue;
+            }
+            if status.ready {
                 return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
             }
 
-            match state {
+            return match status.state {
                 slot::SlotState::InFlightWaiting => {
-                    return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
-                }
-                slot::SlotState::Finalizing => {
-                    spin_yield();
-                    continue;
+                    self.recorded_mutation(token, CompletionMutationOutcome::Applied)
                 }
                 slot::SlotState::Idle
                 | slot::SlotState::Reserved
-                | slot::SlotState::InFlightOrphaned
-                | slot::SlotState::InFlightReady
-                | slot::SlotState::ReservedValue => {
-                    return self
-                        .recorded_mutation(token, mutation_non_active(idx, generation, state));
+                | slot::SlotState::InFlightOrphaned => {
+                    self.recorded_mutation(token, mutation_non_active(idx, generation, status))
                 }
-            }
+            };
         }
     }
 
@@ -486,43 +490,40 @@ where
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
+            let status = current.status();
             let cell_gen = current.generation();
 
-            match state {
-                slot::SlotState::InFlightReady if cell_gen == generation => {
-                    if cell
-                        .core_state
-                        .compare_exchange(
-                            current,
-                            current
-                                .with_state(slot::SlotState::Idle)
-                                .with_generation(generation.next()),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.clear_ready_completion();
-                        let record_data = cell.completion_with_record_data(std::mem::take);
-                        self.run_discarded_record_cleanup(record_data);
-                        return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
-                    }
-                }
-                slot::SlotState::Finalizing => {
-                    spin_yield();
-                    continue;
-                }
-                _ if cell_gen != generation => {
-                    return self.recorded_mutation(
-                        token,
-                        mutation_generation_mismatch(idx, generation, cell_gen, state),
-                    );
-                }
-                _ => {
-                    return self
-                        .recorded_mutation(token, mutation_non_active(idx, generation, state));
-                }
+            if status.finalizing {
+                spin_yield();
+                continue;
+            }
+            if cell_gen != generation {
+                return self.recorded_mutation(
+                    token,
+                    mutation_generation_mismatch(idx, generation, cell_gen, status),
+                );
+            }
+            if !status.ready {
+                return self.recorded_mutation(token, mutation_non_active(idx, generation, status));
+            }
+
+            if cell
+                .core_state
+                .compare_exchange(
+                    current,
+                    current
+                        .with_ready(false)
+                        .with_state(slot::SlotState::Idle)
+                        .with_generation(generation.next()),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.clear_ready_completion();
+                let record_data = cell.completion_with_record_data(std::mem::take);
+                self.run_discarded_record_cleanup(record_data);
+                return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
             }
         }
     }
@@ -536,17 +537,26 @@ where
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
+            let status = current.status();
             let cell_gen = current.generation();
 
-            match state {
+            if status.finalizing {
+                spin_yield();
+                continue;
+            }
+            if cell_gen != generation {
+                return self.recorded_mutation(
+                    token,
+                    mutation_generation_mismatch(idx, generation, cell_gen, status),
+                );
+            }
+            // 完成已经发布：放弃它等于丢弃信箱里那条记录，走 discard 才能跑 cleanup。
+            if status.ready {
+                return self.discard_ready_record(token);
+            }
+
+            match status.state {
                 slot::SlotState::InFlightWaiting => {
-                    if cell_gen != generation {
-                        return self.recorded_mutation(
-                            token,
-                            mutation_generation_mismatch(idx, generation, cell_gen, state),
-                        );
-                    }
                     if cell
                         .core_state
                         .compare_exchange(
@@ -562,22 +572,11 @@ where
                         return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
                     }
                 }
-                slot::SlotState::InFlightReady if cell_gen == generation => {
-                    return self.discard_ready_record(token);
-                }
-                slot::SlotState::Finalizing => {
-                    spin_yield();
-                    continue;
-                }
-                _ if cell_gen != generation => {
-                    return self.recorded_mutation(
-                        token,
-                        mutation_generation_mismatch(idx, generation, cell_gen, state),
-                    );
-                }
-                _ => {
+                slot::SlotState::Idle
+                | slot::SlotState::Reserved
+                | slot::SlotState::InFlightOrphaned => {
                     return self
-                        .recorded_mutation(token, mutation_non_active(idx, generation, state));
+                        .recorded_mutation(token, mutation_non_active(idx, generation, status));
                 }
             }
         }
@@ -585,15 +584,17 @@ where
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8 {
-        let current = self.slots[idx].load_core_state(Ordering::Acquire);
-        match current.state() {
-            slot::SlotState::Idle => CELL_STATE_IDLE,
+        let status = self.slots[idx].load_core_state(Ordering::Acquire).status();
+        if status.finalizing {
+            return CELL_STATE_BUSY;
+        }
+        if status.ready {
+            return CELL_STATE_READY;
+        }
+        match status.state {
             slot::SlotState::InFlightWaiting => CELL_STATE_WAITING,
-            slot::SlotState::InFlightReady => CELL_STATE_READY,
             slot::SlotState::InFlightOrphaned => CELL_STATE_ORPHANED,
-            slot::SlotState::Finalizing => CELL_STATE_BUSY,
-            slot::SlotState::Reserved => CELL_STATE_IDLE,
-            slot::SlotState::ReservedValue => CELL_STATE_IDLE,
+            slot::SlotState::Idle | slot::SlotState::Reserved => CELL_STATE_IDLE,
         }
     }
 }

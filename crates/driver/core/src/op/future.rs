@@ -178,8 +178,8 @@ where
         if let Some(actual_generation) = kind.actual_generation() {
             report = report.with_ctx("actual_generation", actual_generation);
         }
-        if let Some(state) = kind.state() {
-            report = report.with_ctx("slot_state", format!("{state:?}"));
+        if let Some(status) = kind.status() {
+            report = report.with_ctx("slot_status", format!("{status:?}"));
         }
         if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
             report = report.with_ctx("completion_backend", format!("{backend:?}"));

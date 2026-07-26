@@ -27,7 +27,7 @@ use veloq_driver_core::{
         CompletionHookOutcome, CompletionIngress, CompletionSource, RawCompletion,
         SharedCompletionTable, UserCompletionEvent,
     },
-    slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState},
+    slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
 use windows_sys::Win32::{
     Foundation::ERROR_OPERATION_ABORTED,
@@ -161,7 +161,10 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
                 .push_ctx("scope", "rio.runtime.control_flow.complete_waiting")
                 .with_ctx("token_index", event.token().index())
                 .with_ctx("token_generation", event.token().generation())
-                .with_ctx("slot_state", format!("{:?}", SlotState::InFlightWaiting))
+                .with_ctx(
+                    "slot_status",
+                    format!("{:?}", SlotStatus::of(SlotState::InFlightWaiting)),
+                )
                 .with_ctx("completion_source", source_name)
                 .attach_note(
                     "Backend invariant broken: RIO complete_waiting received non-Backend source",

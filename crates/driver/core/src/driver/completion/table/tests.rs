@@ -367,6 +367,115 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
     );
 }
 
+/// 双轨收敛后的核心不变量：完成发布之后，slot 的**生命周期**已经回到 `Idle`（driver
+/// 线程已把它归还给 free list），而「信箱里有一条待消费的完成」由正交的 `ready` 标志位
+/// 表示。两者同时成立，正是旧 `InFlightReady` 单一状态被拆开的地方。
+#[test]
+fn a_published_completion_is_orthogonal_to_the_slot_lifecycle() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+
+    accept_user(&mut registry, token, 5);
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(
+        status.state,
+        SlotState::Idle,
+        "the slot itself must already be released"
+    );
+    assert!(status.ready, "the record must stay in the mailbox");
+    assert!(!status.finalizing);
+    assert!(!status.is_idle(), "a ready slot is not reusable");
+    assert_eq!(table.debug_get_state(token.index()), CELL_STATE_READY);
+    assert!(table.has_ready_completion());
+
+    match table.try_take_record(token).unwrap() {
+        PollRecordResult::Ready(record) => assert_eq!(record.event.res(), 5),
+        PollRecordResult::Pending => panic!("published completion should not be pending"),
+        PollRecordResult::Unavailable { kind, .. } => {
+            panic!("published completion should be takeable: {kind:?}")
+        }
+    }
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert!(status.is_idle(), "consumption must fully release the slot");
+    assert!(!table.has_ready_completion());
+}
+
+/// `ready` 必须优先于生命周期被检查：远端 mutator 看到信箱里有记录时，不论 slot 处于
+/// 哪个生命周期，都要走信箱路径而不是生命周期路径。
+#[test]
+fn mailbox_checks_take_priority_over_the_slot_lifecycle() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+
+    accept_user(&mut registry, token, 1);
+    assert_eq!(
+        table.slots[token.index()].status(Ordering::Acquire).state,
+        SlotState::Idle
+    );
+
+    // 生命周期是 `Idle`——若按 state 判定，这两个都会被拒成 NonActive。
+    assert_eq!(
+        table.mark_waiting(token),
+        CompletionMutationOutcome::Applied
+    );
+    assert_eq!(
+        table.register_waker(token, Waker::noop()),
+        CompletionMutationOutcome::Applied
+    );
+    assert_eq!(
+        table.mark_orphaned(token),
+        CompletionMutationOutcome::Applied
+    );
+    assert!(!table.has_ready_completion());
+}
+
+/// 生命周期空、信箱也空时，三个 mutator 都必须拒绝——确认上一条不是把判定放宽了。
+#[test]
+fn an_empty_mailbox_on_an_idle_slot_still_rejects_every_mutation() {
+    let table = slot::SlotTable::<DummySlotSpec>::new(1);
+    table.slots[0].reset(Generation::new(1));
+    let token = test_token(0, 1);
+
+    let status = table.slots[0].status(Ordering::Acquire);
+    assert!(status.is_idle());
+
+    assert!(matches!(
+        table.mark_waiting(token),
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(_))
+    ));
+    assert!(matches!(
+        table.mark_orphaned(token),
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(_))
+    ));
+    assert!(matches!(
+        table.register_waker(token, Waker::noop()),
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(_))
+    ));
+    assert!(matches!(
+        table.try_take_record(token).unwrap(),
+        PollRecordResult::Unavailable { .. }
+    ));
+}
+
+/// 诊断里携带的是完整 [`slot::SlotStatus`]：旧实现把「已发布」编码进 state，收敛后若
+/// 只记 state 就会退化成一个信息量为零的 `Idle`。
+#[test]
+fn anomaly_diagnostics_keep_the_mailbox_bit() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+
+    accept_user(&mut registry, token, 0);
+    // 重复完成：slot 生命周期已是 Idle，但信箱里压着记录。
+    let mut hooks = TestHooks::default();
+    let outcome = accept_with_hooks(&mut registry, test_event(token, 0), &mut hooks);
+    assert_eq!(outcome.anomaly, 1);
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(format!("{status:?}"), "Idle+ready");
+}
+
 #[test]
 fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     let (mut registry, token) = active_registry();

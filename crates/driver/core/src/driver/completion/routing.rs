@@ -2,7 +2,29 @@ use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 use crate::{DriverCoreError, DriverError, driver::registry::OpRegistry};
 use diagweave::prelude::*;
 
-use super::{CompletionAnomalyKind, CompletionAnomalyReason, OpToken, UserCompletionEvent};
+use super::{CompletionAnomalyKind, OpToken, UserCompletionEvent};
+
+/// `checked_slot_view` 拿不到 slot 时的三种原因。
+///
+/// 它是 [`CompletionAnomalyKind`] 的真子集：后者还包含后端相关的变体，用它做路由就
+/// 必须写 `_ => unreachable!()` 兜底。用独立类型表达之后，下游的 match 天然穷尽。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotLookupFailure {
+    /// 索引越界——不存在这个 slot。
+    Missing(CompletionAnomalyKind),
+    /// slot 存在但当前不承载任何在途操作（`Idle`，可能信箱里还压着完成）。
+    NonActive(CompletionAnomalyKind),
+    /// slot 已被复用给新一代操作。
+    Stale(CompletionAnomalyKind),
+}
+
+impl SlotLookupFailure {
+    pub const fn kind(self) -> CompletionAnomalyKind {
+        match self {
+            Self::Missing(kind) | Self::NonActive(kind) | Self::Stale(kind) => kind,
+        }
+    }
+}
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
     Waiting(slot::Slot<'a, slot::InFlightWaiting, Spec>),
@@ -77,7 +99,7 @@ where
         } => slot::SlotSnapshot {
             index,
             generation: expected_generation,
-            state: slot::SlotState::Idle,
+            status: slot::SlotStatus::of(slot::SlotState::Idle),
             has_op: false,
             has_payload: false,
         },
@@ -112,12 +134,9 @@ pub(super) fn route_user_completion<'a, Spec: slot::SlotSpec>(
                 ));
             Err(Spec::Error::from_core_report(report))
         }
-        Err(kind) => match kind.reason() {
-            CompletionAnomalyReason::UnknownSlot => Ok(RoutedSlotCompletion::Missing(kind)),
-            CompletionAnomalyReason::NonActiveSlot => Ok(RoutedSlotCompletion::Empty(kind)),
-            CompletionAnomalyReason::StaleGeneration => Ok(RoutedSlotCompletion::Stale(kind)),
-            _ => unreachable!(),
-        },
+        Err(SlotLookupFailure::Missing(kind)) => Ok(RoutedSlotCompletion::Missing(kind)),
+        Err(SlotLookupFailure::NonActive(kind)) => Ok(RoutedSlotCompletion::Empty(kind)),
+        Err(SlotLookupFailure::Stale(kind)) => Ok(RoutedSlotCompletion::Stale(kind)),
     }
 }
 
@@ -125,24 +144,23 @@ pub(super) fn route_user_completion<'a, Spec: slot::SlotSpec>(
 pub(super) fn slot_view_kind<'a, Spec: slot::SlotSpec>(
     token: OpToken,
     view: CheckedSlotView<'a, Spec>,
-) -> Result<SlotView<'a, Spec>, CompletionAnomalyKind> {
+) -> Result<SlotView<'a, Spec>, SlotLookupFailure> {
     let (index, expected_generation) = token.parts();
     match view {
         CheckedSlotView::Valid(slot) => Ok(slot),
-        CheckedSlotView::Missing { .. } => Err(CompletionAnomalyKind::unknown_slot(
-            index,
-            expected_generation,
+        CheckedSlotView::Missing { .. } => Err(SlotLookupFailure::Missing(
+            CompletionAnomalyKind::unknown_slot(index, expected_generation),
         )),
-        CheckedSlotView::Empty(snapshot) => Err(CompletionAnomalyKind::non_active(
-            snapshot.index,
-            expected_generation,
-            snapshot.state,
+        CheckedSlotView::Empty(snapshot) => Err(SlotLookupFailure::NonActive(
+            CompletionAnomalyKind::non_active(snapshot.index, expected_generation, snapshot.status),
         )),
-        CheckedSlotView::Stale(snapshot) => Err(CompletionAnomalyKind::stale(
-            snapshot.index,
-            expected_generation,
-            snapshot.generation,
-            snapshot.state,
-        )),
+        CheckedSlotView::Stale(snapshot) => {
+            Err(SlotLookupFailure::Stale(CompletionAnomalyKind::stale(
+                snapshot.index,
+                expected_generation,
+                snapshot.generation,
+                snapshot.status,
+            )))
+        }
     }
 }

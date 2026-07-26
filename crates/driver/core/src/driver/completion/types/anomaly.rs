@@ -45,12 +45,12 @@ pub enum CompletionAnomalyKind {
         index: usize,
         expected: Generation,
         actual: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     },
     NonActive {
         index: usize,
         generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
     },
     BackendContext {
         backend: CompletionBackend,
@@ -113,7 +113,7 @@ pub enum CompletionAnomaly {
         index: usize,
         expected_generation: Generation,
         actual_generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
         raw: Option<CompletionRaw>,
     },
     SlotState {
@@ -121,7 +121,7 @@ pub enum CompletionAnomaly {
         token: CompletionToken,
         index: usize,
         generation: Generation,
-        state: slot::SlotState,
+        status: slot::SlotStatus,
         snapshot: Option<slot::SlotSnapshot>,
         raw: Option<CompletionRaw>,
     },

@@ -45,20 +45,36 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// 编译期类型态与运行期 [`SlotState`] 的对应关系：
+///
+/// | 类型态 | 运行期 | 说明 |
+/// |---|---|---|
+/// | — | [`SlotState::Idle`] | 无 slot 可借出 |
+/// | [`Reserved`] | [`SlotState::Reserved`] | 已预留，尚未提交 |
+/// | [`InFlightWaiting`] | [`SlotState::InFlightWaiting`] | 已提交，等待完成 |
+/// | [`InFlightOrphaned`] | [`SlotState::InFlightOrphaned`] | 用户已放弃，等待内核收尾 |
+/// | [`Draining`] | 沿用进入前的运行期状态 | driver 线程独占地取走 op/payload |
+///
+/// [`Draining`] 刻意**不**改变运行期状态：它表达的是「driver 线程正在把这个 slot 掏
+/// 空」这一独占能力，而不是一个远端可见的相位。远端可见的「完成已发布」由 cell 上的
+/// `ready` 标志位表示（见 [`SlotStatus`]），与本轨完全正交。
 pub struct Reserved;
 pub struct InFlightWaiting;
 pub struct InFlightOrphaned;
-pub struct Completed;
+
+/// 排空视图：持有它意味着 driver 线程已判定该 slot 不再需要提交，可以取走 `op` 与
+/// 完成数据。见 [`Reserved`] 上的对应关系表。
+pub struct Draining;
 
 impl sealed::Sealed for Reserved {}
 impl sealed::Sealed for InFlightWaiting {}
 impl sealed::Sealed for InFlightOrphaned {}
-impl sealed::Sealed for Completed {}
+impl sealed::Sealed for Draining {}
 
 impl SlotMarker for Reserved {}
 impl SlotMarker for InFlightWaiting {}
 impl SlotMarker for InFlightOrphaned {}
-impl SlotMarker for Completed {}
+impl SlotMarker for Draining {}
 
 pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
     entry: &'a SlotEntry<Spec>,
@@ -96,10 +112,11 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
     }
 
     pub fn snapshot(&self) -> SlotSnapshot {
+        let core = self.entry.load_core_state(Ordering::Acquire);
         SlotSnapshot {
             index: self.index,
-            generation: self.entry.generation(Ordering::Acquire),
-            state: self.entry.state(Ordering::Acquire),
+            generation: core.generation(),
+            status: core.status(),
             has_op: self.op.is_some(),
             has_payload: self.storage.payload.is_some(),
         }
@@ -231,7 +248,9 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
-    pub fn complete(self) -> Slot<'a, Completed, Spec> {
+    /// 转入排空视图。**不改变运行期状态**——完成尚未发布，远端观察到的仍是
+    /// `InFlightWaiting`；发布由 `CompletionAccess::record_completion` 负责。
+    pub fn complete(self) -> Slot<'a, Draining, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
@@ -271,16 +290,7 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
     }
 }
 
-impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
-    pub fn reset(self) -> Slot<'a, Reserved, Spec> {
-        let _ = self.op.take();
-        let generation = self.entry.generation(Ordering::Acquire);
-        self.storage.reset();
-        self.entry.reset(generation);
-        self.entry.set_state(SlotState::Reserved, Ordering::Release);
-        Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
-    }
-
+impl<'a, Spec: SlotSpec> Slot<'a, Draining, Spec> {
     pub fn take_op(&mut self) -> SlotAccessOutcome<SlotOp<Spec>> {
         self.op.take().ok_or_else(|| {
             self.access_error(SlotAccessAction::TakeOp, SlotAccessErrorReason::MissingOp)
@@ -316,7 +326,8 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
-    pub fn complete(self) -> Slot<'a, Completed, Spec> {
+    /// 转入排空视图，语义同 [`Slot::<InFlightWaiting, _>::complete`]。
+    pub fn complete(self) -> Slot<'a, Draining, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
@@ -375,7 +386,7 @@ pub enum SlotView<'a, Spec: SlotSpec> {
 pub struct SlotSnapshot {
     pub index: usize,
     pub generation: Generation,
-    pub state: SlotState,
+    pub status: SlotStatus,
     pub has_op: bool,
     pub has_payload: bool,
 }
@@ -441,12 +452,13 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 expected_generation,
             });
         };
-        let generation = entry.generation(Ordering::Acquire);
-        let state = entry.state(Ordering::Acquire);
+        let core = entry.load_core_state(Ordering::Acquire);
+        let generation = core.generation();
+        let status = core.status();
         let snapshot = SlotSnapshot {
             index,
             generation,
-            state,
+            status,
             has_op: op.is_some(),
             has_payload: storage.payload.is_some(),
         };
@@ -455,67 +467,54 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
             return Ok(CheckedSlotView::Stale(snapshot));
         }
 
-        match state {
-            SlotState::InFlightWaiting | SlotState::InFlightOrphaned => {
-                if !snapshot.has_op || !snapshot.has_payload {
-                    let report = DriverCoreError::Internal
-                        .to_report()
-                        .push_ctx("scope", "checked_slot_view")
-                        .attach_note(format!("corrupt slot detected: {:?}", snapshot));
-                    return Err(Spec::Error::from_core_report(report));
-                }
+        // 只 match 一次：四个生命周期状态各自恰好对应一种视图。`ready` / `finalizing`
+        // 都是 cell 信箱的标志位，不参与借出判定——信箱里有没有记录不影响 slot 本身
+        // 能否被借出，只影响它能否被重新分配（见 `SlotStatus::is_idle`）。
+        let platform = &mut op_entry.platform_data;
+        match status.state {
+            SlotState::Idle => Ok(CheckedSlotView::Empty(snapshot)),
+            SlotState::Reserved => {
+                Slot::<Reserved, Spec>::try_bind(entry, op, storage, platform, index).map_or_else(
+                    || Err(corrupt_slot(snapshot, "try_bind Reserved failed")),
+                    |slot| Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))),
+                )
             }
-            SlotState::Idle
-            | SlotState::InFlightReady
-            | SlotState::Finalizing
-            | SlotState::ReservedValue => return Ok(CheckedSlotView::Empty(snapshot)),
-            SlotState::Reserved => {}
+            SlotState::InFlightWaiting => {
+                ensure_in_flight_payload::<Spec>(snapshot)?;
+                Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(
+                    Slot::new_internal(entry, op, storage, platform, index),
+                )))
+            }
+            SlotState::InFlightOrphaned => {
+                ensure_in_flight_payload::<Spec>(snapshot)?;
+                Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(
+                    Slot::new_internal(entry, op, storage, platform, index),
+                )))
+            }
         }
+    }
+}
 
-        match state {
-            SlotState::Reserved => Slot::<Reserved, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map_or_else(
-                || {
-                    let report = DriverCoreError::Internal
-                        .to_report()
-                        .push_ctx("scope", "checked_slot_view")
-                        .attach_note(format!(
-                            "corrupt slot (try_bind Reserved failed): {:?}",
-                            snapshot
-                        ));
-                    Err(Spec::Error::from_core_report(report))
-                },
-                |slot| Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))),
-            ),
-            SlotState::InFlightWaiting => Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(
-                Slot::<InFlightWaiting, Spec>::new_internal(
-                    entry,
-                    op,
-                    storage,
-                    &mut op_entry.platform_data,
-                    index,
-                ),
-            ))),
-            SlotState::InFlightOrphaned => Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(
-                Slot::<InFlightOrphaned, Spec>::new_internal(
-                    entry,
-                    op,
-                    storage,
-                    &mut op_entry.platform_data,
-                    index,
-                ),
-            ))),
-            SlotState::Idle
-            | SlotState::InFlightReady
-            | SlotState::Finalizing
-            | SlotState::ReservedValue => Ok(CheckedSlotView::Empty(snapshot)),
-        }
+#[inline]
+fn corrupt_slot<E: DriverError>(snapshot: SlotSnapshot, note: &str) -> Report<E> {
+    E::from_core_report(
+        DriverCoreError::Internal
+            .to_report()
+            .push_ctx("scope", "checked_slot_view")
+            .attach_note(format!("corrupt slot detected ({note}): {snapshot:?}")),
+    )
+}
+
+/// 在途的 slot 必须同时持有 op 与 payload——完成式 I/O 下内核仍持有指向 payload 的
+/// 指针，缺任何一半都说明有人在在途期间把 slot 掏空了。
+#[inline]
+fn ensure_in_flight_payload<Spec: SlotSpec>(
+    snapshot: SlotSnapshot,
+) -> Result<(), Report<Spec::Error>> {
+    if snapshot.has_op && snapshot.has_payload {
+        Ok(())
+    } else {
+        Err(corrupt_slot(snapshot, "in-flight slot lost op or payload"))
     }
 }
 
@@ -718,8 +717,63 @@ mod tests {
             CheckedSlotView::Empty(snapshot)
                 if snapshot.index == token.index()
                     && snapshot.generation == token.generation()
-                    && snapshot.state == SlotState::Idle
+                    && snapshot.status == SlotStatus::of(SlotState::Idle)
         ));
+    }
+
+    /// slot 被 `free` 归还后信箱里仍压着一条已发布的完成：生命周期回到 `Idle`，但
+    /// `ready` 必须原样保留，否则 detached future 再来 poll 就取不到东西了。
+    #[test]
+    fn freeing_a_slot_keeps_its_published_completion_in_the_mailbox() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
+
+        registry
+            .with_slot_storage_mut(token, |_result, payload, _sidecar| {
+                *payload = Some(());
+            })
+            .expect("slot storage should exist");
+        let slot = match registry.checked_slot_view(token).unwrap() {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
+                .init_op_with(DummyPlatformOp, |_| {})
+                .expect("reserved slot should accept op"),
+            _ => panic!("reserved slot should be available"),
+        };
+        let _in_flight = slot
+            .start_submission_with(None)
+            .expect("reserved slot should start submission")
+            .persist();
+
+        let diagnostics = registry.shared.completion_diagnostics();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+        let mut hooks = TestHooks;
+        let _ = registry.accept_completion(
+            &table,
+            &diagnostics,
+            &mut hooks,
+            CompletionIngress::User(UserCompletionEvent::from_parts(
+                CompletionBackend::Core,
+                token,
+                0,
+                0,
+            )),
+        );
+
+        // `accept_completion` 内部走完 record + finalize，slot 已被归还。
+        let status = registry.shared.slots[token.index()].status(Ordering::Acquire);
+        assert_eq!(status.state, SlotState::Idle);
+        assert!(status.ready, "published completion must survive `free`");
+        assert!(!status.is_idle(), "a ready slot must not be reallocated");
+
+        // 容量为 1 的 registry 在完成被消费前拿不到新 slot。
+        assert!(registry.alloc(()).is_err());
+
+        let _ = registry.shared.try_take_record(token);
+        let status = registry.shared.slots[token.index()].status(Ordering::Acquire);
+        assert!(status.is_idle(), "consuming the record must free the slot");
+        assert!(registry.alloc(()).is_ok());
     }
 
     #[test]
@@ -748,7 +802,7 @@ mod tests {
         let snapshot = SlotSnapshot {
             index: 0,
             generation: Generation::new(3),
-            state: SlotState::InFlightWaiting,
+            status: SlotStatus::of(SlotState::InFlightWaiting),
             has_op: true,
             has_payload: true,
         };
