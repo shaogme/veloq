@@ -1,20 +1,10 @@
-use std::{
-    future::Future,
-    num::NonZeroUsize,
-    ops::AsyncFnOnce,
-    pin::pin,
-    ptr,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
-    thread,
-};
+use std::{num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, sync::Mutex, thread};
 
 use crate::{
     error::{Result, RuntimeError},
-    utils::{FastRand, ownership::ArcOwnership},
+    utils::FastRand,
 };
 use diagweave::prelude::*;
-use veloq_storage::AtomicStorage;
 
 pub mod context;
 pub mod primitives;
@@ -25,8 +15,10 @@ pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
-use primitives::{Signal, create_waker};
-use shared::{MAX_WORKER_COUNT, Receivers, init_runtime_components};
+use primitives::BlockOnSignal;
+use shared::{
+    BlockOnController, MAX_WORKER_COUNT, Receivers, init_runtime_components, run_worker_loop,
+};
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -93,9 +85,8 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
         let thread_errors = Mutex::new(None);
         // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
-        // 它把主线程从 `signal.wait()` 里叫回来，否则错误永远不会被报告
-        // （RUNTIME_REVIEW §1.11）。
-        let signal = Arc::new(Signal::new(true));
+        // 它把主线程从 park 里叫回来，否则错误永远不会被报告（RUNTIME_REVIEW §1.11）。
+        let signal = BlockOnSignal::new(shared_ref.base.unparker(0).clone());
 
         let res: Result<R> = veloq_std::thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
@@ -142,10 +133,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                             Ok(())
                         })();
 
-                        // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：
-                        // 主线程可能正阻塞在 `signal.wait()` 上等一个再也不会到来的事件。
-                        // 还要放弃自己队列里的积压任务：它们再也不会被 poll，而某个作用域
-                        // 可能正在 join 它们（`drive_worker` 只在正常退出时自己排空）。
+                        // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：主线程
+                        // 可能正 park 着等一个再也不会到来的事件。还要放弃自己队列里的积压
+                        // 任务：它们再也不会被 poll，而某个作用域可能正在 join 它们（调度
+                        // 循环只在自己正常退出时才排空）。
                         let report_fatal = |err| {
                             let mut guard =
                                 thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,9 +157,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                         let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
-                        if let Err(err) =
-                            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)
-                        {
+                        if let Err(err) = shared_ref.run_worker() {
                             report_fatal(err);
                         }
                     })
@@ -210,82 +199,27 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 return Err(err);
             }
 
-            let waker = create_waker(signal.clone());
-            let mut cx = Context::from_waker(&waker);
-
-            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)?;
-
+            // 主线程就是 0 号 worker：外层 future 作为循环的「退出条件」交给统一调度循环
+            // 驱动，不再手写第二份 pop 链（RUNTIME_REVIEW §2.1 / §2.2）。
             let mut fut = pin!(f(ctx));
-            let block_res = loop {
-                if let Some(err) = thread_errors
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                {
-                    break Err(err);
-                }
+            let mut controller = BlockOnController::new(fut.as_mut(), signal.clone());
+            let loop_res = run_worker_loop(shared_ref, &mut controller);
 
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(res) => {
-                        break Ok(res);
-                    }
-                    Poll::Pending => {
-                        while !signal.is_notified() {
-                            let mut progressed = false;
-                            if let Some(task) = shared_ref.base.fn_pop_send(0) {
-                                shared_ref.base.poll_send_task(0, task)?;
-                                progressed = true;
-                            } else if let Some(task) = shared_ref.base.fn_pop_pinned(0) {
-                                shared_ref.base.poll_send_task(0, task)?;
-                                progressed = true;
-                            } else if let Some(task) = shared_ref.base.fn_pop_local(0) {
-                                shared_ref.base.poll_local_task(0, task)?;
-                                progressed = true;
-                            } else if let Some(task) = shared_ref.base.pop_global() {
-                                shared_ref.base.poll_send_task(0, task)?;
-                                progressed = true;
-                            } else if let Some(task) =
-                                shared_ref.base.registry.workers[0].remote_queue.pop()
-                            {
-                                shared_ref.base.poll_send_task(0, task)?;
-                                progressed = true;
-                            }
-
-                            if !progressed {
-                                break;
-                            }
-                        }
-
-                        if !signal.try_reset() {
-                            let decision = match shared_ref.idle_hook {
-                                Some(h) => match h(shared_ref) {
-                                    Ok(dec) => dec,
-                                    Err(err) => break Err(err),
-                                },
-                                None => IdleDecision::wait(IdleWaitStrategy::Block),
-                            };
-                            match decision {
-                                IdleDecision::Continue => thread::yield_now(),
-                                IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
-                                    let _ = signal.wait_timeout(d);
-                                }
-                                IdleDecision::Wait(IdleWaitStrategy::Block) => signal.wait(),
-                            }
-                        }
-                    }
-                }
-            };
-
-            if block_res.is_ok()
-                && let Some(err) = thread_errors
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
+            // worker 线程的致命错误优先于循环自身的退出原因：循环正是被它触发的 shutdown
+            // 叫停的（RUNTIME_REVIEW §1.11）。
+            if let Some(err) = thread_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
             {
                 return Err(err);
             }
+            loop_res?;
 
-            block_res
+            match controller.take_output() {
+                Some(res) => Ok(res),
+                None => RuntimeError::ShutdownBeforeCompletion.trans(),
+            }
         });
 
         res

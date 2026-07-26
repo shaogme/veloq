@@ -204,24 +204,59 @@ impl Signal {
     }
 }
 
-pub fn create_waker(signal: Arc<Signal>) -> Waker {
-    let raw = Arc::into_raw(signal) as *const ();
-    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+/// `block_on` 那个外层 future 的唤醒目标。
+///
+/// 主线程既是 0 号 worker、又是唯一驱动外层 future 的地方，所以一次唤醒必须同时做两件
+/// 事：记下「外层 future 需要重新 poll」，以及把主线程从调度循环的 park 里叫回来 ——
+/// park 可能是 [`Unparker`] 的内置信号，也可能是 `park_hook` 里的驱动等待，两者都只认
+/// unpark（RUNTIME_REVIEW §2.1 / §2.2）。
+pub(crate) struct BlockOnSignal {
+    ready: Signal,
+    unparker: Unparker,
 }
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(
+impl BlockOnSignal {
+    /// 初始状态就是「待 poll」：外层 future 必须先被 poll 一次才可能注册任何 waker。
+    pub(crate) fn new(unparker: Unparker) -> Arc<Self> {
+        Arc::new(Self {
+            ready: Signal::new(true),
+            unparker,
+        })
+    }
+
+    pub(crate) fn notify(&self) {
+        self.ready.notify();
+        self.unparker.unpark();
+    }
+
+    /// 取走「待 poll」标记；返回 `true` 表示本轮应当 poll 外层 future。
+    pub(crate) fn take_ready(&self) -> bool {
+        self.ready.try_reset()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.is_notified()
+    }
+}
+
+pub(crate) fn create_block_on_waker(signal: Arc<BlockOnSignal>) -> Waker {
+    let raw = Arc::into_raw(signal) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &BLOCK_ON_VTABLE)) }
+}
+
+static BLOCK_ON_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |p| unsafe {
-        Arc::increment_strong_count(p as *const Signal);
-        RawWaker::new(p, &VTABLE)
+        Arc::increment_strong_count(p as *const BlockOnSignal);
+        RawWaker::new(p, &BLOCK_ON_VTABLE)
     },
     |p| unsafe {
-        Arc::from_raw(p as *const Signal).notify();
+        Arc::from_raw(p as *const BlockOnSignal).notify();
     },
     |p| unsafe {
-        ManuallyDrop::new(Arc::from_raw(p as *const Signal)).notify();
+        ManuallyDrop::new(Arc::from_raw(p as *const BlockOnSignal)).notify();
     },
     |p| unsafe {
-        drop(Arc::from_raw(p as *const Signal));
+        drop(Arc::from_raw(p as *const BlockOnSignal));
     },
 );
 
@@ -255,11 +290,20 @@ pub trait RuntimeWaker: Send + Sync {
 }
 
 pub(crate) struct UnparkerInner {
-    pub(crate) waker: OnceLock<Arc<dyn RuntimeWaker>>,
+    /// 没有 `park_hook` 时 worker 就阻塞在这个信号上。
+    signal: Signal,
+    waker: OnceLock<Arc<dyn RuntimeWaker>>,
 }
 
 impl UnparkerInner {
+    /// 两个目标都要通知。
+    ///
+    /// `bind` 之前的唤醒只能落到内置信号上 —— 旧实现在未绑定时静默什么都不做，等于丢
+    /// 唤醒；而绑定了驱动 waker 的 worker 阻塞在驱动里、看不到信号，只能靠 waker 叫醒
+    /// （RUNTIME_REVIEW §1.13）。信号侧的额外成本只有一次 swap：状态停在「已通知」之后
+    /// 就不会再发系统调用。
     fn wake(&self) {
+        self.signal.notify();
         if let Some(waker) = self.waker.get() {
             waker.wake();
         }
@@ -281,6 +325,7 @@ impl Unparker {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(UnparkerInner {
+                signal: Signal::new(false),
                 waker: OnceLock::new(),
             }),
         }
@@ -292,6 +337,16 @@ impl Unparker {
 
     pub fn unpark(&self) {
         self.inner.wake();
+    }
+
+    /// 阻塞直到本 worker 被 unpark。运行时未安装 `park_hook` 时的默认 park 实现。
+    pub(crate) fn park(&self) {
+        self.inner.signal.wait();
+    }
+
+    /// 带超时的 [`Self::park`]。
+    pub(crate) fn park_timeout(&self, timeout: Duration) {
+        self.inner.signal.wait_timeout(timeout);
     }
 }
 
@@ -638,7 +693,62 @@ impl EventCount {
 
     /// 产生一个新事件（例如有新任务入队）。
     /// 这将递增序列号，从而使所有持有旧快照的 Worker 意识到状态已变。
+    ///
+    /// **必须在工作真正可见之后调用**（任务已 push 进队列）。反过来先 bump 再入队会打开
+    /// 一个丢唤醒的窗口：worker 读到新序列号 → 检查队列（任务还没进去）→ `should_retry`
+    /// 认为无事发生 → 安心 park（RUNTIME_REVIEW §1.10）。
     pub fn notify(&self) {
         self.state.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread::sleep, time::Duration};
+
+    /// 已经发生过的 unpark 必须被记住：worker 检查完队列到真正睡下去之间存在窗口，
+    /// 落在窗口里的唤醒若被丢弃就是死锁（RUNTIME_REVIEW §1.13）。
+    #[test]
+    fn unpark_before_park_does_not_block() {
+        let unparker = Unparker::new();
+        unparker.unpark();
+        unparker.park();
+    }
+
+    /// 未 `bind` 任何驱动 waker 时，`unpark` 也必须能把线程从 `park` 里叫回来 ——
+    /// 旧实现在这种情况下静默什么都不做。
+    #[test]
+    fn park_wakes_on_unpark_from_another_thread() {
+        let unparker = Unparker::new();
+        // 消耗掉可能存在的初始状态，确保真的会睡下去。
+        assert!(!unparker.inner.signal.is_notified());
+
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                sleep(Duration::from_millis(20));
+                unparker.unpark();
+            });
+            unparker.park();
+        });
+    }
+
+    /// 带超时的 park 不会因为没人唤醒而永久阻塞。
+    #[test]
+    fn park_timeout_returns_without_an_unpark() {
+        let unparker = Unparker::new();
+        unparker.park_timeout(Duration::from_millis(5));
+    }
+
+    /// `BlockOnSignal` 初始就是「待 poll」，且取走一次之后不会重复触发。
+    #[test]
+    fn block_on_signal_starts_ready_and_is_consumed_once() {
+        let signal = BlockOnSignal::new(Unparker::new());
+        assert!(signal.is_ready());
+        assert!(signal.take_ready());
+        assert!(!signal.take_ready());
+
+        signal.notify();
+        assert!(signal.take_ready());
     }
 }

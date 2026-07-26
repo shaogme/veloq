@@ -59,6 +59,9 @@ set! {
         #[display("runtime binding is missing")]
         MissingRuntimeBinding,
 
+        #[display("the runtime shut down before the entry future completed")]
+        ShutdownBeforeCompletion,
+
         #[display("arena layout overflow during {op}")]
         ArenaLayoutOverflow {
             op: &'static str,

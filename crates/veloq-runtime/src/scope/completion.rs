@@ -7,7 +7,13 @@ use crate::{
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
 use std::{
-    any::Any, marker::PhantomData, pin::Pin, ptr::NonNull, sync::atomic::Ordering, task::Waker,
+    any::Any,
+    future::Future,
+    marker::{PhantomData, PhantomPinned},
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::Ordering,
+    task::{Context, Poll, Waker},
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_storage::{
@@ -26,6 +32,15 @@ impl<S: ScopeStorage> ScopeWakerNode<S> {
     fn new(waker: &Waker) -> Self {
         Self {
             waker: waker.clone(),
+            link: Link::new(),
+            marker: PhantomData,
+        }
+    }
+
+    /// 尚未拿到真正 waker 的空节点：`register` 第一次被调用时才填上。
+    fn detached() -> Self {
+        Self {
+            waker: Waker::noop().clone(),
             link: Link::new(),
             marker: PhantomData,
         }
@@ -56,6 +71,57 @@ impl<S: ScopeStorage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, 
         unsafe {
             self.completion.remove_waiter(node);
         }
+    }
+}
+
+/// 等待一个作用域内全部子任务结束的 future。
+///
+/// 「等待」必须由 waker 驱动。旧的 `wait_all` 是一个体内没有 `.await` 的 `async fn`：它
+/// 同步跑一整个调度循环直到 `remaining == 0`，于是 await 一个 handle 实际等的是整个作用
+/// 域、栈深度随作用域嵌套线性增长、外层 `select!` / 超时永远拿不到控制权，非 worker 线程
+/// 上还会直接 panic（RUNTIME_REVIEW §2.1）。驱动完成队列的职责只属于 worker 顶层循环。
+pub(crate) struct ScopeJoinFuture<'a, S: ScopeStorage, O: Ownership> {
+    completion: &'a GenericScopeCompletion<S, O>,
+    /// 侵入式节点，入链后地址必须稳定 —— 靠 `!Unpin` 保证。
+    node: ScopeWakerNode<S>,
+    _pin: PhantomPinned,
+}
+
+impl<'a, S: ScopeStorage, O: Ownership> ScopeJoinFuture<'a, S, O> {
+    pub(crate) fn new(completion: &'a GenericScopeCompletion<S, O>) -> Self {
+        Self {
+            completion,
+            node: ScopeWakerNode::detached(),
+            _pin: PhantomPinned,
+        }
+    }
+}
+
+impl<'a, S: ScopeStorage, O: Ownership> Future for ScopeJoinFuture<'a, S, O> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let completion = this.completion;
+        if completion.is_done() {
+            return Poll::Ready(());
+        }
+
+        let node = unsafe { Pin::new_unchecked(&mut this.node) };
+        completion.register(node, cx.waker());
+
+        // 入链与「最后一个子任务结算」之间的窗口：`register` 之后再复查一次。
+        if completion.is_done() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<S: ScopeStorage, O: Ownership> Drop for ScopeJoinFuture<'_, S, O> {
+    fn drop(&mut self) {
+        unsafe { self.completion.remove_waiter(NonNull::from(&self.node)) };
     }
 }
 
@@ -147,14 +213,20 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
+    /// 注册（或刷新）一个「全部子任务结束」的等待者。
+    ///
+    /// 判据只有 `remaining == 0`，**不含**取消状态：取消只是请求，子任务还在跑，而结构化
+    /// 并发要求等到它们真正停下。把「已取消」也当成立即唤醒会让 [`ScopeJoinFuture`] 每次
+    /// poll 都被立刻唤醒，退化成忙转。取消本身会走 `cancel()` → `drain_wakers()`，等待者
+    /// 依然会被唤醒一次去复查。
     pub(crate) fn register(&self, mut node: Pin<&mut ScopeWakerNode<S>>, waker: &Waker) {
-        if self.remaining.load(Ordering::Acquire) == 0 || self.is_cancelled() {
+        if self.remaining.load(Ordering::Acquire) == 0 {
             waker.wake_by_ref();
             return;
         }
 
         let mut wakers = self.wakers.lock();
-        if self.remaining.load(Ordering::Acquire) == 0 || self.is_cancelled() {
+        if self.remaining.load(Ordering::Acquire) == 0 {
             drop(wakers);
             waker.wake_by_ref();
             return;

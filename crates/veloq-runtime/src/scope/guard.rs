@@ -48,11 +48,15 @@ impl<S: ScopeStorage, O: Ownership> ScopeTaskGuard<S, O> {
     }
 
     /// `NeedsCallerSettle`：义务尚在 guard 时由 guard 结算，已 handoff 时由 header ack。
+    ///
+    /// header 那一侧用幂等版本：`NeedsCallerSettle` 只是一次「已完成、尚未结算」的观察，
+    /// 而这个状态在 `TaskFinalizer::finalize` 里转瞬即逝，观察者可能与真正的结算者撞在
+    /// 一起，只有翻转 ACK 标记的一方才该去 `task_done`。
     pub(crate) fn settle_enqueue_failure<H: Storage>(&mut self, header: &GenericTaskHeader<H>) {
         if self.armed {
             self.settle();
         } else {
-            header.acknowledge_completion();
+            header.try_acknowledge_completion();
         }
     }
 }

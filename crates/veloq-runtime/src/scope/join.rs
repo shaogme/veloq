@@ -289,16 +289,13 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
 {
     type Output = JoinOutcome<T>;
 
+    /// 只做「查完成状态 → 未完成则注册 waker → `Pending`」，**不驱动调度器**。
+    ///
+    /// 旧实现每次 poll 的第一件事是跑一整个调度循环直到整个作用域结束，于是
+    /// `handle.await` 等的是本作用域的**所有**子任务，`select!` 的公平轮询完全失效，而在
+    /// 非 worker 线程上 poll 一个 handle 会因取不到 TLS 直接 panic（RUNTIME_REVIEW §2.1）。
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        if let Err(err) = this
-            .scope
-            .runtime()
-            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()))
-        {
-            return Poll::Ready(JoinOutcome::RuntimeErr(err));
-        }
-
         let arena = this.scope.arena();
         let waker_node = &mut this.waker_node;
         let reclaim = this.reclaim;

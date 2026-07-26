@@ -16,18 +16,30 @@ use veloq_tls::Tls;
 use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
-    runtime::primitives::{EventCount, Unparker, create_unpark_waker},
-    scope::{GenericScopeCompletion, ScopeCompletionRegistration},
+    runtime::primitives::{EventCount, Unparker},
+    scope::GenericScopeCompletion,
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
 };
 
 pub(crate) mod infra;
+pub(crate) mod worker_loop;
 
 use infra::{
-    AtomicBitset, GlobalInjector, IdleController, IdleSlots, IdleStack, NUMAGroup,
-    RuntimeProgressCoordinator, TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
+    AtomicBitset, GlobalInjector, IdleController, IdleSlots, IdleStack, NUMAGroup, TaskScheduler,
+    TopologyContext, WorkerQueue, WorkerRegistry,
 };
+pub(crate) use worker_loop::{BlockOnController, run_worker_loop};
+use worker_loop::{ScopeJoinController, ShutdownController};
+
+/// 每隔多少轮循环先看一次全局队列。
+///
+/// 单一公平性机制：旧实现同时有 `tick % 61` 和 `processed_tasks >= 64` 两套重叠的计数器，
+/// 而且后者在检查后无条件归零（即使没取到任务），两者互相干扰（RUNTIME_REVIEW §2.3）。
+const GLOBAL_QUEUE_INTERVAL: u32 = 61;
+
+/// 本地与全局队列都空时的偷取尝试次数。
+const STEAL_ATTEMPTS: usize = 4;
 
 /// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +205,11 @@ impl RuntimeSharedBase {
     }
 
     #[inline]
+    pub(crate) fn unparker(&self, worker_id: usize) -> &Unparker {
+        &self.registry.unparkers[worker_id]
+    }
+
+    #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
         if let Some(count) = NonZeroUsize::new(self.registry.workers.len()) {
             count
@@ -307,7 +324,6 @@ impl RuntimeSharedBase {
             return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
         if header.try_mark_queued() {
-            self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
             worker.pinned_count.fetch_add(1, Ordering::Release);
             if let Err(task) = worker.pinned_queue.push(task) {
@@ -315,6 +331,9 @@ impl RuntimeSharedBase {
                 Self::abandon_queued_task(&task);
                 return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
+            // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`
+            // （RUNTIME_REVIEW §1.10）。
+            self.idle.event_count.notify();
             self.wake_worker(worker_id);
             EnqueuePinnedOutcome::Enqueued
         } else {
@@ -405,17 +424,74 @@ impl RuntimeSharedBase {
             return;
         }
         if task.header().try_mark_queued() {
-            self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
+            // 两条分支都先让任务可见、再 bump 序列号（RUNTIME_REVIEW §1.10）。
             if let Err(task) = worker.remote_queue.push(task) {
                 self.scheduler.injector.push(task);
+                self.idle.event_count.notify();
                 let group_idx = self.topo.worker_to_group[worker_id];
                 self.idle
                     .wake_idle_in_group(group_idx, &self.topo, &self.registry);
             } else {
+                self.idle.event_count.notify();
                 self.wake_worker(worker_id);
             }
         }
+    }
+
+    /// 从当前 worker 可见的所有来源里取出一个任务并 poll；无事可做时返回 `false`。
+    ///
+    /// 这是**唯一**的取任务链：worker 线程、`block_on` 主线程、作用域析构 join 全部共用
+    /// 它，主 worker 因此也参与 work stealing 与公平性间隔（RUNTIME_REVIEW §2.2）。
+    ///
+    /// 调用方必须已经处于本 worker 的 TLS 上下文中（`rand` 就是从那里借来的）。
+    pub(crate) fn poll_next_task(
+        &self,
+        worker_id: usize,
+        tick: u32,
+        rand: &FastRand,
+    ) -> Result<bool> {
+        if tick.is_multiple_of(GLOBAL_QUEUE_INTERVAL)
+            && let Some(task) = self.pop_global()
+        {
+            self.poll_send_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        if let Some(task) = self.fn_pop_send(worker_id) {
+            self.poll_send_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        if let Some(task) = self.fn_pop_pinned(worker_id) {
+            self.poll_send_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        if let Some(task) = self.fn_pop_local(worker_id) {
+            self.poll_local_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        if let Some(task) = self.pop_global() {
+            self.poll_send_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        if let Some(task) = self.registry.workers[worker_id].remote_queue.pop() {
+            self.poll_send_task(worker_id, task)?;
+            return Ok(true);
+        }
+
+        for _ in 0..STEAL_ATTEMPTS {
+            if let Some(task) = self.steal_send(worker_id, rand) {
+                self.poll_send_task(worker_id, task)?;
+                return Ok(true);
+            }
+            spin_loop();
+        }
+
+        Ok(false)
     }
 }
 
@@ -493,8 +569,6 @@ impl<T> RuntimeShared<T> {
             .unwrap_or(usize::MAX);
 
         if current == worker_id && task.header().try_mark_queued() {
-            self.base.idle.event_count.notify();
-
             let worker = &self.base.registry.workers[worker_id];
             let header_ptr = task.header() as *const _ as *mut _;
             if worker
@@ -505,15 +579,15 @@ impl<T> RuntimeShared<T> {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_ok()
+                .is_err()
             {
-                self.wake_worker(worker_id);
-                return;
+                self.base.tls.with(|ctx| {
+                    ctx.worker.push(task);
+                });
             }
-
-            self.base.tls.with(|ctx| {
-                ctx.worker.push(task);
-            });
+            // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号
+            // （RUNTIME_REVIEW §1.10）。
+            self.base.idle.event_count.notify();
             self.wake_worker(worker_id);
             return;
         }
@@ -531,9 +605,9 @@ impl<T> RuntimeShared<T> {
     /// 任务持有的 `'env` 借用会悬垂（RUNTIME_REVIEW §1.4）。因此这里**没有**提前退出的
     /// 出口 —— 与 `std::thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
     ///
-    /// 正常情况下复用 `drive_worker`（含 work stealing 与 idle/park 协调）；运行时正在
-    /// 关停时 `drive_worker` 会立刻返回，退化为「排空自己的队列 + 让出 CPU」，而关停路径
-    /// 上每个 worker 退出前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
+    /// 正常情况下复用统一的调度循环（含 work stealing 与 idle/park 协调）；运行时正在关停
+    /// 时循环会立刻返回，退化为「排空自己的队列 + 让出 CPU」，而关停路径上每个 worker 退出
+    /// 前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
     pub(crate) fn join_scope<S: ScopeStorage, O: Ownership + 'static>(
         &self,
         completion: &O::Shared<GenericScopeCompletion<S, O>>,
@@ -550,7 +624,8 @@ impl<T> RuntimeShared<T> {
             if !self.base.shutdown.load(Ordering::Acquire) {
                 // 驱动出错也只能重试：把错误上报出去就意味着带着未结束的子任务返回，
                 // 而这里没有任何调用者能安全处理那种状态。
-                let _ = self.drive_worker::<S, O>(Some(completion));
+                let mut controller = ScopeJoinController::new(&**completion);
+                let _ = run_worker_loop(self, &mut controller);
                 continue;
             }
             if !self.drain_one_pending_task() {
@@ -559,137 +634,16 @@ impl<T> RuntimeShared<T> {
         }
     }
 
-    /// 从当前 worker 可见的队列里取出一个任务并 poll；无事可做时返回 `false`。
+    /// 关停期间的退化驱动：只排空自己看得见的队列，不进入 idle 协调。
     fn drain_one_pending_task(&self) -> bool {
         let base = &self.base;
-        base.tls.with(|ctx| {
-            let worker_id = ctx.worker_id;
-            if let Some(task) = base.fn_pop_send(worker_id) {
-                let _ = base.poll_send_task(worker_id, task);
-                return true;
-            }
-            if let Some(task) = base.fn_pop_pinned(worker_id) {
-                let _ = base.poll_send_task(worker_id, task);
-                return true;
-            }
-            if let Some(task) = base.fn_pop_local(worker_id) {
-                let _ = base.poll_local_task(worker_id, task);
-                return true;
-            }
-            if let Some(task) = base.pop_global() {
-                let _ = base.poll_send_task(worker_id, task);
-                return true;
-            }
-            if let Some(task) = base.registry.workers[worker_id].remote_queue.pop() {
-                let _ = base.poll_send_task(worker_id, task);
-                return true;
-            }
-            false
-        })
+        base.tls
+            .with(|ctx| base.poll_next_task(ctx.worker_id, 1, &ctx.rand))
+            .unwrap_or(false)
     }
 
-    pub(crate) fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
-        &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
-    ) -> Result<()> {
-        self.base.tls.with(move |ctx| -> Result<()> {
-            let worker_id = ctx.worker_id;
-
-            let worker_tick_hook = self.base.worker_tick_hook;
-
-            let waker = create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
-            let mut completion_registration =
-                completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
-
-            let mut tick = 0u32;
-            const INJECTOR_CHECK_INTERVAL: u32 = 61;
-            let mut processed_tasks = 0u32;
-
-            while !self.base.shutdown.load(Ordering::Acquire) {
-                let mut progressed = false;
-
-                if let Some(hook) = worker_tick_hook {
-                    hook();
-                }
-
-                if completion.map(|c| c.is_done()).unwrap_or(false) {
-                    return Ok(());
-                }
-
-                if completion.is_none() && worker_id == 0 {
-                    return Ok(());
-                }
-
-                tick = tick.wrapping_add(1);
-
-                if processed_tasks >= 64 {
-                    processed_tasks = 0;
-                    if let Some(task) = self.base.pop_global() {
-                        self.base.poll_send_task(worker_id, task)?;
-                        progressed = true;
-                    }
-                }
-
-                if !progressed && let Some(task) = self.base.fn_pop_send(worker_id) {
-                    self.base.poll_send_task(worker_id, task)?;
-                    progressed = true;
-                }
-
-                if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id) {
-                    self.base.poll_send_task(worker_id, task)?;
-                    progressed = true;
-                }
-
-                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id) {
-                    self.base.poll_local_task(worker_id, task)?;
-                    progressed = true;
-                }
-
-                if !progressed
-                    && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
-                    && let Some(task) = self.base.pop_global()
-                {
-                    self.base.poll_send_task(worker_id, task)?;
-                    progressed = true;
-                }
-
-                if !progressed
-                    && let Some(task) = self.base.registry.workers[worker_id].remote_queue.pop()
-                {
-                    self.base.poll_send_task(worker_id, task)?;
-                    progressed = true;
-                }
-
-                if progressed {
-                    processed_tasks = processed_tasks.wrapping_add(1);
-                    continue;
-                }
-
-                for _ in 0..4 {
-                    if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
-                        self.base.poll_send_task(worker_id, task)?;
-                        progressed = true;
-                        break;
-                    }
-                    spin_loop();
-                }
-
-                if progressed {
-                    processed_tasks = processed_tasks.wrapping_add(1);
-                    continue;
-                }
-
-                if let Some(registration) = completion_registration.as_mut() {
-                    registration.register(&waker);
-                }
-                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c))?;
-            }
-
-            // 因 shutdown 退出：队列里的积压任务再也不会被 poll，必须在此放弃它们并结算
-            // scope 义务，否则等待方（`wait_all` / 作用域析构 join）永远等不到 `remaining`
-            // 归零（RUNTIME_REVIEW §1.4 / §4.4）。
-            self.base.abandon_worker_backlog(worker_id);
-            Ok(())
-        })
+    /// worker 线程的调度循环入口：一直跑到运行时关停。
+    pub(crate) fn run_worker(&self) -> Result<()> {
+        run_worker_loop(self, &mut ShutdownController)
     }
 }

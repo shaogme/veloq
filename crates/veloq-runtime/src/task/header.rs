@@ -678,7 +678,18 @@ impl<S: Storage> GenericTaskHeader<S> {
                 EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
                 EnqueuePinnedOutcome::AbortedAcknowledged
                 | EnqueuePinnedOutcome::AlreadySettled => {}
-                EnqueuePinnedOutcome::NeedsCallerSettle => self.acknowledge_completion(),
+                // 唤醒一个已完成的任务时**不能**在这里结算。
+                //
+                // `NeedsCallerSettle` 只是一次观察：「已完成、尚未结算」。这个状态在
+                // `TaskFinalizer::finalize` 里转瞬即逝 —— 它先 `mark_completed_and_notify`，
+                // 之后才按引用计数结算。在窗口里替它结算有两重错：`remaining` 可能提前归零，
+                // 让 `wait_all` 放行、作用域析构、arena 连着任务节点一起释放，而 `finalize`
+                // 还在往那块内存里写（`exit_poll`）；随后 finalize 自己的结算也成了重复结算。
+                //
+                // 任务义务本来就由引用计数协议兜底：最后一个引用（任务自身或某个队列引用）
+                // 归还时一定会结算。非 pinned 的 `enqueue_send` / `enqueue_local` 在
+                // `is_completed()` 时也是直接返回，这里与它们保持一致。
+                EnqueuePinnedOutcome::NeedsCallerSettle => {}
             }
             return Ok(());
         }

@@ -11,11 +11,10 @@ use crate::{
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
         primitives::{EventCount, Unparker},
-        shared::RuntimeShared,
+        shared::{RuntimeShared, worker_loop::LoopController},
     },
-    scope::GenericScopeCompletion,
-    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHeader},
-    utils::{FastRand, ownership::Ownership},
+    task::{LocalTaskRef, SendTaskRef, TaskHeader},
+    utils::FastRand,
 };
 
 pub(crate) struct WorkerQueue {
@@ -485,10 +484,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         Self { shared, worker_id }
     }
 
-    pub(crate) fn run<S: ScopeStorage, O: Ownership>(
-        &self,
-        completion: Option<&GenericScopeCompletion<S, O>>,
-    ) -> Result<()> {
+    pub(crate) fn run<C: LoopController>(&self, controller: &C) -> Result<()> {
         let idle_decision = match self.shared.idle_hook {
             Some(h) => h(self.shared)?,
             None => IdleDecision::wait(IdleWaitStrategy::Block),
@@ -507,7 +503,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             group.idle_stack.push(self.worker_id, &base.topo.idle_slots);
         }
 
-        if self.should_retry(seq, completion) {
+        if self.should_retry(seq, controller) {
             self.leave_idle(group_idx);
             return Ok(());
         }
@@ -518,32 +514,35 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return Ok(());
         }
 
-        self.park(wait_strategy, completion)?;
+        self.park(wait_strategy)?;
         self.leave_idle(group_idx);
         Ok(())
     }
 
-    fn should_retry<S: ScopeStorage, O: Ownership>(
-        &self,
-        seq: usize,
-        completion: Option<&GenericScopeCompletion<S, O>>,
-    ) -> bool {
+    fn should_retry<C: LoopController>(&self, seq: usize, controller: &C) -> bool {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
             || self.shared.has_work(self.worker_id)
             || base.shutdown.load(Ordering::Acquire)
-            || completion.map(|c| c.is_done()).unwrap_or(false)
+            || controller.is_ready()
     }
 
-    fn park<S: ScopeStorage, O: Ownership>(
-        &self,
-        wait_strategy: IdleWaitStrategy,
-        _completion: Option<&GenericScopeCompletion<S, O>>,
-    ) -> Result<()> {
+    /// 真正让线程睡下去。
+    ///
+    /// 没有 `park_hook` 时**不能**退化成 `thread::yield_now()`：默认构建下 idle 决策就是
+    /// `Wait(Block)`，yield 意味着所有空闲 worker 100% 占用 CPU 死转（RUNTIME_REVIEW
+    /// §1.13）。每个 worker 的 [`Unparker`] 自带一个 futex / `WaitOnAddress` 信号，缺省时
+    /// 就阻塞在它上面 —— 而 `wake_worker` 一律走同一个 `Unparker`，唤醒路径无需分叉。
+    fn park(&self, wait_strategy: IdleWaitStrategy) -> Result<()> {
         if let Some(park_hook) = self.shared.park_hook {
             park_hook(self.shared, wait_strategy)?;
-        } else {
-            thread::yield_now();
+            return Ok(());
+        }
+
+        let unparker = self.shared.base.unparker(self.worker_id);
+        match wait_strategy {
+            IdleWaitStrategy::Block => unparker.park(),
+            IdleWaitStrategy::Timeout(timeout) => unparker.park_timeout(timeout),
         }
         Ok(())
     }

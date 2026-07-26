@@ -24,8 +24,8 @@ mod guard;
 mod join;
 mod router;
 
-pub(crate) use completion::ScopeCompletionRegistration;
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
+pub(crate) use completion::{ScopeCompletionRegistration, ScopeJoinFuture};
 pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
 use guard::ScopeTaskGuard;
@@ -187,10 +187,16 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         self.context.worker_id()
     }
 
+    /// 等待本作用域内派生的全部子任务结束。
+    ///
+    /// 真正的 `await`：未完成时把当前任务的 waker 挂到 completion 上并返回 `Pending`，由
+    /// worker 顶层循环继续跑别的任务 —— 这本就是 thread-per-core 应有的行为。因此它可以被
+    /// `select!` / 超时打断，也不再让栈深度随作用域嵌套增长（RUNTIME_REVIEW §2.1）。
+    ///
+    /// 子任务的 panic payload 在这里取走并重新抛出；被丢弃而没走到这里的作用域由 `Drop`
+    /// 负责上交给父作用域。
     pub async fn wait_all(&self) -> Result<()> {
-        self.context
-            .shared()
-            .drive_worker::<S, O>(Some(&self.completion))?;
+        ScopeJoinFuture::new(&*self.completion).await;
         if let Some(panic_info) = self.completion.take_panic() {
             resume_unwind(panic_info);
         }
