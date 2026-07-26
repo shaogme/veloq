@@ -1,7 +1,7 @@
 use crate::{
     error::{Result, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::sys},
-    task::{ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
+    task::{ScopeCancelWaiter, ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
 };
 use diagweave::prelude::*;
 use std::{
@@ -33,6 +33,8 @@ pub(crate) const STATE_WOKEN: usize = 1 << 5;
 pub(crate) const STATE_PINNED: usize = 1 << 6;
 pub(crate) const STATE_SCOPE_OBLIGATED: usize = 1 << 7;
 pub(crate) const STATE_SCOPE_ACKED: usize = 1 << 8;
+/// 任务已把自己的等待节点挂到所属 scope 的取消队列上。
+pub(crate) const STATE_CANCEL_ARMED: usize = 1 << 9;
 const WAKE_TOKEN_ALIVE: u32 = 1 << 0;
 const WAKE_TOKEN_ACTIVE_SHIFT: u32 = 1;
 const WAKE_TOKEN_ACTIVE_UNIT: u32 = 1 << WAKE_TOKEN_ACTIVE_SHIFT;
@@ -176,6 +178,8 @@ pub struct GenericTaskHeader<S: Storage> {
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     wake_token: Arc<TaskWakeToken<S>>,
     scope: UnsafeCell<ScopeRef<S>>,
+    /// 本任务在所属 scope 取消队列中的等待节点；由 scope 的取消令牌锁保护。
+    cancel_waiter: ScopeCancelWaiter,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
     vtable: &'static TaskVTable<S>,
@@ -205,6 +209,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             wake_token: Arc::new(TaskWakeToken::new()),
             scope: UnsafeCell::new(ScopeRef::dummy()),
+            cancel_waiter: ScopeCancelWaiter::new(),
             runtime: UnsafeCell::new(None),
             worker_id: S::Usize::new(0),
             vtable,
@@ -250,9 +255,58 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.scope_completion_ref().is_cancelled()
     }
 
+    /// 仅置位取消标记，**不唤醒**任务。
+    ///
+    /// 只用于「任务马上就会被 poll 到」或「唤醒路径本身失败」的场合（后者若在这里唤醒
+    /// 会无限递归）。其余场合一律用 [`Self::cancel_and_wake`]。
     #[inline]
     pub(crate) fn cancel(&self) {
         self.state.fetch_or(STATE_CANCELLED, Ordering::Release);
+    }
+
+    /// 请求取消，并唤醒任务让它去观察这个状态。
+    ///
+    /// 取消在本运行时是协作式的：任务只有被 poll 到才会看到 `STATE_CANCELLED`。一个正
+    /// 挂起的任务若不被唤醒，就要等到下一次自然唤醒（可能永远不来）才会结束，而
+    /// `wait_all` / 作用域析构都要等它结束（RUNTIME_REVIEW §2.4）。
+    #[inline]
+    pub(crate) fn cancel_and_wake(&self) {
+        let old = self.state.fetch_or(STATE_CANCELLED, Ordering::AcqRel);
+        if old & (STATE_CANCELLED | STATE_COMPLETED) != 0 {
+            return;
+        }
+        self.wake_by_ref();
+    }
+
+    /// 把任务自己挂到所属 scope 的取消队列上，使 scope 取消能唤醒它。
+    ///
+    /// 在任务第一次返回 `Pending`（即它不再位于任何队列中）时调用一次即可：waker 由同一个
+    /// `TaskWakeToken` 派生，跨 poll 稳定。返回 `false` 表示 scope 已取消 —— 调用方应当
+    /// 立刻按取消处理，因为取消队列可能已经被 drain 过了。
+    pub(crate) fn arm_scope_cancel_waiter(&self, waker: &Waker) -> bool {
+        if self.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED != 0 {
+            return true;
+        }
+
+        let waiter = NonNull::from(&self.cancel_waiter);
+        if !unsafe {
+            self.scope_completion_ref()
+                .link_cancel_waiter(waiter, waker)
+        } {
+            return false;
+        }
+        self.state.fetch_or(STATE_CANCEL_ARMED, Ordering::AcqRel);
+        true
+    }
+
+    /// 摘除取消等待节点。必须在 header 析构前完成：`Link` 在仍然入链时析构会 panic。
+    fn disarm_scope_cancel_waiter(&self) {
+        if self.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED == 0 {
+            return;
+        }
+        let waiter = NonNull::from(&self.cancel_waiter);
+        unsafe { self.scope_completion_ref().unlink_cancel_waiter(waiter) };
+        self.state.fetch_and(!STATE_CANCEL_ARMED, Ordering::AcqRel);
     }
 
     #[inline]
@@ -401,6 +455,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             return;
         }
 
+        self.disarm_scope_cancel_waiter();
         self.notify_completion_wakers();
     }
 
@@ -507,6 +562,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             return;
         }
 
+        self.disarm_scope_cancel_waiter();
         self.notify_completion_wakers();
         if self.decrement_ref_count() {
             self.try_acknowledge_completion();
@@ -693,6 +749,9 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 impl<S: Storage> Drop for GenericTaskHeader<S> {
     fn drop(&mut self) {
         self.wake_token.deactivate_and_wait();
+        // 必须先于 `cancel_waiter` 字段析构：`Link` 在仍然入链时析构会 panic，而留在
+        // scope 队列里的节点在 header 释放后就是悬垂指针。
+        self.disarm_scope_cancel_waiter();
     }
 }
 

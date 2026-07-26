@@ -302,9 +302,29 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
 impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     for GenericAsyncScope<'rt, 'scope, 'env, S, O, TExtra>
 {
+    /// 作用域析构必须 join，而不是只发一次取消信号。
+    ///
+    /// `spawn*` 接受 `&'env` 借用，子任务可能正在别的 worker 上持有这些借用运行；取消在本
+    /// 运行时是协作式的，「已取消」与「已停止」之间有任意长的窗口。正常路径由
+    /// `wait_all()` 兜底，但 `f` panic 和「整个 scope future 被丢弃」（`select!` 落败分支、
+    /// 超时、外层取消）这两条路径都绕过它 —— 那里若只发信号就返回，借用立刻悬垂
+    /// （RUNTIME_REVIEW §1.4）。这正是 `std::thread::scope` 必须在 `Drop` 里阻塞 join 的
+    /// 原因。
     fn drop(&mut self) {
         if !self.completion.is_done() {
             self.completion.cancel();
+            self.context.shared().join_scope::<S, O>(&self.completion);
+        }
+
+        // panic payload 的归属：正常路径由 `wait_all()` 取走并抛出。走到这里说明没人 join
+        // （上面那两条路径），payload 交给上一层 scope，由它的 `wait_all()` 抛出；已经没有
+        // 上一层时，只要当前不是在 unwind 中就地抛出，绝不静默丢弃（RUNTIME_REVIEW §1.12）。
+        if let Some(payload) = self.completion.take_panic() {
+            match self.completion.parent() {
+                Some(parent) => parent.report_panic(payload),
+                None if !std::thread::panicking() => resume_unwind(payload),
+                None => {}
+            }
         }
     }
 }

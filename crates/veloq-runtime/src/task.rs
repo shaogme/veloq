@@ -12,7 +12,7 @@ pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
-    ScopeParent, ScopeRef, ScopeStorage,
+    ScopeCancelWaiter, ScopeCancelWaiterAdapter, ScopeParent, ScopeRef, ScopeStorage,
 };
 
 use crate::error::Result as RuntimeResult;
@@ -259,7 +259,11 @@ where
                 return true;
             }
             Ok(Poll::Pending) => {
-                if header.is_cancelled() {
+                // 任务即将离开所有队列：先把自己挂到 scope 的取消队列上，之后取消才有人
+                // 唤醒它（RUNTIME_REVIEW §2.4）。挂载失败意味着 scope 已经取消，队列可能
+                // 已被 drain，只能就地结束。挂载后仍要复查一次，覆盖「入链」与「取消」
+                // 交错的窗口。
+                if !header.arm_scope_cancel_waiter(cx.waker()) || header.is_cancelled() {
                     finalizer.complete(Err(TaskError::Cancelled), is_local);
                     return true;
                 }

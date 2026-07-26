@@ -14,7 +14,7 @@ use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
 use crate::{
-    task::{AnySendScopeRef, OpaqueToken},
+    task::{AnySendScopeRef, OpaqueToken, ScopeCancelWaiter, ScopeCancelWaiterAdapter},
     utils::ownership::Ownership,
 };
 
@@ -304,10 +304,13 @@ pub struct GenericCancellationToken<S: Storage, O: Ownership> {
 pub type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
 pub type ParentSlot<S, O> =
     <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
+pub type CancelWaiterList<S> = <S as Storage>::Lock<LinkedList<ScopeCancelWaiterAdapter>>;
 
 pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     cancelled: S::Usize,
     wakers: S::WakerQueue,
+    /// 挂在本令牌上的任务等待节点（节点内联在 task header 里，可摘除）。
+    task_waiters: CancelWaiterList<S>,
     children: ChildList<S, O>,
     link: Link,
     parent: ParentSlot<S, O>,
@@ -317,24 +320,72 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
 intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
 
 impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
+    /// 摘下并唤醒本令牌上的全部等待者。
+    ///
+    /// 唤醒一律发生在**锁外**：`wake` 会把任务重新入队，可能同步走到
+    /// `unlink_cancel_waiter`（任务立刻完成），持锁唤醒即自锁。
+    fn wake_waiters(&self) {
+        let mut ready = self.wakers.take_all();
+        {
+            let mut waiters = self.task_waiters.lock();
+            while let Some(waiter) = waiters.pop_front() {
+                if let Some(waker) = unsafe { waiter.as_ref().get_ref().take_waker() } {
+                    ready.push(waker);
+                }
+            }
+        }
+
+        for waker in ready {
+            waker.wake();
+        }
+    }
+
+    /// 取消本令牌及其整棵子树。
+    ///
+    /// 用**显式工作栈**代替递归：递归深度等于令牌树深度（可栈溢出），而且旧实现是
+    /// 持父锁递归的 —— 唤醒范围覆盖整棵子树（RUNTIME_REVIEW §2.4）。这里每层只在锁内
+    /// 摘链并为子节点加一次强引用（否则出锁后子节点可能已被析构），唤醒与继续下探都在
+    /// 锁外进行。
     fn cancel_internal(&self) {
         if self
             .cancelled
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
 
-        let wakers = self.wakers.take_all();
-        for waker in wakers {
-            waker.wake();
-        }
+        self.wake_waiters();
 
-        let mut children = self.children.lock();
-        while let Some(child_inner) = children.pop_front() {
-            child_inner.cancel_internal();
+        let mut pending = self.detach_children();
+        while let Some(child) = pending.pop() {
+            let child_ref = unsafe { child.as_ref() };
+            if child_ref
+                .cancelled
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                child_ref.wake_waiters();
+                pending.extend(child_ref.detach_children());
+            }
+            // 归还上面在锁内加的那次强引用。
+            unsafe { O::decrement_strong_count(child.as_ptr() as *const Self) };
         }
+    }
+
+    /// 在锁内摘下所有子节点，并为每个子节点加一次强引用后交给调用方。
+    ///
+    /// 加引用是必需的：出锁之后父链表已不再保护子节点，`Drop for
+    /// GenericCancellationToken` 随时可能释放它们。
+    fn detach_children(&self) -> Vec<NonNull<Self>> {
+        let mut detached = Vec::new();
+        let mut children = self.children.lock();
+        while let Some(child) = children.pop_front() {
+            let ptr = unsafe { NonNull::from(child.get_unchecked_mut()) };
+            unsafe { O::increment_strong_count(ptr.as_ptr() as *const Self) };
+            detached.push(ptr);
+        }
+        detached
     }
 }
 
@@ -354,6 +405,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             inner: O::new(GenericCancellationTokenInner {
                 cancelled: S::Usize::new(0),
                 wakers: S::WakerQueue::new(),
+                task_waiters: S::Lock::new(LinkedList::new(ScopeCancelWaiterAdapter)),
                 children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<S, O>::new())),
                 link: Link::new(),
                 parent: S::Lock::new(None),
@@ -380,12 +432,72 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             return;
         }
 
+        // 同一个令牌被 link 到两个父亲会直接覆盖 prev/next 并损坏链表，`push_back` 自身
+        // 只会 panic。这里显式拒绝重复挂载（RUNTIME_REVIEW §2.4）。
+        debug_assert!(
+            !child.inner.link.is_linked(),
+            "cancellation token is already linked to a parent"
+        );
+        if child.inner.link.is_linked() {
+            return;
+        }
+
         unsafe {
             let child_ptr = NonNull::new_unchecked(
                 O::as_ptr(&child.inner) as *mut GenericCancellationTokenInner<S, O>
             );
             children.push_back(Pin::new_unchecked(&mut *child_ptr.as_ptr()));
         }
+    }
+
+    /// 把任务的等待节点挂到本令牌上；已取消时返回 `false` 且不入链。
+    ///
+    /// # Safety
+    ///
+    /// `waiter` 必须在被 `unlink_cancel_waiter` 摘除之前保持有效且地址稳定。
+    pub(crate) unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<ScopeCancelWaiter>,
+        waker: &Waker,
+    ) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+
+        {
+            let mut waiters = self.inner.task_waiters.lock();
+            unsafe {
+                let waiter_ref = waiter.as_ref();
+                waiter_ref.set_waker(waker);
+                if !waiter_ref.link.is_linked() {
+                    waiters.push_back(Pin::new_unchecked(&mut *waiter.as_ptr()));
+                }
+            }
+        }
+
+        if let Some(ref parent) = self.inner.cross_parent {
+            // 跨策略嵌套（local scope 挂在 send scope 下）走不了令牌树，只能退回
+            // 父 scope 的 waker 队列。
+            parent.register_cancel_waker(waker);
+        }
+
+        // 入链与取消之间的窗口：若此刻已被取消，队列可能已经被 drain 过，
+        // 由调用方按「已取消」处理。
+        !self.is_cancelled()
+    }
+
+    /// # Safety
+    ///
+    /// `waiter` 必须是先前传给 `link_cancel_waiter` 的同一个节点。
+    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>) {
+        let mut waiters = self.inner.task_waiters.lock();
+        if unsafe { waiter.as_ref().link.is_linked() } {
+            unsafe {
+                let mut cursor = waiters.cursor_mut_from_ptr(waiter);
+                cursor.remove();
+            }
+        }
+        let _ = unsafe { waiter.as_ref().take_waker() };
     }
 
     pub(crate) unsafe fn try_link_child_raw(&self, child_token_ptr: *const OpaqueToken) -> bool {
@@ -406,7 +518,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        if self.inner.cancelled.load(Ordering::SeqCst) != 0 {
+        if self.inner.cancelled.load(Ordering::Acquire) != 0 {
             return true;
         }
         if let Some(ref parent) = self.inner.cross_parent

@@ -1,6 +1,9 @@
 use crate::{
     runtime::primitives::GenericCancellationToken,
-    task::{AnyScopeRef, ErasedCancellationToken, RawScope, ScopeParent, ScopeStorage},
+    task::{
+        AnyScopeRef, ErasedCancellationToken, RawScope, ScopeCancelWaiter, ScopeParent,
+        ScopeStorage,
+    },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
 use std::{
@@ -200,18 +203,16 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 }
 
+/// panic payload 的抛出点只有 `wait_all()`（以及作用域析构时的上交路径），**不在这里**。
+///
+/// completion 由 `Arc`/`Rc` 持有，最后一个引用可能落在任意 worker 线程上（task header
+/// 通过 `ScopeRef` 持有引用），在这里 `resume_unwind` 等于把 panic 抛到一个与该作用域
+/// 毫无关系的线程上，诊断信息完全失真（RUNTIME_REVIEW §1.12）。走到这里还残留 payload
+/// 说明作用域析构时也没能把它交出去（例如根作用域正在 unwind），只能丢弃。
 impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
-        {
-            let mut wakers = self.wakers.lock();
-            while wakers.pop_front().is_some() {}
-        }
-
-        if let Some(panic_info) = self.take_panic()
-            && !std::thread::panicking()
-        {
-            std::panic::resume_unwind(panic_info);
-        }
+        let mut wakers = self.wakers.lock();
+        while wakers.pop_front().is_some() {}
     }
 }
 
@@ -256,6 +257,16 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
     #[inline]
     fn register_cancel_waker(&self, waker: &Waker) {
         self.cancel_token().register_waker(waker);
+    }
+
+    #[inline]
+    unsafe fn link_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>, waker: &Waker) -> bool {
+        unsafe { self.cancel_token().link_cancel_waiter(waiter, waker) }
+    }
+
+    #[inline]
+    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>) {
+        unsafe { self.cancel_token().unlink_cancel_waiter(waiter) }
     }
 
     #[inline]

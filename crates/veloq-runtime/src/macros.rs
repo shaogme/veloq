@@ -11,6 +11,14 @@ pub mod helpers;
 /// Use `biased;` immediately after `ctx;` to poll branches strictly in declaration order. This is more efficient
 /// for I/O completion models where polling may trigger a syscall or resource allocation.
 ///
+/// # Cancellation
+///
+/// `select!` does not implement cancellation itself: when the surrounding task has been
+/// cancelled it simply stops polling its branches and yields `Pending`, and the task
+/// machinery finishes the task with [`TaskError::Cancelled`](crate::task::TaskError::Cancelled)
+/// at the poll boundary. Cancellation is therefore observed at the same point for every
+/// form of the macro, single-branch included.
+///
 /// # Example
 /// ```ignore
 /// select! {
@@ -60,10 +68,11 @@ macro_rules! select {
             let mut __futures = &mut __futures;
 
             poll_fn(move |cx| {
+                // 取消走值而不是走 panic：返回 `Pending` 后由 `poll_task_internal` 统一按
+                // 取消结束任务（它在每次 poll 前后都检查取消状态）。`panic_any` 在
+                // `panic = "abort"` 下会直接终止进程（RUNTIME_REVIEW §1.6）。
                 if cx.is_cancelled() {
-                    use std::panic::panic_any;
-                    use $crate::task::TaskError;
-                    panic_any(TaskError::Cancelled);
+                    return Poll::Pending;
                 }
 
                 for __i in 0..BRANCHES {
@@ -93,12 +102,10 @@ macro_rules! select {
             let __start = $ctx.select_poll_start(BRANCHES as u32) as usize;
 
             poll_fn(move |cx| {
+                // 见 biased 分支的说明：取消返回 `Pending`，由任务层统一结束。
                 if cx.is_cancelled() {
-                    use std::panic::panic_any;
-                    use $crate::task::TaskError;
-                    panic_any(TaskError::Cancelled);
+                    return Poll::Pending;
                 }
-
 
                  for __i in 0..BRANCHES {
                     let __branch = (__start + __i) % BRANCHES;
@@ -187,46 +194,50 @@ macro_rules! select {
     (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.15 };
 }
 
+/// Runs `closure` inside a fresh thread-safe scope derived from the current task's scope.
+///
+/// Equivalent to [`RuntimeCtx::scope`](crate::runtime::RuntimeCtx::scope), which is what you
+/// should reach for when the closure's parameter type is already pinned down (a named `async
+/// fn`, for instance). The macro exists because an `async |s| ..` literal cannot infer the
+/// scope reference type on its own.
+///
+/// The macro **cannot** simply forward the literal to `RuntimeCtx::scope`: handing an `async`
+/// closure to a generic function whose bound still carries unresolved regions makes rustc
+/// demand that the closure be higher-ranked over those regions too, which async closures
+/// cannot be (`implementation of AsyncFnOnce is not general enough`). That is why the scope is
+/// built and driven here, calling the closure in the same body where its argument exists.
+/// Everything with actual semantics — parent lookup, `wait_all`, and the join/cancel/panic
+/// handling in [`AsyncScope`](crate::scope::AsyncScope)'s `Drop` — is shared with the method.
 #[macro_export]
 macro_rules! scope {
     ($ctx:expr, $closure:expr) => {
         async {
-            use std::future::poll_fn;
-            use std::task::Poll;
             use $crate::macros::helpers::{_constrain, _constrain_result};
             use $crate::scope::AsyncScope;
-            use $crate::task::RuntimeContextExt;
 
-            let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
-            let scope = AsyncScope::new(
-                $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx),
-                parent,
-            );
-            let s_ref = &scope;
-            let res = _constrain($closure)(s_ref).await;
+            let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
+            let __parent = $crate::runtime::current_scope().await;
+            let scope = AsyncScope::new(__ctx, __parent);
+            let res = _constrain($closure)(&scope).await;
             scope.wait_all().await?;
             _constrain_result(Ok(res))
         }
     };
 }
 
+/// Thread-local counterpart of [`scope!`]; see there for why the body is not a plain forward
+/// to [`RuntimeCtx::scope_local`](crate::runtime::RuntimeCtx::scope_local).
 #[macro_export]
 macro_rules! scope_local {
     ($ctx:expr, $closure:expr) => {
         async {
-            use std::future::poll_fn;
-            use std::task::Poll;
             use $crate::macros::helpers::{_constrain_local, _constrain_result};
             use $crate::scope::LocalAsyncScope;
-            use $crate::task::RuntimeContextExt;
 
-            let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
-            let scope = LocalAsyncScope::new(
-                $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx),
-                parent,
-            );
-            let s_ref = &scope;
-            let res = _constrain_local($closure)(s_ref).await;
+            let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
+            let __parent = $crate::runtime::current_scope().await;
+            let scope = LocalAsyncScope::new(__ctx, __parent);
+            let res = _constrain_local($closure)(&scope).await;
             scope.wait_all().await?;
             _constrain_result(Ok(res))
         }

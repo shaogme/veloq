@@ -113,14 +113,16 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             token.cancel();
         }
 
+        // 取消必须伴随一次唤醒，否则一个正挂起的任务要等到下一次自然唤醒才会观察到
+        // 取消状态，而 `await` / `wait_all` 都在等它结束（RUNTIME_REVIEW §2.4）。
         match &self.source {
             JoinSource::Direct { task, .. } => {
-                task.header().cancel();
+                task.header().cancel_and_wake();
             }
             JoinSource::Routed { state, resolved } => {
                 state.request_cancel();
                 if let Some(resolved) = resolved {
-                    resolved.task.header().cancel();
+                    resolved.task.header().cancel_and_wake();
                 } else {
                     state.cancel_ready_task_if_any();
                 }

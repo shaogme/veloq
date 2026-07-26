@@ -20,7 +20,7 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
-pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx};
+pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, current_scope};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
@@ -57,11 +57,18 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         self.shared.worker_count()
     }
 
+    /// Runs `f` to completion on this runtime.
+    ///
+    /// `f` is higher-ranked over the context lifetime, so `R` cannot mention it: the
+    /// `RuntimeCtx` (and anything derived from it) is confined to the call. Without that
+    /// bound `'rt` is picked by the caller and `async |ctx| ctx` hands back a dangling
+    /// context, because the `RuntimeShared` it points at lives in this frame
+    /// (RUNTIME_REVIEW §1.15).
     pub fn block_on<R, F>(mut self, f: F) -> Result<R>
     where
         T: 'rt,
         WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync,
-        F: AsyncFnOnce(RuntimeCtx<'rt, T>) -> R,
+        F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
@@ -137,6 +144,8 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
                         // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：
                         // 主线程可能正阻塞在 `signal.wait()` 上等一个再也不会到来的事件。
+                        // 还要放弃自己队列里的积压任务：它们再也不会被 poll，而某个作用域
+                        // 可能正在 join 它们（`drive_worker` 只在正常退出时自己排空）。
                         let report_fatal = |err| {
                             let mut guard =
                                 thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,6 +154,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                             }
                             drop(guard);
                             shared_ref.shutdown();
+                            shared_ref.base.abandon_worker_backlog(worker_id);
                             signal_ref.notify();
                         };
 
@@ -353,11 +363,13 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         }
     }
 
+    /// Builds the runtime and runs `f` on it. See [`Runtime::block_on`] for why `f` is
+    /// higher-ranked over the context lifetime.
     pub fn scope<'rt, 'env: 'rt, F, R>(self, f: F) -> Result<R>
     where
         T: 'rt,
         WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync + 'rt,
-        F: AsyncFnOnce(RuntimeCtx<'rt, T>) -> R,
+        F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
         let worker_count = self.worker_count.unwrap_or_else(|| {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())

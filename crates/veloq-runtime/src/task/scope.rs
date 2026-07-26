@@ -4,13 +4,61 @@ use crate::{
 };
 use std::{
     any::Any,
+    cell::UnsafeCell,
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::NonNull,
     task::Waker,
 };
+use veloq_intrusive_linklist::{Link, intrusive_adapter};
 use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage};
+
+/// 任务挂在所属 scope 取消队列上的等待节点。
+///
+/// 节点内联在 `GenericTaskHeader` 里，因此**不随存储策略泛型化** —— 一个
+/// `AtomicStorage` 的 scope 可以同时持有 local 与 send 两种任务（`spawn_local`），
+/// 类型化的链表装不下它们。`Link` 与 `Waker` 本身都与策略无关，节点字段一律在持有
+/// scope 取消令牌的锁时访问。
+pub struct ScopeCancelWaiter {
+    pub(crate) link: Link,
+    pub(crate) waker: UnsafeCell<Option<Waker>>,
+}
+
+intrusive_adapter!(pub ScopeCancelWaiterAdapter = ScopeCancelWaiter { link: Link });
+
+impl ScopeCancelWaiter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            link: Link::new(),
+            waker: UnsafeCell::new(None),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// 调用者必须持有所属取消令牌的锁。
+    pub(crate) unsafe fn set_waker(&self, waker: &Waker) {
+        let slot = unsafe { &mut *self.waker.get() };
+        match slot {
+            Some(existing) if existing.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// 调用者必须持有所属取消令牌的锁。
+    pub(crate) unsafe fn take_waker(&self) -> Option<Waker> {
+        unsafe { (*self.waker.get()).take() }
+    }
+}
+
+impl Default for ScopeCancelWaiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// 不透明的作用域句柄。
 ///
@@ -81,6 +129,16 @@ pub trait RawScope {
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeRef>;
     fn register_cancel_waker(&self, waker: &Waker);
+    /// 把任务自己的等待节点挂到本 scope 的取消队列上；已取消时返回 `false` 且不入链。
+    ///
+    /// # Safety
+    ///
+    /// `waiter` 必须在被 `unlink_cancel_waiter` 摘除之前保持有效且地址稳定。
+    unsafe fn link_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>, waker: &Waker) -> bool;
+    /// # Safety
+    ///
+    /// `waiter` 必须是先前传给 `link_cancel_waiter` 的同一个节点。
+    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>);
     /// # Safety
     ///
     /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
@@ -109,6 +167,15 @@ impl<S: Storage> RawScope for DummyScope<S> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
+    /// 哑作用域永远不会被取消，因此「已挂载」是成立的（虽然什么都没挂）。
+    unsafe fn link_cancel_waiter(
+        &self,
+        _waiter: NonNull<ScopeCancelWaiter>,
+        _waker: &Waker,
+    ) -> bool {
+        true
+    }
+    unsafe fn unlink_cancel_waiter(&self, _waiter: NonNull<ScopeCancelWaiter>) {}
     unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
         let dyn_ptr: *const dyn RawScope = self;
         unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
@@ -210,6 +277,26 @@ impl<S: Storage> ScopeRef<S> {
         unsafe { self.as_ref().register_cancel_waker(waker) }
     }
 
+    /// # Safety
+    ///
+    /// 见 [`RawScope::link_cancel_waiter`]。
+    #[inline]
+    pub(crate) unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<ScopeCancelWaiter>,
+        waker: &Waker,
+    ) -> bool {
+        unsafe { self.as_ref().link_cancel_waiter(waiter, waker) }
+    }
+
+    /// # Safety
+    ///
+    /// 见 [`RawScope::unlink_cancel_waiter`]。
+    #[inline]
+    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>) {
+        unsafe { self.as_ref().unlink_cancel_waiter(waiter) }
+    }
+
     #[inline]
     pub fn task_done(&self) {
         unsafe { self.as_ref().task_done() }
@@ -306,6 +393,11 @@ impl AnySendScopeRef {
     pub fn register_cancel_waker(&self, waker: &Waker) {
         unsafe { self.0.as_ref().register_cancel_waker(waker) }
     }
+
+    #[inline]
+    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        self.0.report_panic(payload);
+    }
 }
 
 impl Clone for AnyScopeRef {
@@ -356,6 +448,20 @@ impl AnyScopeRef {
         match self {
             Self::Local(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
             Self::Send(s) => s.register_cancel_waker(waker),
+        }
+    }
+
+    /// 把一份未被认领的 panic payload 交给上一层 scope。
+    ///
+    /// 子 scope 在没有 `wait_all()` 的路径上被丢弃时（`select!` 落败分支、外层 panic），
+    /// payload 不能就地 `resume_unwind`（那会在任意 worker 线程上抛出，见
+    /// RUNTIME_REVIEW §1.12），也不能静默丢弃，于是沿 scope 树上交，由某一层的
+    /// `wait_all()` 抛出。
+    #[inline]
+    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        match self {
+            Self::Local(s) => s.report_panic(payload),
+            Self::Send(s) => s.report_panic(payload),
         }
     }
 }

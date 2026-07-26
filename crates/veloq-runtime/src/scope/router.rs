@@ -324,7 +324,7 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         if let Some(raw) = self.outcome.load(Ordering::Acquire) {
             let inner = unsafe { raw.as_ref() };
             if let RoutedSpawnOutcomeInner::Ready(ready) = inner {
-                ready.task.header().cancel();
+                ready.task.header().cancel_and_wake();
             }
         }
     }

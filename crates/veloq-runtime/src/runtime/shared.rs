@@ -3,6 +3,7 @@ use std::{
     num::NonZeroUsize,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    thread,
 };
 
 use crossbeam_deque::Worker;
@@ -227,9 +228,52 @@ impl RuntimeSharedBase {
         }
     }
 
+    /// 放弃当前 worker 队列里的全部积压任务并结算它们的 scope 义务。
+    ///
+    /// 只在 worker 因 shutdown 退出调度循环时调用：这些任务已经不可能再被 poll，若不在
+    /// 这里终结，等待它们的作用域会永久挂起。任务体本身不在这里析构 —— 它随所属 arena /
+    /// 调用栈一起释放，与「入队失败」路径的约定一致。
+    pub(crate) fn abandon_worker_backlog(&self, worker_id: usize) {
+        let worker = &self.registry.workers[worker_id];
+
+        if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
+            Self::abandon_queued_task(&unsafe { SendTaskRef::from_header(header.as_ptr()) });
+        }
+        while let Ok(Some(task)) = self.tls.try_with(|ctx| ctx.worker.pop()) {
+            Self::abandon_queued_task(&task);
+        }
+        while let Some(task) = worker.pinned_queue.pop() {
+            worker.pinned_count.fetch_sub(1, Ordering::Release);
+            Self::abandon_queued_task(&task);
+        }
+        while let Some(task) = worker.local_queue.pop() {
+            worker.local_count.fetch_sub(1, Ordering::Release);
+            Self::abandon_queued_task(&task);
+        }
+        while let Some(task) = worker.remote_queue.pop() {
+            Self::abandon_queued_task(&task);
+        }
+    }
+
+    /// 运行时已关停时，入队等于把任务送进一个再也不会被 poll 的队列。
+    ///
+    /// 关停之后所有 worker 都在退出并放弃自己的积压任务，此时新入队的任务会被永远遗忘 ——
+    /// 等待它的作用域（`wait_all` / 析构 join）也就永远等不到 `remaining` 归零。取消唤醒
+    /// 一个挂起的任务恰好会走到这里，所以必须在这里终结它而不是入队。
+    fn abandon_if_shutdown<H: TaskHandleRef>(&self, task: &H) -> bool {
+        if !self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        task.header().abandon_before_enqueue();
+        true
+    }
+
     /// 将本地任务入队当前线程的本地队列。
     pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().is_completed() {
+            return Ok(());
+        }
+        if self.abandon_if_shutdown(&task) {
             return Ok(());
         }
         if task.header().try_mark_queued() {
@@ -258,6 +302,9 @@ impl RuntimeSharedBase {
                 return EnqueuePinnedOutcome::AlreadySettled;
             }
             return EnqueuePinnedOutcome::NeedsCallerSettle;
+        }
+        if self.abandon_if_shutdown(&task) {
+            return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
         if header.try_mark_queued() {
             self.idle.event_count.notify();
@@ -354,6 +401,9 @@ impl RuntimeSharedBase {
         if task.header().is_completed() {
             return;
         }
+        if self.abandon_if_shutdown(&task) {
+            return;
+        }
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
@@ -432,6 +482,9 @@ impl<T> RuntimeShared<T> {
         if task.header().is_completed() {
             return;
         }
+        if self.base.abandon_if_shutdown(&task) {
+            return;
+        }
 
         let current = self
             .base
@@ -470,6 +523,69 @@ impl<T> RuntimeShared<T> {
 
     pub(crate) fn shutdown(&self) {
         self.base.shutdown();
+    }
+
+    /// 阻塞直到 `completion` 的全部子任务真正结束。
+    ///
+    /// 这是结构化并发的最后一道保证：作用域析构时不能带着仍在运行的子任务返回，否则子
+    /// 任务持有的 `'env` 借用会悬垂（RUNTIME_REVIEW §1.4）。因此这里**没有**提前退出的
+    /// 出口 —— 与 `std::thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
+    ///
+    /// 正常情况下复用 `drive_worker`（含 work stealing 与 idle/park 协调）；运行时正在
+    /// 关停时 `drive_worker` 会立刻返回，退化为「排空自己的队列 + 让出 CPU」，而关停路径
+    /// 上每个 worker 退出前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
+    pub(crate) fn join_scope<S: ScopeStorage, O: Ownership + 'static>(
+        &self,
+        completion: &O::Shared<GenericScopeCompletion<S, O>>,
+    ) {
+        if self.base.tls.try_with(|ctx| ctx.worker_id).is_err() {
+            // 非 worker 线程上无法驱动调度器，只能等别的 worker 把子任务跑完。
+            while !completion.is_done() {
+                thread::yield_now();
+            }
+            return;
+        }
+
+        while !completion.is_done() {
+            if !self.base.shutdown.load(Ordering::Acquire) {
+                // 驱动出错也只能重试：把错误上报出去就意味着带着未结束的子任务返回，
+                // 而这里没有任何调用者能安全处理那种状态。
+                let _ = self.drive_worker::<S, O>(Some(completion));
+                continue;
+            }
+            if !self.drain_one_pending_task() {
+                thread::yield_now();
+            }
+        }
+    }
+
+    /// 从当前 worker 可见的队列里取出一个任务并 poll；无事可做时返回 `false`。
+    fn drain_one_pending_task(&self) -> bool {
+        let base = &self.base;
+        base.tls.with(|ctx| {
+            let worker_id = ctx.worker_id;
+            if let Some(task) = base.fn_pop_send(worker_id) {
+                let _ = base.poll_send_task(worker_id, task);
+                return true;
+            }
+            if let Some(task) = base.fn_pop_pinned(worker_id) {
+                let _ = base.poll_send_task(worker_id, task);
+                return true;
+            }
+            if let Some(task) = base.fn_pop_local(worker_id) {
+                let _ = base.poll_local_task(worker_id, task);
+                return true;
+            }
+            if let Some(task) = base.pop_global() {
+                let _ = base.poll_send_task(worker_id, task);
+                return true;
+            }
+            if let Some(task) = base.registry.workers[worker_id].remote_queue.pop() {
+                let _ = base.poll_send_task(worker_id, task);
+                return true;
+            }
+            false
+        })
     }
 
     pub(crate) fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
@@ -568,6 +684,11 @@ impl<T> RuntimeShared<T> {
                 }
                 RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c))?;
             }
+
+            // 因 shutdown 退出：队列里的积压任务再也不会被 poll，必须在此放弃它们并结算
+            // scope 义务，否则等待方（`wait_all` / 作用域析构 join）永远等不到 `remaining`
+            // 归零（RUNTIME_REVIEW §1.4 / §4.4）。
+            self.base.abandon_worker_backlog(worker_id);
             Ok(())
         })
     }

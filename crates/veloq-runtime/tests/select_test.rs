@@ -128,6 +128,36 @@ fn test_select_three_branches() {
     .unwrap();
 }
 
+/// 多分支 `select!` 的取消不再走 `panic_any`：所有分支都真正挂起时，取消必须唤醒任务、让
+/// `select!` 返回 `Pending`，再由任务层判定为取消（RUNTIME_REVIEW §1.6 + §2.4）。
+///
+/// 分支用的 `PendingFuture` 从不自我唤醒，所以只有 `cancel()` 带的那次唤醒能结束这个任务。
+#[test]
+fn test_select_multi_branch_cancellation() {
+    Runtime::<(), _>::scope(async |ctx| {
+        scope!(ctx, async |s| {
+            let handle = s.spawn_boxed(async move {
+                select! {
+                    ctx;
+                    _ = PendingFuture => 1,
+                    _ = PendingFuture => 2,
+                }
+            });
+
+            handle.cancel();
+
+            let res = handle.await;
+            match res {
+                JoinOutcome::TaskErr(TaskError::Cancelled) => {}
+                _ => panic!("Expected TaskError::Cancelled, got {:?}", res),
+            }
+        })
+        .await
+        .unwrap();
+    })
+    .unwrap();
+}
+
 #[test]
 fn test_select_cancellation() {
     Runtime::<(), _>::scope(async |ctx| {

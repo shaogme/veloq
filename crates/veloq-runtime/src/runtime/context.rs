@@ -16,8 +16,8 @@ use crate::{
     error::{Result, RuntimeError},
     scope::{AsyncScope, LocalAsyncScope},
     task::{
-        GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef, TaskHandleRef,
-        TaskHeader, TaskVTable,
+        AnyScopeRef, GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
+        TaskHandleRef, TaskHeader, TaskVTable,
     },
     utils::FastRand,
 };
@@ -97,9 +97,24 @@ pub(crate) struct RuntimeTlsInner {
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
+///
+/// `'rt` is carried by a marker rather than by a `&'rt RuntimeShared<T>` field on purpose.
+/// A reference field would imply `T: 'rt`, and a higher-ranked `for<'rt>` bound on the entry
+/// closure would then collapse into `T: 'static` — which rules out the intended use of the
+/// extra worker state (`veloq`'s `WorkerState<'reg>` borrows back into `RuntimeShared`).
+/// With the pointer, `for<'rt> AsyncFnOnce(RuntimeCtx<'rt, T>) -> R` is expressible for any
+/// `T`, and that bound is what keeps the context from escaping `block_on` inside `R`
+/// (RUNTIME_REVIEW §1.15).
 pub struct RuntimeCtx<'rt, T> {
-    shared: &'rt RuntimeShared<T>,
+    shared: NonNull<RuntimeShared<T>>,
+    /// 与 `&'rt RuntimeShared<T>` 同为协变，但不引入 `T: 'rt` 的隐式约束。
+    _marker: PhantomData<fn() -> &'rt ()>,
 }
+
+// 语义与被替换掉的 `&'rt RuntimeShared<T>` 完全一致：共享引用可跨线程当且仅当被指对象
+// 是 `Sync`。
+unsafe impl<'rt, T> Send for RuntimeCtx<'rt, T> where RuntimeShared<T>: Sync {}
+unsafe impl<'rt, T> Sync for RuntimeCtx<'rt, T> where RuntimeShared<T>: Sync {}
 
 impl<'rt, T> Copy for RuntimeCtx<'rt, T> {}
 
@@ -130,7 +145,10 @@ impl<'rt, T> IntoRuntimeCtx<'rt, T> for &RuntimeCtx<'rt, T> {
 
 impl<'rt, T> RuntimeCtx<'rt, T> {
     pub(crate) fn new(shared: &'rt RuntimeShared<T>) -> Self {
-        Self { shared }
+        Self {
+            shared: NonNull::from(shared),
+            _marker: PhantomData,
+        }
     }
 
     /// Returns the total worker count in the runtime.
@@ -150,7 +168,9 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
     /// Returns the shared runtime state.
     pub fn shared(&self) -> &'rt RuntimeShared<T> {
-        self.shared
+        // 由构造点保证：`RuntimeCtx` 只能从一个存活期覆盖 `'rt` 的 `&'rt RuntimeShared<T>`
+        // 建立，而 `'rt` 被入口闭包的 `for<'rt>` 约束封死在 `block_on` 内部。
+        unsafe { self.shared.as_ref() }
     }
 
     /// 为 `select!` 公平模式返回 `[0, branches)` 范围内的随机起始分支索引。
@@ -162,26 +182,34 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             .with(|ctx| ctx.rand.next_u32(branches))
     }
 
-    pub async fn scope<'env, 'scope, F, R>(&self, f: F) -> Result<R>
+    /// Runs `f` inside a fresh thread-safe scope derived from the current task's scope.
+    ///
+    /// Prefer this over [`scope!`](macro@crate::scope) whenever `f`'s parameter type is already
+    /// pinned down; the macro exists for `async |s| ..` literals, and explains in its own docs
+    /// why it cannot just forward here. `self` is taken by value (the context is `Copy`) so the
+    /// returned future owns everything it needs.
+    pub async fn scope<'env, 'scope, F, R>(self, f: F) -> Result<R>
     where
         'env: 'scope,
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, 'env, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let scope = AsyncScope::new(*self, parent);
+        let scope = AsyncScope::new(self, parent);
         let s_ref = &scope;
         let res = f(s_ref).await;
         scope.wait_all().await?;
         Ok(res)
     }
 
-    pub async fn scope_local<'env, 'scope, F, R>(&self, f: F) -> Result<R>
+    /// Thread-local counterpart of [`RuntimeCtx::scope`], forwarded to by
+    /// [`scope_local!`](crate::scope_local).
+    pub async fn scope_local<'env, 'scope, F, R>(self, f: F) -> Result<R>
     where
         'env: 'scope,
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, 'env, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let scope = LocalAsyncScope::new(*self, parent);
+        let scope = LocalAsyncScope::new(self, parent);
         let s_ref = &scope;
         let res = f(s_ref).await;
         scope.wait_all().await?;
@@ -332,6 +360,15 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             .try_with(|ctx| ctx.worker_id)
             .expect("Failed to get worker id: this should be invoked from a worker thread")
     }
+}
+
+/// 取当前任务所属的作用域，作为新建子作用域的父节点。
+///
+/// [`RuntimeCtx::scope`] 与 `scope!` / `scope_local!` 宏共用这一步：父作用域只能从当前
+/// 任务的 waker 上取，两边不能各写一份。
+#[doc(hidden)]
+pub async fn current_scope() -> Option<AnyScopeRef> {
+    poll_fn(|cx| Poll::Ready(cx.scope_completion())).await
 }
 
 pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
