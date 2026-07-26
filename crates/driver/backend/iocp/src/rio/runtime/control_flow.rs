@@ -453,8 +453,7 @@ impl RioState {
             .registry
             .create_rq((handle, fd), env)
             .push_ctx("scope", "rio.runtime.control_flow.ensure_actor")
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("fd", fd.to_string())
             .with_ctx("handle_raw", handle.raw().as_handle() as usize)
             .with_ctx("socket_raw", handle.raw().as_handle() as usize)
             .with_ctx("rq_depth", self.registry.rq_depth)

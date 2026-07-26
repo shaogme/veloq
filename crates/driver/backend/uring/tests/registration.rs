@@ -8,12 +8,15 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op::{
     IntoPlatformOp,
-    types::{Close, Fsync},
+    types::{Close as CoreClose, Fsync as CoreFsync},
 };
 use veloq_driver_uring::{
     FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError,
     UringOp, UringRawHandle, UringResult, UringSlotSpec, UringUserPayload,
 };
+
+type Close = CoreClose<UringRawHandle>;
+type Fsync = CoreFsync<UringRawHandle>;
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
@@ -100,8 +103,15 @@ fn stale_registered_fd_generation_rejected_on_submit() {
     assert_eq!(stale_fd.fixed_index(), fresh_fd.fixed_index());
     assert_ne!(stale_fd.generation(), fresh_fd.generation());
 
+    assert_stale_fsync_is_rejected(&mut driver, stale_fd);
+
+    driver.unregister_files(vec![fresh_fd]).unwrap();
+}
+
+/// Submits an `Fsync` on `fd` and asserts it is rejected before going in flight.
+fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
     let op = Fsync {
-        fd: stale_fd,
+        fd,
         datasync: false,
     };
     let (uring_kernel, payload) =
@@ -128,8 +138,6 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         matches!(recovered, Some(UringUserPayload::Fsync(_))),
         "payload should be recoverable after void failure"
     );
-
-    driver.unregister_files(vec![fresh_fd]).unwrap();
 }
 
 #[test]
@@ -277,7 +285,9 @@ fn close_owned_registered_file() {
         .into_iter()
         .next()
         .unwrap();
-    let idx = fd.fixed_index() as usize;
+    let index = fd
+        .fixed_index()
+        .expect("a default file table registers descriptors");
 
     let token = submit_test_op(&mut driver, Close { fd });
     let closed = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
@@ -291,41 +301,14 @@ fn close_owned_registered_file() {
         .into_iter()
         .next()
         .unwrap();
-    let stale_fd = IoFd::fixed_with_generation(idx as u32, fd.generation());
-    let op = Fsync {
-        fd: stale_fd,
-        datasync: false,
-    };
-    let (uring_kernel, payload) =
-        <Fsync as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
-    let mut uring_op: Option<UringOp> = Some(uring_kernel);
-    let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
-
-    match slot.submit(&mut uring_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => {
-            assert_eq!(*report.inner(), UringError::ResolveFd);
-        }
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("stale fd submit should fail before in-flight state, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("stale fd submit unexpectedly succeeded"),
-    }
-
-    let recovered = slot.recover_payload();
-    assert!(
-        matches!(recovered, Some(UringUserPayload::Fsync(_))),
-        "payload should be recoverable after void failure"
-    );
+    let stale_fd = IoFd::fixed_with_generation(index, fd.generation().unwrap());
+    assert_stale_fsync_is_rejected(&mut driver, stale_fd);
 
     driver.unregister_files(vec![fsync_fd]).unwrap();
 }
 
-/// Registers one file and returns its descriptor, asserting where it landed.
-fn register_one_beyond(driver: &mut UringDriver<'static>, capacity: u32) -> (std::fs::File, IoFd) {
+/// Registers one file past the kernel table and returns its direct descriptor.
+fn register_one_beyond(driver: &mut UringDriver<'static>) -> (std::fs::File, IoFd) {
     let file = std::fs::File::open("Cargo.toml").unwrap();
     let raw = raw_file(&file);
     let fd = driver
@@ -334,10 +317,10 @@ fn register_one_beyond(driver: &mut UringDriver<'static>, capacity: u32) -> (std
         .into_iter()
         .next()
         .unwrap();
-    assert!(
-        fd.fixed_index() >= capacity,
-        "expected a fallback slot past the kernel table, got index {}",
-        fd.fixed_index()
+    assert_eq!(
+        fd,
+        IoFd::direct(UringRawHandle::for_file(file.as_raw_fd())),
+        "a descriptor past the kernel table must carry its own raw fd"
     );
     (file, fd)
 }
@@ -350,7 +333,7 @@ fn a_full_file_table_falls_back_to_unregistered_descriptors() {
         return;
     };
 
-    let (_file, fd) = register_one_beyond(&mut driver, 1);
+    let (_file, fd) = register_one_beyond(&mut driver);
 
     let token = submit_test_op(
         &mut driver,
@@ -373,7 +356,7 @@ fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
         return;
     };
 
-    let (_file, fd) = register_one_beyond(&mut driver, 0);
+    let (_file, fd) = register_one_beyond(&mut driver);
 
     let token = submit_test_op(
         &mut driver,
@@ -391,45 +374,39 @@ fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
     driver.unregister_files(vec![fd]).unwrap();
 }
 
+/// Pins the trade a fallback descriptor makes, so it cannot be weakened silently.
+///
+/// A registered descriptor is an index plus a generation, and releasing its slot bumps that
+/// generation so the old descriptor is rejected (see
+/// `stale_registered_fd_generation_rejected_on_submit`). A fallback descriptor has no slot to
+/// bump: it *is* the fd. Unregistering one therefore leaves nothing behind that a later submit
+/// could catch, which is exactly why direct descriptors carry no use-after-close protection.
 #[test]
-fn a_released_fallback_slot_is_reused_with_a_fresh_generation() {
+fn a_fallback_descriptor_has_no_generation_to_invalidate() {
     let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
     else {
         return;
     };
 
-    let (_first, stale_fd) = register_one_beyond(&mut driver, 1);
-    driver.unregister_files(vec![stale_fd]).unwrap();
+    let (first, fd) = register_one_beyond(&mut driver);
+    assert!(fd.is_direct());
+    assert_eq!(fd.fixed_index(), None);
+    assert_eq!(fd.generation(), None);
 
-    let (_second, fresh_fd) = register_one_beyond(&mut driver, 1);
-    assert_eq!(stale_fd.fixed_index(), fresh_fd.fixed_index());
-    assert_ne!(stale_fd.generation(), fresh_fd.generation());
+    driver.unregister_files(vec![fd]).unwrap();
 
-    let op = Fsync {
-        fd: stale_fd,
-        datasync: false,
-    };
-    let (uring_kernel, payload) =
-        <Fsync as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
-    let mut uring_op: Option<UringOp> = Some(uring_kernel);
-    let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+    // Registering the *same* still-open file again yields an identical descriptor: there is no
+    // generation in it that unregistering could have moved on.
+    let raw = raw_file(&first);
+    let again = driver
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(again, fd);
 
-    match slot.submit(&mut uring_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::ResolveFd),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("stale fallback fd submit should fail before in-flight state, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => {
-            panic!("stale fallback fd submit unexpectedly succeeded")
-        }
-    }
-    let _ = slot.recover_payload();
-
-    driver.unregister_files(vec![fresh_fd]).unwrap();
+    driver.unregister_files(vec![again]).unwrap();
 }
 
 #[test]
@@ -450,18 +427,23 @@ fn close_owned_fallback_file() {
         .into_iter()
         .next()
         .unwrap();
-    assert!(fd.fixed_index() >= 1, "expected a fallback slot");
+    assert!(fd.is_direct(), "expected a fallback descriptor");
 
     let token = submit_test_op(&mut driver, Close { fd });
     let closed = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
     assert_eq!(closed, 0);
 
-    // The slot is back in the free list with a bumped generation, so the same index is handed
-    // out again and the stale descriptor no longer resolves.
-    let (_next, reused) = register_one_beyond(&mut driver, 1);
-    assert_eq!(reused.fixed_index(), fd.fixed_index());
-    assert_ne!(reused.generation(), fd.generation());
-    driver.unregister_files(vec![reused]).unwrap();
+    // The kernel already closed this fd, so the driver must have *forgotten* the handle it
+    // owned rather than dropped it. Linux hands out the lowest free fd, so reopening usually
+    // lands on the very number just released — unregistering the dead descriptor must not
+    // close that new file out from under us.
+    let reopened = std::fs::File::open("Cargo.toml").unwrap();
+    driver.unregister_files(vec![fd]).unwrap();
+    if reopened.as_raw_fd() == raw_fd {
+        reopened
+            .metadata()
+            .expect("closing a retired fallback descriptor must not close the reused fd");
+    }
 }
 
 #[test]

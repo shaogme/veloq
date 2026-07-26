@@ -71,8 +71,7 @@ macro_rules! submit_io_op {
             header.resolved_handle = Some(raw);
             ensure_iocp_association(&val.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
                 .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd_fixed_index", val.fd.fixed_index())
-                .with_ctx("fd_generation", val.fd.generation())
+                .with_ctx("fd", val.fd.to_string())
                 .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
@@ -86,8 +85,7 @@ macro_rules! submit_io_op {
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd_fixed_index", val.fd.fixed_index())
-                .with_ctx("fd_generation", val.fd.generation())
+                .with_ctx("fd", val.fd.to_string())
                 .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
@@ -117,8 +115,7 @@ macro_rules! submit_raw_io_op {
             header.resolved_handle = Some(raw);
             ensure_iocp_association(&fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
                 .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())

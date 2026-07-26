@@ -284,8 +284,7 @@ impl RioPreparedRequest {
         let socket_key = self.socket_key();
         error
             .push_ctx("scope", ctx.scope)
-            .with_ctx("fd_fixed_index", ctx.fd.fixed_index())
-            .with_ctx("fd_generation", ctx.fd.generation())
+            .with_ctx("fd", ctx.fd.to_string())
             .with_ctx("handle_raw", ctx.handle.raw().as_handle() as usize)
             .with_ctx("socket_raw", socket_key.as_handle() as usize)
             .with_ctx("user_data", self.token.index())

@@ -22,7 +22,7 @@ pub(crate) use state::{
     BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, IocpSlotSpec, Slot,
 };
 pub use state::{IocpOpState, OverlappedEntry};
-pub(crate) use submit::{SubmissionResult, resolve_fd_handle};
+pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
 
 use std::sync::Arc;
 
@@ -56,29 +56,29 @@ use veloq_driver_core::{
 // Type Aliases for Core Ops
 // ============================================================================
 
-pub(crate) type ReadFixed = ReadFixedBase;
+pub(crate) type ReadFixed = ReadFixedBase<IocpHandle>;
 pub(crate) type ReadRaw = ReadRawBase<IocpHandle>;
-pub(crate) type WriteFixed = WriteFixedBase;
+pub(crate) type WriteFixed = WriteFixedBase<IocpHandle>;
 pub(crate) type WriteRaw = WriteRawBase<IocpHandle>;
-pub(crate) type Recv = RecvBase;
-pub(crate) type OpSend = OpSendBase;
-pub(crate) type UdpRecv = UdpRecvBase;
-pub(crate) type UdpSend = UdpSendBase;
-pub(crate) type Close = CloseBase;
-pub(crate) type Fsync = FsyncBase;
+pub(crate) type Recv = RecvBase<IocpHandle>;
+pub(crate) type OpSend = OpSendBase<IocpHandle>;
+pub(crate) type UdpRecv = UdpRecvBase<IocpHandle>;
+pub(crate) type UdpSend = UdpSendBase<IocpHandle>;
+pub(crate) type Close = CloseBase<IocpHandle>;
+pub(crate) type Fsync = FsyncBase<IocpHandle>;
 pub(crate) type FsyncRaw = FsyncRawBase<IocpHandle>;
-pub(crate) type Connect = ConnectBase<SockAddrStorage>;
-pub(crate) type UdpConnect = UdpConnectBase<SockAddrStorage>;
-pub(crate) type Accept = AcceptBase<SockAddrStorage>;
-pub(crate) type SendTo = SendToBase;
-pub(crate) type SyncFileRange = SyncFileRangeBase;
+pub(crate) type Connect = ConnectBase<IocpHandle, SockAddrStorage>;
+pub(crate) type UdpConnect = UdpConnectBase<IocpHandle, SockAddrStorage>;
+pub(crate) type Accept = AcceptBase<IocpHandle, SockAddrStorage>;
+pub(crate) type SendTo = SendToBase<IocpHandle>;
+pub(crate) type SyncFileRange = SyncFileRangeBase<IocpHandle>;
 pub(crate) type SyncFileRangeRaw = SyncFileRangeRawBase<IocpHandle>;
-pub(crate) type Fallocate = FallocateBase;
+pub(crate) type Fallocate = FallocateBase<IocpHandle>;
 pub(crate) type FallocateRaw = FallocateRawBase<IocpHandle>;
-pub(crate) type UdpRecvFrom = UdpRecvFromBase;
+pub(crate) type UdpRecvFrom = UdpRecvFromBase<IocpHandle>;
 pub(crate) type Open = OpenBase;
 pub(crate) type Timeout = TimeoutBase;
-pub(crate) type Wakeup = WakeupBase;
+pub(crate) type Wakeup = WakeupBase<IocpHandle>;
 
 // ============================================================================
 // SubmitContext Definition

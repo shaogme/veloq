@@ -18,6 +18,7 @@ use crate::{
     },
     driver::IocpDriver,
     error::{IocpError, IocpResult},
+    op::locate_registered_slot,
     rio::RioState,
 };
 
@@ -124,45 +125,34 @@ impl HandleRegistry {
     }
 
     fn take_for_unregister(&mut self, fd: IoFd) -> Option<(u32, RegisteredHandle)> {
-        let idx = fd.fixed_index();
-        let slot = self.slots.get_mut(idx as usize)?;
-        if slot.generation != fd.generation() {
-            return None;
-        }
-        slot.handle.take().map(|entry| (idx, entry))
+        let idx = locate_registered_slot(fd, &self.slots).ok()?;
+        let index = u32::try_from(idx).ok()?;
+        self.slots[idx].handle.take().map(|entry| (index, entry))
     }
 
     fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(u32, RegisteredHandle)> {
-        let idx = fd.fixed_index();
-        let Some(slot) = self.slots.get_mut(idx as usize) else {
-            return IocpError::ResolveFd
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .attach_note("registered file descriptor index out of bounds");
-        };
+        let idx = locate_registered_slot(fd, &self.slots)?;
+        let index = u32::try_from(idx).map_err(|_| {
+            IocpError::Internal
+                .to_report()
+                .with_ctx("registered_index", idx)
+                .attach_note("registered file index exceeds IoFd range")
+        })?;
 
-        if slot.generation != fd.generation() {
-            return IocpError::ResolveFd
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("current_generation", slot.generation)
-                .attach_note("stale registered file descriptor generation");
-        }
-
-        match slot.handle.as_ref() {
+        match self.slots[idx].handle.as_ref() {
             Some(RegisteredHandle::Owned(_)) => Ok((
-                idx,
-                slot.handle
+                index,
+                self.slots[idx]
+                    .handle
                     .take()
                     .expect("owned registered handle disappeared during close"),
             )),
             Some(RegisteredHandle::Weak(_)) => IocpError::InvalidInput
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .attach_note("Close is only valid for owned registered file descriptors"),
+            // `locate_registered_slot` only returns occupied slots.
             None => IocpError::ResolveFd
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .attach_note("invalid registered file descriptor"),
         }
     }

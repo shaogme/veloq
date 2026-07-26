@@ -2,7 +2,7 @@ use crate::{
     config::{IoFd, IocpConfig, IocpHandle, RawHandle},
     driver::IocpDriver,
     error::IocpError,
-    op::IocpSlotSpec,
+    op::{IocpSlotSpec, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
 use std::{
@@ -18,10 +18,7 @@ use std::{
 use veloq_buf::{FixedBuf, NoopRegistrar};
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::{
-        IntoPlatformOp,
-        types::{ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
-    },
+    op::IntoPlatformOp,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
@@ -138,9 +135,7 @@ fn submit_raw_write_result(
     let (iocp_kernel, payload) = IntoPlatformOp::<IocpSlotSpec>::into_kernel_and_payload(op);
     let mut iocp_op = Some(iocp_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(
-        <WriteRaw<IocpHandle> as IntoPlatformOp<IocpSlotSpec>>::payload_into_erased(payload),
-    );
+    slot.set_payload(<WriteRaw as IntoPlatformOp<IocpSlotSpec>>::payload_into_erased(payload));
     slot.submit(&mut iocp_op)
 }
 
@@ -154,7 +149,7 @@ fn read_raw(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64, len: u
     let token = submit_test_op(driver, op);
     let record = wait_completion_record(driver, token, Duration::from_secs(5))
         .expect("raw read completion missing");
-    let completion = complete_from_record::<ReadRaw<IocpHandle>>(record);
+    let completion = complete_from_record::<ReadRaw>(record);
     let (result, mut op) = completion.into_parts();
     let bytes = result.expect("raw read completion failed");
     op.buf.set_len(bytes);

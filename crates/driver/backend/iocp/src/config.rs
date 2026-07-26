@@ -239,4 +239,4 @@ impl RegisteredSlot {
 }
 
 /// Type alias for I/O descriptors using RawHandle.
-pub type IoFd = CoreIoFd;
+pub type IoFd = CoreIoFd<IocpHandle>;

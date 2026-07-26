@@ -1,4 +1,4 @@
-use core::marker::PhantomData;
+use core::{fmt, marker::PhantomData};
 
 use diagweave::prelude::*;
 use std::net::SocketAddr;
@@ -30,38 +30,124 @@ impl<T> SlotSidecar for T where T: Default + Send {}
 // IoFd
 // ============================================================================
 
-/// Represents the source of an IO operation as a registered descriptor index.
+/// Names the descriptor an operation runs against.
+///
+/// A descriptor reaches the kernel one of two ways, and which one it is decided when the
+/// driver handed the descriptor out — not at submission time:
+///
+/// - [`Registered`](Self::Registered) is an index into the driver's descriptor registry paired
+///   with the generation that registration was handed out under. The generation is what makes
+///   use-after-close detectable: releasing a slot advances it, so a stale descriptor is
+///   rejected instead of silently naming whatever took the slot's place.
+/// - [`Direct`](Self::Direct) carries the platform handle itself, for descriptors that live
+///   outside the registry. Submitting one needs no registry lookup at all, and its
+///   [`RawHandleKind`] comes from the handle rather than from a table — but **it carries no
+///   generation**, so a `Direct` descriptor whose handle has been closed will silently name
+///   whatever the platform later assigns that same number. Producing one is a backend's
+///   decision; a backend that keeps every descriptor in its registry never does.
+///
+/// `H` is the backend's raw handle type, so this enum stays free of platform types the way a
+/// bare index did. Backends alias it once (`type IoFd = IoFd<UringRawHandle>`) and their own
+/// code never mentions the parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IoFd {
-    fixed_index: u32,
-    generation: u64,
+pub enum IoFd<H: Handle> {
+    /// A slot in the driver's descriptor registry.
+    Registered {
+        /// Index of the registry slot.
+        index: u32,
+        /// Generation the slot carried when this descriptor was handed out.
+        generation: u64,
+    },
+    /// A platform handle submitted as-is, with no registry entry behind it.
+    Direct(H),
 }
 
-impl IoFd {
-    /// Creates an IO descriptor from a registered descriptor index.
+impl<H: Handle> IoFd<H> {
+    /// Creates a registered descriptor at generation zero.
     pub const fn fixed(index: u32) -> Self {
-        Self {
-            fixed_index: index,
+        Self::Registered {
+            index,
             generation: 0,
         }
     }
 
-    /// Creates an IO descriptor from a registered descriptor index and generation.
+    /// Creates a registered descriptor with an explicit generation.
     pub const fn fixed_with_generation(index: u32, generation: u64) -> Self {
-        Self {
-            fixed_index: index,
-            generation,
+        Self::Registered { index, generation }
+    }
+
+    /// Creates a descriptor that carries the platform handle directly.
+    pub const fn direct(handle: H) -> Self {
+        Self::Direct(handle)
+    }
+
+    /// Returns the registry index and generation, or `None` for a direct descriptor.
+    pub const fn registered_parts(self) -> Option<(u32, u64)> {
+        match self {
+            Self::Registered { index, generation } => Some((index, generation)),
+            Self::Direct(_) => None,
         }
     }
 
-    /// Returns the registered descriptor index.
-    pub const fn fixed_index(self) -> u32 {
-        self.fixed_index
+    /// Returns the registry index, or `None` for a direct descriptor.
+    pub const fn fixed_index(self) -> Option<u32> {
+        match self {
+            Self::Registered { index, .. } => Some(index),
+            Self::Direct(_) => None,
+        }
     }
 
-    /// Returns the descriptor generation.
-    pub const fn generation(self) -> u64 {
-        self.generation
+    /// Returns the registration generation, or `None` for a direct descriptor.
+    pub const fn generation(self) -> Option<u64> {
+        match self {
+            Self::Registered { generation, .. } => Some(generation),
+            Self::Direct(_) => None,
+        }
+    }
+
+    /// Returns the platform handle, or `None` for a registered descriptor.
+    pub const fn direct_handle(self) -> Option<H> {
+        match self {
+            Self::Direct(handle) => Some(handle),
+            Self::Registered { .. } => None,
+        }
+    }
+
+    /// Whether this descriptor names a registry slot.
+    pub const fn is_registered(self) -> bool {
+        matches!(self, Self::Registered { .. })
+    }
+
+    /// Whether this descriptor carries its platform handle directly.
+    pub const fn is_direct(self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+}
+
+impl<H: RawHandleMeta> IoFd<H> {
+    /// The handle kind, when it can be told without consulting the registry.
+    ///
+    /// A registered descriptor returns `None`: only the registry knows what it points at.
+    pub fn direct_kind(self) -> Option<RawHandleKind> {
+        match self {
+            Self::Direct(handle) => Some(handle.kind()),
+            Self::Registered { .. } => None,
+        }
+    }
+}
+
+/// Renders a descriptor for diagnostics.
+///
+/// Backends attach this under a single `fd` context key rather than separate index and
+/// generation keys, because a direct descriptor has neither.
+impl<H: Handle + fmt::Debug> fmt::Display for IoFd<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registered { index, generation } => {
+                write!(f, "registered(index={index}, generation={generation})")
+            }
+            Self::Direct(handle) => write!(f, "direct({handle:?})"),
+        }
     }
 }
 

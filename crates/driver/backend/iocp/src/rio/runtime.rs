@@ -3,7 +3,7 @@ pub(crate) mod control_flow;
 use crate::{
     IoFd,
     config::{BorrowedRawHandle, SocketKey},
-    op::SubmissionResult,
+    op::{SubmissionResult, UdpRecvFrom},
     rio::{
         RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState,
         SocketRuntimeState,
@@ -15,7 +15,7 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::ffi::c_void;
 use veloq_buf::{BufferRegistrar, FixedBuf};
-use veloq_driver_core::{driver::OpToken, op::types::UdpRecvFrom};
+use veloq_driver_core::driver::OpToken;
 
 pub(crate) use control_flow::RioSocketActor;
 

@@ -84,8 +84,7 @@ pub(crate) fn submit_accept(
         .rio
         .try_acquire_socket_inflight_guard(raw.raw().actor_key())
         .push_ctx("scope", "submit_accept.acquire_socket_inflight")
-        .with_ctx("fd_fixed_index", user.fd.fixed_index())
-        .with_ctx("fd_generation", user.fd.generation())
+        .with_ctx("fd", user.fd.to_string())
         .with_ctx("listen_handle_raw", raw.raw().as_handle() as usize)
         .with_ctx("accept_socket_raw", accept_socket_raw)
         .with_ctx("user_data", header.token.index())

@@ -213,10 +213,12 @@ pub trait Driver {
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>, SlotError<Self::SlotSpec>>;
+    ) -> DriverResult<Vec<IoFd<Self::Raw>>, SlotError<Self::SlotSpec>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd>)
-    -> DriverResult<(), SlotError<Self::SlotSpec>>;
+    fn unregister_files(
+        &mut self,
+        files: Vec<IoFd<Self::Raw>>,
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>>;
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>>;
 
@@ -326,13 +328,13 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>, SlotError<Self::SlotSpec>> {
+    ) -> DriverResult<Vec<IoFd<Self::Raw>>, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.register_files(files))
     }
 
     fn unregister_files(
         &mut self,
-        files: Vec<IoFd>,
+        files: Vec<IoFd<Self::Raw>>,
     ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.unregister_files(files))
     }

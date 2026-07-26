@@ -2,19 +2,29 @@
 //!
 //! The kernel's registered file table is a fixed-size allocation sized by
 //! [`UringConfig::file_table_capacity`](crate::config::UringConfig::file_table_capacity). This
-//! table is the userspace mirror of it, plus the overflow area: slots past `fixed_capacity`
-//! have no kernel entry and their submissions carry the raw fd instead of a fixed index.
+//! table is the userspace mirror of it, one slot per kernel entry, and a descriptor pointing
+//! into it is an [`IoFd::Registered`] — an index plus the generation it was handed out under.
 //!
-//! Both kinds live in one `slots` vector so an [`IoFd`] means the same thing either way — a
-//! slot index plus a generation — and callers only learn which kind they got when they resolve
-//! it into an [`SqeFd`] at submission time.
+//! Descriptors that do not fit are handed out as [`IoFd::Direct`] instead, which carries the
+//! raw fd inside the descriptor itself: submitting one consults no table at all, and its
+//! [`RawHandleKind`] comes from the handle rather than from a slot. What the table still owes
+//! them is *ownership* — a descriptor registered from [`RegisterFd::Owned`] must stay open
+//! until it is unregistered — so owned fallback handles are parked in `direct_owned`, which is
+//! touched only on registration and unregistration, never on submission.
+//!
+//! The trade this makes is explicit: a direct descriptor has no generation, so it cannot
+//! detect use-after-close the way a registered one does. See [`FileTable::resolve`].
+//!
+//! [`RegisterFd::Owned`]: veloq_driver_core::driver::RegisterFd::Owned
 
 use crate::{
-    config::{FileTableExhaustion, IoFd, OwnedRawHandle, RawHandleKind},
+    config::{FileTableExhaustion, IoFd, OwnedRawHandle, RawHandleKind, UringRawHandle},
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
+use std::collections::HashMap;
 use tracing::warn;
+use veloq_driver_core::RawHandleMeta;
 
 const INITIAL_FILE_GENERATION: u64 = 1;
 
@@ -67,34 +77,16 @@ impl FileSlot {
     }
 }
 
-/// The slot indices a batch registration reserved, split by how they reach the kernel.
-///
-/// `fixed` is sorted ascending so consecutive runs can be pushed to the kernel in one
-/// `register_files_update`, and it always corresponds to the *first* `fixed.len()` inputs of the
-/// batch — the caller pairs entries with slots by walking `fixed` then `direct`.
-#[derive(Debug, Default)]
-pub(crate) struct ClaimedSlots {
-    pub(crate) fixed: Vec<u32>,
-    pub(crate) direct: Vec<u32>,
-}
-
-impl ClaimedSlots {
-    /// Every claimed index, in the order inputs were assigned to them.
-    #[inline]
-    pub(crate) fn in_input_order(&self) -> impl Iterator<Item = u32> + '_ {
-        self.fixed.iter().chain(self.direct.iter()).copied()
-    }
-}
-
 pub(crate) struct FileTable {
-    /// `slots[..fixed_capacity]` mirror the kernel table one-to-one; the rest are fallback
-    /// slots that exist only here. The vector tracks the high-water mark of concurrently
-    /// registered descriptors — released fallback slots go back to `free_direct` for reuse
-    /// rather than shrinking it, so an [`IoFd`] index stays meaningful for the driver's life.
+    /// One slot per kernel table entry; `slots.len() == fixed_capacity` once initialized.
     slots: Vec<FileSlot>,
     fixed_capacity: usize,
     free_fixed: Vec<u32>,
-    free_direct: Vec<u32>,
+    /// Handles owned by the driver behind an [`IoFd::Direct`], keyed by raw fd.
+    ///
+    /// Only [`RegisterFd::Owned`](veloq_driver_core::driver::RegisterFd::Owned) registrations
+    /// land here — a borrowed fallback descriptor is nothing but the number in the `IoFd`.
+    direct_owned: HashMap<i32, OwnedRawHandle>,
     exhaustion: FileTableExhaustion,
     initialized: bool,
     fallback_reported: bool,
@@ -106,7 +98,7 @@ impl FileTable {
             slots: Vec::new(),
             fixed_capacity: fixed_capacity as usize,
             free_fixed: Vec::new(),
-            free_direct: Vec::new(),
+            direct_owned: HashMap::new(),
             exhaustion,
             initialized: false,
             fallback_reported: false,
@@ -121,12 +113,6 @@ impl FileTable {
     #[inline]
     pub(crate) const fn fixed_capacity(&self) -> usize {
         self.fixed_capacity
-    }
-
-    /// Whether `index` owns an entry in the kernel's registered file table.
-    #[inline]
-    pub(crate) fn is_fixed(&self, index: u32) -> bool {
-        (index as usize) < self.fixed_capacity
     }
 
     /// Seeds the userspace mirror once the kernel table exists.
@@ -152,33 +138,56 @@ impl FileTable {
         Some(self.slots.get(index as usize)?.generation)
     }
 
-    /// Whether `fd` still names the registration it was handed out for.
+    /// Whether a registered descriptor still names the registration it was handed out for.
     #[inline]
-    pub(crate) fn matches_generation(&self, fd: IoFd) -> bool {
-        self.generation(fd.fixed_index()) == Some(fd.generation())
+    pub(crate) fn matches_generation(&self, index: u32, generation: u64) -> bool {
+        self.generation(index) == Some(generation)
     }
 
     /// Turns a user-facing descriptor into the form an SQE needs.
+    ///
+    /// The two variants are checked differently, and the difference is the whole point of the
+    /// split. A registered descriptor is validated against its slot: bounds, generation
+    /// (which is what makes a stale descriptor an error rather than a silent hit on whatever
+    /// took the slot's place), and the registered handle's kind. A direct descriptor carries
+    /// its handle, so the kind check reads straight off it and no lookup happens at all — but
+    /// there is **no generation to check**, so a direct descriptor whose fd has since been
+    /// closed resolves happily onto whatever the kernel has since assigned that number.
     pub(crate) fn resolve(
         &self,
         fd: IoFd,
         expected_kind: Option<RawHandleKind>,
         scope: &'static str,
     ) -> UringResult<SqeFd> {
-        let index = fd.fixed_index();
+        let (index, generation) = match fd {
+            IoFd::Direct(raw) => {
+                if let Some(expected_kind) = expected_kind {
+                    let current_kind = raw.kind();
+                    if current_kind != expected_kind {
+                        return UringError::ResolveFd
+                            .push_ctx("scope", scope)
+                            .with_ctx("fd", fd.to_string())
+                            .with_ctx("expected_kind", format!("{expected_kind:?}"))
+                            .with_ctx("current_kind", format!("{current_kind:?}"))
+                            .attach_note("direct file descriptor kind mismatch");
+                    }
+                }
+                return Ok(SqeFd::Direct(raw.as_fd()));
+            }
+            IoFd::Registered { index, generation } => (index, generation),
+        };
+
         let Some(slot) = self.slots.get(index as usize) else {
             return UringError::ResolveFd
                 .push_ctx("scope", scope)
-                .with_ctx("fd_fixed_index", index)
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .attach_note("registered file descriptor index out of bounds");
         };
 
-        if slot.generation != fd.generation() {
+        if slot.generation != generation {
             return UringError::ResolveFd
                 .push_ctx("scope", scope)
-                .with_ctx("fd_fixed_index", index)
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .attach_note("stale registered file descriptor generation")
                 .with_ctx("current_generation", slot.generation);
         }
@@ -186,8 +195,7 @@ impl FileTable {
         let Some(entry) = slot.entry.as_ref() else {
             return UringError::ResolveFd
                 .push_ctx("scope", scope)
-                .with_ctx("fd_fixed_index", index)
-                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("fd", fd.to_string())
                 .attach_note("invalid registered file descriptor");
         };
 
@@ -196,26 +204,25 @@ impl FileTable {
             if current_kind != expected_kind {
                 return UringError::ResolveFd
                     .push_ctx("scope", scope)
-                    .with_ctx("fd_fixed_index", index)
-                    .with_ctx("fd_generation", fd.generation())
+                    .with_ctx("fd", fd.to_string())
                     .with_ctx("expected_kind", format!("{expected_kind:?}"))
                     .with_ctx("current_kind", format!("{current_kind:?}"))
                     .attach_note("registered file descriptor kind mismatch");
             }
         }
 
-        Ok(if self.is_fixed(index) {
-            SqeFd::Fixed(index)
-        } else {
-            SqeFd::Direct(entry.fd())
-        })
+        Ok(SqeFd::Fixed(index))
     }
 
-    /// Reserves `count` slots, falling back past the kernel table when it is full.
+    /// Reserves up to `count` kernel table slots, ascending.
     ///
-    /// Nothing is written to the slots themselves — the caller fills them in with
-    /// [`Self::install_entry`] once it knows the kernel accepted the registration.
-    pub(crate) fn claim(&mut self, count: usize) -> UringResult<ClaimedSlots> {
+    /// Returns fewer than `count` when the table runs out; the caller hands the remainder out
+    /// as direct descriptors. Nothing is written to the slots themselves — the caller fills
+    /// them in with [`Self::install_entry`] once it knows the kernel accepted them.
+    ///
+    /// With [`FileTableExhaustion::Fail`] a short claim is an error instead, and nothing is
+    /// consumed.
+    pub(crate) fn claim(&mut self, count: usize) -> UringResult<Vec<u32>> {
         let from_kernel_table = count.min(self.free_fixed.len());
         let overflow = count - from_kernel_table;
 
@@ -240,37 +247,10 @@ impl FileTable {
         // sorting keeps that property visible to the batching in `register_files_internal`.
         fixed.sort_unstable();
 
-        let mut direct = Vec::with_capacity(overflow);
-        for _ in 0..overflow {
-            match self.claim_fallback_slot() {
-                Ok(index) => direct.push(index),
-                Err(report) => {
-                    // Undo the partial claim so a failure leaves the table untouched.
-                    self.release_all(fixed.drain(..).chain(direct.drain(..)));
-                    return Err(report);
-                }
-            }
-        }
-
         if overflow > 0 {
             self.report_fallback(overflow);
         }
-        Ok(ClaimedSlots { fixed, direct })
-    }
-
-    fn claim_fallback_slot(&mut self) -> UringResult<u32> {
-        if let Some(index) = self.free_direct.pop() {
-            return Ok(index);
-        }
-        let index = u32::try_from(self.slots.len()).map_err(|_| {
-            UringError::InvalidState
-                .to_report()
-                .push_ctx("scope", "driver.file_table.claim_fallback_slot")
-                .with_ctx("file_slots", self.slots.len())
-                .attach_note("registered file slot index exceeds the IoFd range")
-        })?;
-        self.slots.push(FileSlot::vacant());
-        Ok(index)
+        Ok(fixed)
     }
 
     fn report_fallback(&mut self, count: usize) {
@@ -285,6 +265,31 @@ impl FileTable {
         );
     }
 
+    /// Takes ownership of a handle handed out as a direct descriptor.
+    ///
+    /// The handle stays parked here until [`Self::release_direct`] retires it, which is what
+    /// keeps a `RegisterFd::Owned` fallback registration open for as long as its descriptor
+    /// is valid.
+    pub(crate) fn adopt_direct(&mut self, handle: OwnedRawHandle) -> IoFd {
+        let raw = handle.raw();
+        self.direct_owned.insert(raw.as_fd(), handle);
+        IoFd::direct(raw)
+    }
+
+    /// Whether the driver holds the handle behind a direct descriptor.
+    #[inline]
+    pub(crate) fn owns_direct(&self, raw: UringRawHandle) -> bool {
+        self.direct_owned.contains_key(&raw.as_fd())
+    }
+
+    /// Retires a direct descriptor, returning the handle when the driver owned one.
+    ///
+    /// Dropping the returned handle closes the fd; callers whose descriptor was already closed
+    /// by the kernel must forget it instead.
+    pub(crate) fn release_direct(&mut self, raw: UringRawHandle) -> Option<OwnedRawHandle> {
+        self.direct_owned.remove(&raw.as_fd())
+    }
+
     /// Stores the handle backing `index`. The slot must have been claimed first.
     #[inline]
     pub(crate) fn install_entry(&mut self, index: u32, entry: RegisteredFileEntry) {
@@ -296,17 +301,13 @@ impl FileTable {
         self.slots.get_mut(index as usize)?.entry.take()
     }
 
-    /// Returns `index` to its free list. The entry must already be gone.
+    /// Returns `index` to the free list. The entry must already be gone.
     pub(crate) fn release(&mut self, index: u32) {
         debug_assert!(
             self.entry(index).is_none(),
             "released a file slot that still owns a handle"
         );
-        if self.is_fixed(index) {
-            self.free_fixed.push(index);
-        } else {
-            self.free_direct.push(index);
-        }
+        self.free_fixed.push(index);
     }
 
     pub(crate) fn release_all(&mut self, indices: impl IntoIterator<Item = u32>) {
@@ -336,7 +337,7 @@ impl FileTable {
 #[cfg(test)]
 mod tests {
     use super::{FileTable, RegisteredFileEntry, SqeFd};
-    use crate::config::{FileTableExhaustion, IoFd, RawHandleKind};
+    use crate::config::{FileTableExhaustion, IoFd, RawHandleKind, UringRawHandle};
 
     fn borrowed(fd: i32) -> RegisteredFileEntry {
         RegisteredFileEntry::BorrowedFd {
@@ -351,17 +352,19 @@ mod tests {
         table
     }
 
-    /// Claims `count` slots and installs one entry per slot, returning the descriptors.
+    /// Registers `fds` the way `register_files_internal` does: kernel slots first, the rest as
+    /// direct descriptors.
     fn register(table: &mut FileTable, fds: &[i32]) -> Vec<IoFd> {
         let claimed = table.claim(fds.len()).expect("claim failed");
-        let indices = claimed.in_input_order().collect::<Vec<_>>();
-        for (index, fd) in indices.iter().copied().zip(fds.iter().copied()) {
+        let mut descriptors = Vec::with_capacity(fds.len());
+        for (index, fd) in claimed.iter().copied().zip(fds.iter().copied()) {
             table.install_entry(index, borrowed(fd));
+            descriptors.push(table.descriptor(index).expect("claimed slot exists"));
         }
-        indices
-            .into_iter()
-            .map(|index| table.descriptor(index).expect("claimed slot exists"))
-            .collect()
+        for fd in fds[claimed.len()..].iter().copied() {
+            descriptors.push(IoFd::direct(UringRawHandle::for_file(fd)));
+        }
+        descriptors
     }
 
     #[test]
@@ -380,14 +383,16 @@ mod tests {
     }
 
     #[test]
-    fn slots_past_the_capacity_resolve_to_raw_fds() {
+    fn descriptors_past_the_capacity_carry_their_raw_fd() {
         let mut table = table(2, FileTableExhaustion::Fallback);
         let fds = register(&mut table, &[10, 11, 12, 13]);
 
+        assert!(fds[1].is_registered());
         assert_eq!(
             table.resolve(fds[1], None, "test").unwrap(),
             SqeFd::Fixed(1)
         );
+        assert!(fds[2].is_direct());
         assert_eq!(
             table.resolve(fds[2], None, "test").unwrap(),
             SqeFd::Direct(12)
@@ -407,6 +412,28 @@ mod tests {
             table.resolve(fds[0], None, "test").unwrap(),
             SqeFd::Direct(7)
         );
+    }
+
+    #[test]
+    fn a_direct_descriptor_resolves_without_consulting_the_table() {
+        // Nothing was ever registered, yet the descriptor still submits: the fd is in it.
+        let table = table(4, FileTableExhaustion::Fallback);
+        let fd = IoFd::direct(UringRawHandle::for_file(9));
+
+        assert_eq!(table.resolve(fd, None, "test").unwrap(), SqeFd::Direct(9));
+    }
+
+    #[test]
+    fn a_direct_descriptor_is_kind_checked_against_its_own_handle() {
+        let table = table(4, FileTableExhaustion::Fallback);
+        let fd = IoFd::direct(UringRawHandle::for_file(9));
+
+        assert!(
+            table
+                .resolve(fd, Some(RawHandleKind::Socket), "test")
+                .is_err()
+        );
+        assert!(table.resolve(fd, Some(RawHandleKind::File), "test").is_ok());
     }
 
     #[test]
@@ -432,32 +459,32 @@ mod tests {
     }
 
     #[test]
-    fn released_fallback_slots_are_reused_before_new_ones() {
-        let mut table = table(1, FileTableExhaustion::Fallback);
-        let fds = register(&mut table, &[10, 11, 12]);
-        let reused = fds[2].fixed_index();
-
-        table.take_entry(reused);
-        table.release(reused);
-        table.advance_generation(reused);
-
-        let again = register(&mut table, &[13]);
-        assert_eq!(again[0].fixed_index(), reused);
-        assert_ne!(again[0].generation(), fds[2].generation());
-    }
-
-    #[test]
     fn a_released_slot_rejects_its_stale_descriptor() {
         let mut table = table(2, FileTableExhaustion::Fallback);
         let fds = register(&mut table, &[10]);
-        let index = fds[0].fixed_index();
+        let index = fds[0].fixed_index().expect("registered descriptor");
 
         table.take_entry(index);
         table.release(index);
         table.advance_generation(index);
 
         assert!(table.resolve(fds[0], None, "test").is_err());
-        assert!(!table.matches_generation(fds[0]));
+        assert!(!table.matches_generation(index, fds[0].generation().unwrap()));
+    }
+
+    #[test]
+    fn a_released_slot_is_reused_with_a_fresh_generation() {
+        let mut table = table(1, FileTableExhaustion::Fallback);
+        let fds = register(&mut table, &[10]);
+        let index = fds[0].fixed_index().expect("registered descriptor");
+
+        table.take_entry(index);
+        table.release(index);
+        table.advance_generation(index);
+
+        let again = register(&mut table, &[11]);
+        assert_eq!(again[0].fixed_index(), Some(index));
+        assert_ne!(again[0].generation(), fds[0].generation());
     }
 
     #[test]

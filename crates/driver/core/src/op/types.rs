@@ -1,4 +1,4 @@
-use crate::{IoFd, RawHandleMeta, SockAddr};
+use crate::{Handle, IoFd, RawHandleMeta, SockAddr};
 use veloq_buf::FixedBuf;
 
 #[repr(u16)]
@@ -25,8 +25,8 @@ pub enum OpKind {
 }
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed {
-    pub fd: IoFd,
+pub struct ReadFixed<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
     pub buf_offset: usize,
@@ -41,8 +41,8 @@ pub struct ReadRaw<H: RawHandleMeta> {
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed {
-    pub fd: IoFd,
+pub struct WriteFixed<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
     pub buf_offset: usize,
@@ -57,44 +57,44 @@ pub struct WriteRaw<H: RawHandleMeta> {
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv {
-    pub fd: IoFd,
+pub struct Recv<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send {
-    pub fd: IoFd,
+pub struct Send<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Receive data from a UDP socket into a fixed buffer.
-pub struct UdpRecv {
-    pub fd: IoFd,
+pub struct UdpRecv<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a UDP socket.
-pub struct UdpSend {
-    pub fd: IoFd,
+pub struct UdpSend<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Connect a socket to a remote address.
-pub struct Connect<A: SockAddr> {
-    pub fd: IoFd,
+pub struct Connect<H: Handle, A: SockAddr> {
+    pub fd: IoFd<H>,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: A,
     pub addr_len: u32,
 }
 
 /// Connect a UDP socket to a remote address.
-pub struct UdpConnect<A: SockAddr> {
-    pub fd: IoFd,
+pub struct UdpConnect<H: Handle, A: SockAddr> {
+    pub fd: IoFd<H>,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: A,
     pub addr_len: u32,
@@ -113,13 +113,13 @@ pub struct Open {
 }
 
 /// Close a file descriptor or handle.
-pub struct Close {
-    pub fd: IoFd,
+pub struct Close<H: Handle> {
+    pub fd: IoFd<H>,
 }
 
 /// Flush file buffers to disk.
-pub struct Fsync {
-    pub fd: IoFd,
+pub struct Fsync<H: Handle> {
+    pub fd: IoFd<H>,
     /// If true, only sync data (not metadata).
     pub datasync: bool,
 }
@@ -137,14 +137,14 @@ pub struct Timeout {
 }
 
 /// Wake up the event loop.
-pub struct Wakeup {
-    pub fd: IoFd,
+pub struct Wakeup<H: Handle> {
+    pub fd: IoFd<H>,
 }
 
 /// Accept a new connection on a listening socket.
 /// Result includes the new socket handle and remote address.
-pub struct Accept<A: SockAddr> {
-    pub fd: IoFd,
+pub struct Accept<H: Handle, A: SockAddr> {
+    pub fd: IoFd<H>,
     /// Buffer for storing the remote address.
     /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
     pub addr: A,
@@ -155,8 +155,8 @@ pub struct Accept<A: SockAddr> {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo {
-    pub fd: IoFd,
+pub struct SendTo<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
     /// Target address.
@@ -164,8 +164,8 @@ pub struct SendTo {
 }
 
 /// Sync file range.
-pub struct SyncFileRange {
-    pub fd: IoFd,
+pub struct SyncFileRange<H: Handle> {
+    pub fd: IoFd<H>,
     pub offset: u64,
     pub nbytes: u64,
     pub flags: u32,
@@ -180,8 +180,8 @@ pub struct SyncFileRangeRaw<H: RawHandleMeta> {
 }
 
 /// Pre-allocate file space.
-pub struct Fallocate {
-    pub fd: IoFd,
+pub struct Fallocate<H: Handle> {
+    pub fd: IoFd<H>,
     pub mode: i32,
     pub offset: u64,
     pub len: u64,
@@ -196,8 +196,8 @@ pub struct FallocateRaw<H: RawHandleMeta> {
 }
 
 /// Receive a UDP datagram together with its source address.
-pub struct UdpRecvFrom {
-    pub fd: IoFd,
+pub struct UdpRecvFrom<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
     pub addr: Option<std::net::SocketAddr>,

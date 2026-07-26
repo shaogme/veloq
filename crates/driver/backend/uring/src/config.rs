@@ -1,9 +1,9 @@
 use std::{mem, num::NonZeroU32};
+pub use veloq_driver_core::RawHandleKind;
 use veloq_driver_core::{
-    BorrowedRawHandle as CoreBorrowedRawHandle, OwnedRawHandle as CoreOwnedRawHandle,
-    RawHandle as CoreRawHandle, RawHandleMeta,
+    BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
+    OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
 };
-pub use veloq_driver_core::{IoFd, RawHandleKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UringRawHandle {
@@ -52,6 +52,8 @@ impl RawHandleMeta for UringRawHandle {
     }
 }
 
+/// Type alias for I/O descriptors using [`UringRawHandle`].
+pub type IoFd = CoreIoFd<UringRawHandle>;
 pub type RawHandle = CoreRawHandle<UringRawHandle>;
 pub type OwnedRawHandle = CoreOwnedRawHandle<UringRawHandle>;
 pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, UringRawHandle>;

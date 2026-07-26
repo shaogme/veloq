@@ -2,6 +2,7 @@ use crate::{
     config::{IoFd, IocpConfig},
     driver::IocpDriver,
     net::socket::Socket,
+    op::{SendTo, UdpRecvFrom},
     tests::{
         complete_from_record, completion_os_error_code, submit_test_op, wait_completion,
         wait_completion_record,
@@ -12,10 +13,7 @@ use veloq_buf::{
     BufPool, FixedBuf, NoopRegistrar, PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
-use veloq_driver_core::{
-    driver::{CancelRequest, Driver, RegisterFd},
-    op::types::{SendTo, UdpRecvFrom},
-};
+use veloq_driver_core::driver::{CancelRequest, Driver, RegisterFd};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {

@@ -38,8 +38,7 @@ pub(crate) fn submit_connect(
         &mut *ctx.registered_slots,
     )
     .push_ctx("scope", "submit_connect")
-    .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
-    .with_ctx("fd_generation", connect_op.fd.generation())
+    .with_ctx("fd", connect_op.fd.to_string())
     .with_ctx("handle_raw", raw.raw().as_handle() as usize)
     .with_ctx("user_data", header.token.index())
     .with_ctx("generation", header.token.generation())?;
@@ -51,8 +50,7 @@ pub(crate) fn submit_connect(
         .rio
         .try_acquire_socket_inflight_guard(raw.raw().actor_key())
         .push_ctx("scope", "submit_connect.acquire_socket_inflight")
-        .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
-        .with_ctx("fd_generation", connect_op.fd.generation())
+        .with_ctx("fd", connect_op.fd.to_string())
         .with_ctx("handle_raw", raw.raw().as_handle() as usize)
         .with_ctx("user_data", header.token.index())
         .with_ctx("generation", header.token.generation())

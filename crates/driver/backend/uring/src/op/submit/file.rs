@@ -1,4 +1,5 @@
 use crate::{
+    config::IoFd,
     driver::{RegisteredFileEntry, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
@@ -146,22 +147,28 @@ pub(crate) unsafe fn make_sqe_close(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let idx = close_op.fd.fixed_index();
-    if let Some(RegisteredFileEntry::BorrowedFd { .. }) = env.file_table.entry(idx) {
+    let scope = "uring.op.submit.make_sqe_close";
+    // `Close` hands the descriptor to the kernel, so it is only valid where the driver owns
+    // the handle. Which side of the file table the descriptor lives on decides where to look:
+    // a registered one has a slot entry, a direct one is tracked by handle.
+    let owned = match close_op.fd {
+        IoFd::Registered { index, .. } => !matches!(
+            env.file_table.entry(index),
+            Some(RegisteredFileEntry::BorrowedFd { .. })
+        ),
+        IoFd::Direct(raw) => env.file_table.owns_direct(raw),
+    };
+    if !owned {
         return Err(UringError::InvalidInput
             .report(
-                "uring.op.submit.make_sqe_close",
+                scope,
                 "Close is only valid for owned registered file descriptors",
             )
-            .push_ctx("scope", "uring.op.submit.make_sqe_close")
-            .with_ctx("fd_fixed_index", close_op.fd.fixed_index())
+            .push_ctx("scope", scope)
+            .with_ctx("fd", close_op.fd.to_string())
             .attach_note("borrowed fd Close rejected"));
     }
-    let fd = resolve_any_fd(
-        env.file_table,
-        close_op.fd,
-        "uring.op.submit.make_sqe_close",
-    )?;
+    let fd = resolve_any_fd(env.file_table, close_op.fd, scope)?;
     Ok(sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
 }
 

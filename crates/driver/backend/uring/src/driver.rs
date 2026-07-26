@@ -275,9 +275,15 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
         let new_fd = Self::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
-        if let Some(fixed_fd) = self.waker_registered_fd {
-            let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
-            self.replace_registered_fixed_fd(fixed_fd, raw)?;
+        let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
+        match self.waker_registered_fd {
+            // A registered waker keeps its slot: only the kernel table entry changes, so the
+            // descriptor stays valid across the rebuild.
+            Some(fd @ IoFd::Registered { .. }) => self.replace_registered_fixed_fd(fd, raw)?,
+            // A direct descriptor *is* the fd, so a rebuilt eventfd needs a new one. Only the
+            // driver holds this descriptor, so replacing it invalidates nothing.
+            Some(IoFd::Direct(_)) => self.waker_registered_fd = Some(IoFd::direct(raw.raw())),
+            None => {}
         }
         let _old_fd = self.waker_state.replace(new_fd);
         Ok(())

@@ -190,34 +190,73 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
     Ok(SubmissionResult::Pending)
 }
 
+/// Index of the occupied registry slot holding `raw`.
+fn find_slot_by_handle(raw: IocpHandle, registered_slots: &[RegisteredSlot]) -> Option<usize> {
+    registered_slots.iter().position(|slot| {
+        slot.handle
+            .as_ref()
+            .is_some_and(|entry| entry.as_raw().raw() == raw)
+    })
+}
+
+/// Index of the registry slot a descriptor names.
+///
+/// [`IoFd::Registered`] resolves by index, with the generation check that makes a stale
+/// descriptor an error rather than a silent hit on whoever took the slot's place.
+///
+/// [`IoFd::Direct`] carries no index, so it is matched by handle identity — O(n) in the
+/// registry size. This backend never *hands out* a direct descriptor: its registry is a
+/// `Vec` that grows on demand, so there is no exhaustion to fall back from. The scan exists
+/// because a slot is still where per-handle state lives (notably the completion-port
+/// association, which must be established exactly once per handle), so a direct descriptor a
+/// caller built itself has to be mapped back onto its slot rather than rejected.
+pub(crate) fn locate_registered_slot(
+    fd: IoFd,
+    registered_slots: &[RegisteredSlot],
+) -> IocpResult<usize> {
+    match fd {
+        IoFd::Registered { index, generation } => {
+            let idx = index as usize;
+            let Some(slot) = registered_slots.get(idx) else {
+                return IocpError::ResolveFd
+                    .with_ctx("fd", fd.to_string())
+                    .attach_note("registered file descriptor index out of bounds");
+            };
+
+            if slot.generation != generation {
+                return IocpError::ResolveFd
+                    .with_ctx("fd", fd.to_string())
+                    .with_ctx("current_generation", slot.generation)
+                    .attach_note("stale registered file descriptor generation");
+            }
+
+            if slot.handle.is_none() {
+                return IocpError::ResolveFd
+                    .with_ctx("fd", fd.to_string())
+                    .attach_note("invalid registered file descriptor");
+            }
+
+            Ok(idx)
+        }
+        IoFd::Direct(raw) => find_slot_by_handle(raw, registered_slots).ok_or_else(|| {
+            IocpError::ResolveFd
+                .to_report()
+                .with_ctx("fd", fd.to_string())
+                .attach_note("direct descriptors require the handle to be registered first")
+        }),
+    }
+}
+
 pub(crate) fn resolve_fd_handle(
     fd: &IoFd,
     registered_slots: &[RegisteredSlot],
 ) -> IocpResult<RawHandle> {
-    let idx = fd.fixed_index();
-    let Some(slot) = registered_slots.get(idx as usize) else {
-        return IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("registered file descriptor index out of bounds");
-    };
-
-    if slot.generation != fd.generation() {
-        return IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .with_ctx("current_generation", slot.generation)
-            .attach_note("stale registered file descriptor generation");
-    }
-
-    if let Some(handle) = slot.handle.as_ref() {
-        Ok(handle.as_raw())
-    } else {
-        IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("invalid registered file descriptor")
-    }
+    let idx = locate_registered_slot(*fd, registered_slots)?;
+    Ok(registered_slots[idx]
+        .handle
+        .as_ref()
+        .expect("located slot is occupied")
+        .as_raw())
 }
 
 pub(crate) fn resolve_registered_raw_file(
@@ -230,27 +269,27 @@ pub(crate) fn resolve_registered_raw_file(
             .attach_note("raw file I/O only accepts file handles");
     }
 
-    for (idx, slot) in registered_slots.iter().enumerate() {
-        let Some(entry) = slot.handle.as_ref() else {
-            continue;
-        };
-        if entry.as_raw().raw() != raw {
-            continue;
-        }
+    let Some(idx) = find_slot_by_handle(raw, registered_slots) else {
+        return IocpError::InvalidInput
+            .with_ctx("handle_raw", raw.as_handle() as usize)
+            .attach_note("raw file I/O requires the handle to be registered first");
+    };
 
-        let fixed_index = u32::try_from(idx).map_err(|_| {
-            IocpError::Internal
-                .to_report()
-                .with_ctx("registered_index", idx)
-                .attach_note("registered file index exceeds IoFd range")
-        })?;
-        let fd = IoFd::fixed_with_generation(fixed_index, slot.generation);
-        return Ok((fd, entry.as_raw()));
-    }
-
-    IocpError::InvalidInput
-        .with_ctx("handle_raw", raw.as_handle() as usize)
-        .attach_note("raw file I/O requires the handle to be registered first")
+    let slot = &registered_slots[idx];
+    let fixed_index = u32::try_from(idx).map_err(|_| {
+        IocpError::Internal
+            .to_report()
+            .with_ctx("registered_index", idx)
+            .attach_note("registered file index exceeds IoFd range")
+    })?;
+    let fd = IoFd::fixed_with_generation(fixed_index, slot.generation);
+    Ok((
+        fd,
+        slot.handle
+            .as_ref()
+            .expect("located slot is occupied")
+            .as_raw(),
+    ))
 }
 
 /// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.
@@ -277,29 +316,8 @@ pub(crate) fn ensure_iocp_association(
     port: &IoCompletionPort,
     registered_slots: &mut [RegisteredSlot],
 ) -> IocpResult<()> {
-    let idx = fd.fixed_index() as usize;
-    let Some(slot) = registered_slots.get_mut(idx) else {
-        return IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("registered file descriptor index out of bounds");
-    };
-
-    if slot.generation != fd.generation() {
-        return IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
-            .with_ctx("current_generation", slot.generation)
-            .attach_note("stale registered file descriptor generation");
-    }
-
-    if slot.handle.is_none() {
-        return IocpError::ResolveFd
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("invalid registered file descriptor");
-    }
-
+    let idx = locate_registered_slot(*fd, registered_slots)?;
+    let slot = &mut registered_slots[idx];
     ensure_handle_iocp_association(handle.raw(), port, &mut slot.association)
 }
 

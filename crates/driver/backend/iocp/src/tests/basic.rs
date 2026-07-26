@@ -6,7 +6,7 @@ use crate::{
     },
     driver::IocpDriver,
     ext::Extensions,
-    op::IocpSlotSpec,
+    op::{Close, Fsync, IocpSlotSpec},
     tests::{submit_test_op, wait_completion},
 };
 use std::{
@@ -18,7 +18,7 @@ use std::{
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::{IntoPlatformOp, types::*},
+    op::IntoPlatformOp,
 };
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 
@@ -110,7 +110,7 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
         .next()
         .unwrap();
 
-    let idx = fd.fixed_index() as usize;
+    let idx = fd.fixed_index().expect("registered descriptor") as usize;
 
     assert!(
         matches!(
@@ -187,7 +187,7 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
         .into_iter()
         .next()
         .unwrap();
-    let idx = fd.fixed_index() as usize;
+    let idx = fd.fixed_index().expect("registered descriptor") as usize;
 
     let token = submit_test_op(&mut driver, Close { fd });
     let closed = wait_completion(&mut driver, token, Duration::from_secs(5))
@@ -220,7 +220,7 @@ fn test_close_borrowed_registered_file_is_rejected_without_unregistering() {
         .into_iter()
         .next()
         .unwrap();
-    let idx = fd.fixed_index() as usize;
+    let idx = fd.fixed_index().expect("registered descriptor") as usize;
 
     submit_expect_void_failure(&mut driver, Close { fd }, "borrowed fd Close");
     assert!(

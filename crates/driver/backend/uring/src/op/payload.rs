@@ -12,27 +12,27 @@ use crate::config::{SockAddrStorage, UringRawHandle};
 use io_uring::types::Timespec;
 use std::{marker::PhantomData, mem, ptr};
 
-pub(crate) type ReadFixed = CoreReadFixed;
+pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
 pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
-pub(crate) type WriteFixed = CoreWriteFixed;
+pub(crate) type WriteFixed = CoreWriteFixed<UringRawHandle>;
 pub(crate) type WriteRaw = CoreWriteRaw<UringRawHandle>;
-pub(crate) type Recv = CoreRecv;
-pub(crate) type OpSend = CoreSend;
-pub(crate) type UdpRecv = CoreUdpRecv;
-pub(crate) type UdpSend = CoreUdpSend;
-pub(crate) type Connect = CoreConnect<SockAddrStorage>;
-pub(crate) type UdpConnect = CoreUdpConnect<SockAddrStorage>;
-pub(crate) type Close = CoreClose;
-pub(crate) type Fsync = CoreFsync;
+pub(crate) type Recv = CoreRecv<UringRawHandle>;
+pub(crate) type OpSend = CoreSend<UringRawHandle>;
+pub(crate) type UdpRecv = CoreUdpRecv<UringRawHandle>;
+pub(crate) type UdpSend = CoreUdpSend<UringRawHandle>;
+pub(crate) type Connect = CoreConnect<UringRawHandle, SockAddrStorage>;
+pub(crate) type UdpConnect = CoreUdpConnect<UringRawHandle, SockAddrStorage>;
+pub(crate) type Close = CoreClose<UringRawHandle>;
+pub(crate) type Fsync = CoreFsync<UringRawHandle>;
 pub(crate) type FsyncRaw = CoreFsyncRaw<UringRawHandle>;
-pub(crate) type SyncFileRange = CoreSyncFileRange;
+pub(crate) type SyncFileRange = CoreSyncFileRange<UringRawHandle>;
 pub(crate) type SyncFileRangeRaw = CoreSyncFileRangeRaw<UringRawHandle>;
-pub(crate) type Fallocate = CoreFallocate;
+pub(crate) type Fallocate = CoreFallocate<UringRawHandle>;
 pub(crate) type FallocateRaw = CoreFallocateRaw<UringRawHandle>;
-pub(crate) type Accept = CoreAccept<SockAddrStorage>;
-pub(crate) type SendTo = CoreSendTo;
-pub(crate) type UdpRecvFrom = CoreUdpRecvFrom;
-pub(crate) type Wakeup = CoreWakeup;
+pub(crate) type Accept = CoreAccept<UringRawHandle, SockAddrStorage>;
+pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
+pub(crate) type UdpRecvFrom = CoreUdpRecvFrom<UringRawHandle>;
+pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
 
 pub enum UringUserPayload {
     ReadFixed(ReadFixed),

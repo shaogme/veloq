@@ -333,8 +333,7 @@ impl RioRegistry {
                 send_cq: env.cq,
                 context: ptr::null(),
             })
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("fd", fd.to_string())
             .with_ctx("socket_raw", handle.raw().as_handle() as usize)
             .with_ctx("rq_depth", self.rq_depth)
             .with_ctx("max_outstanding_recvs", max_outstanding_recvs)

@@ -10,13 +10,13 @@ use diagweave::prelude::*;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    config::IoFd,
     diagnostics::UringCompletionDiagnostics,
     driver::{PendingCancel, UringDriver},
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{Slot, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::{
-    IoFd,
     driver::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,

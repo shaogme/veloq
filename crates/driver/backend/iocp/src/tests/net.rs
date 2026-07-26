@@ -1,11 +1,9 @@
 use crate::{
-    OwnedRawHandle, RawHandle,
+    OwnedRawHandle, RawHandle, SockAddrStorage,
     config::{IoFd, IocpConfig, IocpHandle},
     driver::IocpDriver,
-    net::{
-        addr::{SockAddrStorage, socket_addr_to_storage},
-        socket::Socket,
-    },
+    net::{addr::socket_addr_to_storage, socket::Socket},
+    op::{Accept, Connect, Recv},
     tests::{
         complete_from_record, completion_os_error_code, remote_free_contains, submit_test_op,
         wait_completion, wait_completion_record,
@@ -23,10 +21,7 @@ use std::{
 };
 use veloq_buf::BufPool;
 use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::{
-    driver::{CancelRequest, DriveMode, Driver, RegisterFd},
-    op::types::{Accept, Connect, Recv},
-};
+use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
@@ -78,7 +73,7 @@ fn test_iocp_accept() {
 
     let record =
         wait_completion_record(&mut driver, token, Duration::from_secs(5)).expect("Accept failed");
-    let completion = complete_from_record::<Accept<SockAddrStorage>>(record);
+    let completion = complete_from_record::<Accept>(record);
     let (accepted, op) = completion.into_parts();
     let _accepted = accepted.expect("Accept failed");
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");

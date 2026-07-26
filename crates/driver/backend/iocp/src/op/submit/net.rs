@@ -81,8 +81,7 @@ pub(crate) fn submit_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_recv")
-            .with_ctx("fd_fixed_index", val.fd.fixed_index())
-            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("fd", val.fd.to_string())
             .with_ctx("user_data", user_data)
             .with_ctx("generation", generation)
             .attach_note("RIO recv submit failed")
@@ -120,8 +119,7 @@ pub(crate) fn submit_udp_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_recv")
-            .with_ctx("fd_fixed_index", val.fd.fixed_index())
-            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("fd", val.fd.to_string())
             .with_ctx("user_data", user_data)
             .with_ctx("generation", generation)
             .attach_note("RIO udp_recv submit failed")
@@ -158,8 +156,7 @@ pub(crate) fn submit_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_send")
-            .with_ctx("fd_fixed_index", val.fd.fixed_index())
-            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("fd", val.fd.to_string())
             .with_ctx("user_data", user_data)
             .with_ctx("generation", generation)
             .attach_note("RIO send submit failed")
@@ -196,8 +193,7 @@ pub(crate) fn submit_udp_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_send")
-            .with_ctx("fd_fixed_index", val.fd.fixed_index())
-            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("fd", val.fd.to_string())
             .with_ctx("user_data", user_data)
             .with_ctx("generation", generation)
             .attach_note("RIO udp_send submit failed")
@@ -230,8 +226,7 @@ pub(crate) fn submit_send_to(
         ctx.rio
             .try_submit_send_to(args, ctx.registrar)
             .with_ctx("outer_scope", "submit_send_to")
-            .with_ctx("fd_fixed_index", user.fd.fixed_index())
-            .with_ctx("fd_generation", user.fd.generation())
+            .with_ctx("fd", user.fd.to_string())
             .with_ctx("user_data", header.token.index())
             .with_ctx("generation", header.token.generation())
             .attach_note("RIO send_to submit failed")
@@ -270,8 +265,7 @@ pub(crate) fn submit_udp_recv_from(
         ctx.rio
             .try_submit_recv_from(args, ctx.registrar)
             .with_ctx("outer_scope", "submit_udp_recv_from")
-            .with_ctx("fd_fixed_index", fd.fixed_index())
-            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("fd", fd.to_string())
             .with_ctx("user_data", header.token.index())
             .with_ctx("generation", header.token.generation())
             .attach_note("RIO udp_recv_from submit failed")

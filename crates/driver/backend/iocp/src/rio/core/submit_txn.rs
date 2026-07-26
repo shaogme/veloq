@@ -431,8 +431,7 @@ impl<'a> RioSubmitTxn<'a> {
         let socket_key = self.socket_key();
         let mut report = error
             .push_ctx("scope", scope)
-            .with_ctx("fd_fixed_index", self.plan.fd.fixed_index())
-            .with_ctx("fd_generation", self.plan.fd.generation())
+            .with_ctx("fd", self.plan.fd.to_string())
             .with_ctx("handle_raw", self.plan.handle.raw().as_handle() as usize)
             .with_ctx("socket_raw", socket_key.as_handle() as usize)
             .with_ctx("user_data", self.plan.token.index())
