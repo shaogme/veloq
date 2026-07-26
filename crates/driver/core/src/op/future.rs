@@ -21,6 +21,10 @@ use crate::{
 
 use diagweave::prelude::*;
 
+#[cfg(test)]
+#[cfg(not(feature = "loom"))]
+mod tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LostReason {
     /// 槽位已被回收，用于新一代操作 (Generation Mismatch)。
@@ -279,14 +283,21 @@ where
     T: IntoPlatformOp<Spec>,
 {
     fn drop(&mut self) {
-        if let Some(token) = self.token {
-            if let Some(table) = self.completion_table.as_ref() {
-                table.mark_orphaned(token);
-            }
-            if let Some(cancel_sender) = self.cancel_sender.as_ref() {
-                let _ = cancel_sender.send(CancelRequest::abandon(token));
-            }
+        // token 为 `None` 说明这个操作已经取到了它的终态完成：slot 早就归还、generation
+        // 也推进过了。此时再 `mark_orphaned` / `abandon` 命中的必然是 generation 校验，
+        // 只会往诊断里记一条假的 `StaleGeneration`，把真正的异常淹没掉，还要让驱动为一个
+        // 已经结束的操作白跑一次查表与唤醒。
+        let Some(token) = self.token else {
+            return;
+        };
+
+        if let Some(table) = self.completion_table.as_ref() {
+            table.mark_orphaned(token);
         }
+        if let Some(cancel_sender) = self.cancel_sender.as_ref() {
+            let _ = cancel_sender.send(CancelRequest::abandon(token));
+        }
+        // 唤醒的唯一目的是让驱动线程去处理刚投进去的取消请求，所以它跟着请求走。
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
             && let Err(e) = cancel_waker.wake()
         {
@@ -321,11 +332,18 @@ where
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
         if let Poll::Ready(result) = Self::Output::poll_table_once::<T, Spec>(&**table, token) {
+            // 终态记录被取走的同时 slot 已经归还、generation 已经推进，token 从此失效。
+            // 丢掉它，`Drop` 才不会去动一个已经属于下一代操作的 cell（见 `Drop`）。
+            this.token = None;
             return Poll::Ready(result);
         }
 
         table.register_waker(token, cx.waker());
-        Self::Output::poll_table_once::<T, Spec>(&**table, token)
+        let polled = Self::Output::poll_table_once::<T, Spec>(&**table, token);
+        if polled.is_ready() {
+            this.token = None;
+        }
+        polled
     }
 }
 
@@ -804,14 +822,17 @@ where
 {
     fn drop(&mut self) {
         // token 仍在说明操作还没终止：既要放弃信箱里剩下的记录（`mark_orphaned` 会逐条
-        // 跑它们的 cleanup），也要请求内核取消，否则 multishot 会一直投递下去。
-        if let Some(token) = self.token {
-            if let Some(table) = self.completion_table.as_ref() {
-                table.mark_orphaned(token);
-            }
-            if let Some(cancel_sender) = self.cancel_sender.as_ref() {
-                let _ = cancel_sender.send(CancelRequest::abandon(token));
-            }
+        // 跑它们的 cleanup），也要请求内核取消，否则 multishot 会一直投递下去。取到终态
+        // 完成的流已经把 token 清掉了，那种情况下什么都不该做——与 `DetachedOp` 同理。
+        let Some(token) = self.token else {
+            return;
+        };
+
+        if let Some(table) = self.completion_table.as_ref() {
+            table.mark_orphaned(token);
+        }
+        if let Some(cancel_sender) = self.cancel_sender.as_ref() {
+            let _ = cancel_sender.send(CancelRequest::abandon(token));
         }
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
             && let Err(e) = cancel_waker.wake()
