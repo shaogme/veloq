@@ -86,11 +86,42 @@ pub enum IoMode {
     Polling(NonZeroU32),
 }
 
+/// What happens once every entry of the kernel's registered file table is taken.
+///
+/// The table is a fixed-size kernel allocation, so it cannot grow on demand. The number of
+/// descriptors a server keeps open is an independent dimension from it, which means any fixed
+/// capacity can be reached by a legitimate workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileTableExhaustion {
+    /// Hand out unregistered descriptors instead. Submissions for them carry the raw fd rather
+    /// than a fixed index, so they lose the registered-file fast path but keep working.
+    #[default]
+    Fallback,
+    /// Reject the registration with an error.
+    Fail,
+}
+
+impl FileTableExhaustion {
+    #[inline]
+    pub const fn falls_back(self) -> bool {
+        matches!(self, Self::Fallback)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UringConfig {
     pub mode: IoMode,
     pub entries: NonZeroU32,
     pub registration_mode: BufferRegistrationMode,
+    /// Size of the kernel's registered (fixed) file table.
+    ///
+    /// Independent of [`Self::entries`]: submission queue depth bounds how many operations are
+    /// in flight, this bounds how many descriptors are registered at once. `0` disables the
+    /// table entirely and submits every descriptor as a raw fd; driver construction fails if
+    /// the value is larger than the driver — or the kernel — is willing to allocate.
+    pub file_table_capacity: u32,
+    /// Behaviour once `file_table_capacity` entries are in use.
+    pub file_table_exhaustion: FileTableExhaustion,
 }
 
 impl AsRef<UringConfig> for UringConfig {
@@ -106,13 +137,28 @@ impl Default for UringConfig {
             // SAFETY: 1024 is non-zero.
             entries: unsafe { NonZeroU32::new_unchecked(1024) },
             registration_mode: BufferRegistrationMode::Strict,
+            file_table_capacity: DEFAULT_FILE_TABLE_CAPACITY,
+            file_table_exhaustion: FileTableExhaustion::Fallback,
         }
     }
 }
 
+/// Matches the historical capacity, which was pinned to the default ring depth.
+const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
+
 impl UringConfig {
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
+        self
+    }
+
+    pub fn file_table_capacity(mut self, capacity: u32) -> Self {
+        self.file_table_capacity = capacity;
+        self
+    }
+
+    pub fn file_table_exhaustion(mut self, exhaustion: FileTableExhaustion) -> Self {
+        self.file_table_exhaustion = exhaustion;
         self
     }
 }

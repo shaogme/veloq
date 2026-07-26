@@ -6,8 +6,8 @@ mod net;
 mod op;
 
 pub use config::{
-    BorrowedRawHandle, BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle,
-    RawHandleKind, SockAddrStorage, UringConfig, UringRawHandle,
+    BorrowedRawHandle, BufferRegistrationMode, FileTableExhaustion, IoFd, IoMode, OwnedRawHandle,
+    RawHandle, RawHandleKind, SockAddrStorage, UringConfig, UringRawHandle,
 };
 pub use diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot};
 pub use driver::{UringDriver, UringOpState};

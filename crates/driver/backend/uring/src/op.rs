@@ -27,6 +27,7 @@ pub(crate) use payload::{
     ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
     UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
+pub(crate) use submit::sqe_with_fd;
 
 // ============================================================================
 // VTable Definition

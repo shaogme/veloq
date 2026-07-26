@@ -5,7 +5,7 @@ pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
 use veloq_std::nz;
 
 #[cfg(not(windows))]
-pub use veloq_driver_uring::{BufferRegistrationMode, IoMode, UringConfig};
+pub use veloq_driver_uring::{BufferRegistrationMode, FileTableExhaustion, IoMode, UringConfig};
 
 /// I/O submission mode.
 #[cfg(windows)]
@@ -47,6 +47,17 @@ impl Default for IocpConfig {
     }
 }
 
+/// Behaviour once the registered file table is full (Shim for Windows platform).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileTableExhaustion {
+    /// Hand out unregistered descriptors instead.
+    #[default]
+    Fallback,
+    /// Reject the registration with an error.
+    Fail,
+}
+
 /// Configuration for the io_uring driver (Shim for Windows platform).
 #[cfg(windows)]
 #[derive(Debug, Clone)]
@@ -57,6 +68,10 @@ pub struct UringConfig {
     pub entries: NonZeroU32,
     /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
+    /// Size of the kernel's registered file table, independent of `entries`.
+    pub file_table_capacity: u32,
+    /// Behaviour once `file_table_capacity` entries are in use.
+    pub file_table_exhaustion: FileTableExhaustion,
 }
 
 #[cfg(windows)]
@@ -64,6 +79,18 @@ impl UringConfig {
     /// Sets the registration mode.
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
+        self
+    }
+
+    /// Sets the registered file table capacity.
+    pub fn file_table_capacity(mut self, capacity: u32) -> Self {
+        self.file_table_capacity = capacity;
+        self
+    }
+
+    /// Sets what happens once the registered file table is full.
+    pub fn file_table_exhaustion(mut self, exhaustion: FileTableExhaustion) -> Self {
+        self.file_table_exhaustion = exhaustion;
         self
     }
 }
@@ -75,6 +102,8 @@ impl Default for UringConfig {
             mode: IoMode::Interrupt,
             entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
+            file_table_capacity: 1024,
+            file_table_exhaustion: FileTableExhaustion::Fallback,
         }
     }
 }

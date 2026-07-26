@@ -6,7 +6,7 @@ pub(super) use net::*;
 
 use crate::{
     config::{IoFd, RawHandleKind},
-    driver::{FileSlot, SqeEnv, resolve_registered_fixed_fd},
+    driver::{FileTable, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
         Timeout, Wakeup,
@@ -36,32 +36,42 @@ fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<Uri
 }
 
 #[inline]
-fn resolve_file_fd(
-    file_slots: &[FileSlot],
-    fd: IoFd,
-    scope: &'static str,
-) -> UringResult<types::Fixed> {
-    resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::File), scope).map(types::Fixed)
+fn resolve_file_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    table.resolve(fd, Some(RawHandleKind::File), scope)
 }
 
 #[inline]
-fn resolve_socket_fd(
-    file_slots: &[FileSlot],
-    fd: IoFd,
-    scope: &'static str,
-) -> UringResult<types::Fixed> {
-    resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::Socket), scope)
-        .map(types::Fixed)
+fn resolve_socket_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    table.resolve(fd, Some(RawHandleKind::Socket), scope)
 }
 
 #[inline]
-fn resolve_any_fd(
-    file_slots: &[FileSlot],
-    fd: IoFd,
-    scope: &'static str,
-) -> UringResult<types::Fixed> {
-    resolve_registered_fixed_fd(file_slots, fd, None, scope).map(types::Fixed)
+fn resolve_any_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    table.resolve(fd, None, scope)
 }
+
+/// Builds an SQE for either shape a resolved descriptor can take.
+///
+/// Every `io_uring` opcode accepts `impl sealed::UseFixed`, which both `types::Fixed` and
+/// `types::Fd` implement — but the trait is crate-private, so the builder cannot be written
+/// generically over it. Expanding the body once per variant is the way to keep the two paths
+/// from drifting apart. Callers must have `SqeFd` and `io_uring::types` in scope.
+macro_rules! sqe_with_fd {
+    ($fd:expr, |$name:ident| $build:expr) => {
+        match $fd {
+            SqeFd::Fixed(index) => {
+                let $name = types::Fixed(index);
+                $build
+            }
+            SqeFd::Direct(raw) => {
+                let $name = types::Fd(raw);
+                $build
+            }
+        }
+    };
+}
+
+pub(crate) use sqe_with_fd;
 
 pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupGuard {
     if result < 0 {
@@ -107,6 +117,11 @@ pub(crate) unsafe fn make_sqe_wakeup(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fixed_fd = resolve_file_fd(env.file_slots, user.fd, "uring.op.submit.make_sqe_wakeup")?;
-    Ok(opcode::Read::new(fixed_fd, kernel.buf.as_mut_ptr(), 8).build())
+    let fd = resolve_file_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_wakeup")?;
+    Ok(sqe_with_fd!(fd, |f| opcode::Read::new(
+        f,
+        kernel.buf.as_mut_ptr(),
+        8
+    )
+    .build()))
 }

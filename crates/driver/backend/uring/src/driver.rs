@@ -44,7 +44,7 @@ mod submission;
 pub(crate) use env::SqeEnv;
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{
-    FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
+    FileTable, MAX_CHUNKS, RegisteredFileEntry, SqeFd, UringRegistrationStats,
 };
 
 pub(crate) struct EventFd {
@@ -159,9 +159,7 @@ pub struct UringDriver<'a> {
     pub(crate) registration_mode: BufferRegistrationMode,
     /// Last failed registration attempt per chunk, indexed by [`ChunkId`]; `MAX_CHUNKS` long.
     pub(crate) chunk_register_failure_at: Box<[Option<Instant>]>,
-    pub(crate) file_slots: Vec<FileSlot>,
-    pub(crate) free_file_slots: Vec<u32>,
-    pub(crate) file_table_initialized: bool,
+    pub(crate) file_table: FileTable,
 }
 
 impl<'a> UringDriver<'a> {
@@ -230,9 +228,7 @@ impl<'a> UringDriver<'a> {
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
-            file_slots: Vec::new(),
-            free_file_slots: Vec::new(),
-            file_table_initialized: false,
+            file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
         };
 
         driver.submit_waker()?;

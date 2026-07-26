@@ -11,8 +11,8 @@ use veloq_driver_core::op::{
     types::{Close, Fsync},
 };
 use veloq_driver_uring::{
-    IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError, UringOp, UringRawHandle,
-    UringResult, UringSlotSpec, UringUserPayload,
+    FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError,
+    UringOp, UringRawHandle, UringResult, UringSlotSpec, UringUserPayload,
 };
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
@@ -26,16 +26,23 @@ fn new_driver_or_skip() -> Option<UringDriver<'static>> {
     }
 }
 
-fn new_driver_with_entries_or_skip(entries: u32) -> Option<UringDriver<'static>> {
+/// A driver whose kernel file table holds `capacity` entries, one of which the eventfd waker
+/// claims during construction.
+fn new_driver_with_file_table_or_skip(
+    capacity: u32,
+    exhaustion: FileTableExhaustion,
+) -> Option<UringDriver<'static>> {
     let config = UringConfig {
-        entries: NonZeroU32::new(entries).unwrap(),
+        entries: NonZeroU32::new(64).unwrap(),
+        file_table_capacity: capacity,
+        file_table_exhaustion: exhaustion,
         ..UringConfig::default()
     };
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
     match UringDriver::new(config, &REGISTRAR) {
         Ok(driver) => Some(driver),
         Err(report) => {
-            eprintln!("skipping uring test with {entries} entries: {report}");
+            eprintln!("skipping uring test with file table capacity {capacity}: {report}");
             None
         }
     }
@@ -127,7 +134,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
 
 #[test]
 fn failed_single_registration_restores_popped_slot() {
-    let Some(mut driver) = new_driver_with_entries_or_skip(4) else {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
@@ -147,7 +154,7 @@ fn failed_single_registration_restores_popped_slot() {
 
 #[test]
 fn failed_batch_registration_rolls_back_successful_prefix() {
-    let Some(mut driver) = new_driver_with_entries_or_skip(4) else {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
@@ -172,10 +179,11 @@ fn failed_batch_registration_rolls_back_successful_prefix() {
 
 #[test]
 fn exhausted_batch_registration_does_not_partially_register() {
-    let Some(mut driver) = new_driver_with_entries_or_skip(4) else {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
+    // The waker holds one of the four entries, so a batch of four cannot fit.
     let too_many_files = open_cargo_files::<4>();
     assert!(register_borrowed_files_result(&mut driver, &too_many_files).is_err());
 
@@ -314,6 +322,146 @@ fn close_owned_registered_file() {
     );
 
     driver.unregister_files(vec![fsync_fd]).unwrap();
+}
+
+/// Registers one file and returns its descriptor, asserting where it landed.
+fn register_one_beyond(driver: &mut UringDriver<'static>, capacity: u32) -> (std::fs::File, IoFd) {
+    let file = std::fs::File::open("Cargo.toml").unwrap();
+    let raw = raw_file(&file);
+    let fd = driver
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+        .expect("registration must fall back instead of failing")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        fd.fixed_index() >= capacity,
+        "expected a fallback slot past the kernel table, got index {}",
+        fd.fixed_index()
+    );
+    (file, fd)
+}
+
+#[test]
+fn a_full_file_table_falls_back_to_unregistered_descriptors() {
+    // Capacity 1 is entirely consumed by the waker, so any user file overflows.
+    let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let (_file, fd) = register_one_beyond(&mut driver, 1);
+
+    let token = submit_test_op(
+        &mut driver,
+        Fsync {
+            fd,
+            datasync: false,
+        },
+    );
+    let result = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    assert_eq!(result, 0, "fsync on a fallback descriptor must succeed");
+
+    driver.unregister_files(vec![fd]).unwrap();
+}
+
+#[test]
+fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
+    // Capacity 0 means even the waker eventfd is submitted unregistered.
+    let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let (_file, fd) = register_one_beyond(&mut driver, 0);
+
+    let token = submit_test_op(
+        &mut driver,
+        Fsync {
+            fd,
+            datasync: false,
+        },
+    );
+    let result = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    assert_eq!(
+        result, 0,
+        "fsync without a registered file table must succeed"
+    );
+
+    driver.unregister_files(vec![fd]).unwrap();
+}
+
+#[test]
+fn a_released_fallback_slot_is_reused_with_a_fresh_generation() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let (_first, stale_fd) = register_one_beyond(&mut driver, 1);
+    driver.unregister_files(vec![stale_fd]).unwrap();
+
+    let (_second, fresh_fd) = register_one_beyond(&mut driver, 1);
+    assert_eq!(stale_fd.fixed_index(), fresh_fd.fixed_index());
+    assert_ne!(stale_fd.generation(), fresh_fd.generation());
+
+    let op = Fsync {
+        fd: stale_fd,
+        datasync: false,
+    };
+    let (uring_kernel, payload) =
+        <Fsync as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
+    let mut uring_op: Option<UringOp> = Some(uring_kernel);
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+
+    match slot.submit(&mut uring_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), UringError::ResolveFd),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("stale fallback fd submit should fail before in-flight state, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => {
+            panic!("stale fallback fd submit unexpectedly succeeded")
+        }
+    }
+    let _ = slot.recover_payload();
+
+    driver.unregister_files(vec![fresh_fd]).unwrap();
+}
+
+#[test]
+fn close_owned_fallback_file() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let file = std::fs::File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    std::mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(fd.fixed_index() >= 1, "expected a fallback slot");
+
+    let token = submit_test_op(&mut driver, Close { fd });
+    let closed = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    assert_eq!(closed, 0);
+
+    // The slot is back in the free list with a bumped generation, so the same index is handed
+    // out again and the stale descriptor no longer resolves.
+    let (_next, reused) = register_one_beyond(&mut driver, 1);
+    assert_eq!(reused.fixed_index(), fd.fixed_index());
+    assert_ne!(reused.generation(), fd.generation());
+    driver.unregister_files(vec![reused]).unwrap();
 }
 
 #[test]

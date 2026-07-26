@@ -1,13 +1,14 @@
 use crate::{
     config::{RawHandle, UringRawHandle},
-    driver::{UringDriver, env::SubmitEnv, lifecycle::UringSubmissionState},
+    driver::{SqeFd, UringDriver, env::SubmitEnv, lifecycle::UringSubmissionState},
     error::{UringError, UringResult},
     op::{
         Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, UringSlotSpec,
+        sqe_with_fd,
     },
 };
 use diagweave::prelude::*;
-use io_uring::opcode;
+use io_uring::{opcode, types};
 use std::task::Poll;
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
@@ -227,7 +228,7 @@ impl<'a> UringDriver<'a> {
             return Ok(());
         }
 
-        let fixed_fd = match self.waker_registered_fd {
+        let waker_fd = match self.waker_registered_fd {
             Some(fd) => fd,
             None => {
                 let event_fd = self.waker_state.current();
@@ -235,21 +236,23 @@ impl<'a> UringDriver<'a> {
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
                 let mut fds =
                     self.register_files_internal(vec![RegisterFd::Borrowed(raw.borrow())])?;
-                let fixed_fd = fds.pop().ok_or_else(|| {
+                let waker_fd = fds.pop().ok_or_else(|| {
                     UringError::InvalidState
                         .report("driver.submit_waker", "register_files returned empty")
                 })?;
-                self.waker_registered_fd = Some(fixed_fd);
-                fixed_fd
+                self.waker_registered_fd = Some(waker_fd);
+                waker_fd
             }
         };
-        let sqe = opcode::Read::new(
-            io_uring::types::Fixed(fixed_fd.fixed_index()),
-            self.waker_buf.as_mut_ptr(),
-            self.waker_buf.len() as u32,
-        )
-        .build()
-        .user_data(CompletionToken::waker(0).raw());
+        // The eventfd is registered like any other descriptor, so it lands in the fallback area
+        // once the kernel table is full (or configured away entirely).
+        let sqe_fd = self
+            .file_table
+            .resolve(waker_fd, None, "driver.submit_waker.resolve")?;
+        let buf = self.waker_buf.as_mut_ptr();
+        let len = self.waker_buf.len() as u32;
+        let sqe = sqe_with_fd!(sqe_fd, |f| opcode::Read::new(f, buf, len).build())
+            .user_data(CompletionToken::waker(0).raw());
 
         if self.push_entry(sqe) {
             self.waker_armed = true;

@@ -1,5 +1,5 @@
 use crate::{
-    config::{IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle},
+    config::{IoFd, RawHandle, UringRawHandle},
     driver::UringDriver,
     error::{UringError, UringResult},
 };
@@ -8,89 +8,19 @@ use std::{mem::ManuallyDrop, time::Duration};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::RegisterFd;
 
+mod file_table;
+
+pub(crate) use file_table::{ClaimedSlots, FileTable, RegisteredFileEntry, SqeFd};
+
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
-const MIN_FILE_TABLE_CAPACITY: usize = 1;
-const INITIAL_FILE_GENERATION: u64 = 1;
-
-#[derive(Debug)]
-pub(crate) struct FileSlot {
-    pub(crate) entry: Option<RegisteredFileEntry>,
-    pub(crate) generation: u64,
-}
-
-#[derive(Debug)]
-pub(crate) enum RegisteredFileEntry {
-    BorrowedFd { fd: i32, kind: RawHandleKind },
-    OwnedHandle(OwnedRawHandle),
-}
-
-impl RegisteredFileEntry {
-    #[inline]
-    pub(crate) fn fd(&self) -> i32 {
-        match self {
-            Self::BorrowedFd { fd, .. } => *fd,
-            Self::OwnedHandle(handle) => handle.raw().as_fd(),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn kind(&self) -> RawHandleKind {
-        match self {
-            Self::BorrowedFd { kind, .. } => *kind,
-            Self::OwnedHandle(handle) => handle.kind(),
-        }
-    }
-}
-
-pub(crate) fn resolve_registered_fixed_fd(
-    file_slots: &[FileSlot],
-    fd: IoFd,
-    expected_kind: Option<RawHandleKind>,
-    scope: &'static str,
-) -> UringResult<u32> {
-    let idx = fd.fixed_index();
-    let index = idx as usize;
-    let Some(slot) = file_slots.get(index) else {
-        return UringError::ResolveFd
-            .push_ctx("scope", scope)
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("registered file descriptor index out of bounds");
-    };
-
-    if slot.generation != fd.generation() {
-        return UringError::ResolveFd
-            .push_ctx("scope", scope)
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("stale registered file descriptor generation")
-            .with_ctx("current_generation", slot.generation);
-    }
-
-    let Some(entry) = slot.entry.as_ref() else {
-        return UringError::ResolveFd
-            .push_ctx("scope", scope)
-            .with_ctx("fd_fixed_index", idx)
-            .with_ctx("fd_generation", fd.generation())
-            .attach_note("invalid registered file descriptor");
-    };
-
-    if let Some(expected_kind) = expected_kind {
-        let current_kind = entry.kind();
-        if current_kind != expected_kind {
-            return UringError::ResolveFd
-                .push_ctx("scope", scope)
-                .with_ctx("fd_fixed_index", idx)
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("expected_kind", format!("{expected_kind:?}"))
-                .with_ctx("current_kind", format!("{current_kind:?}"))
-                .attach_note("registered file descriptor kind mismatch");
-        }
-    }
-
-    Ok(idx)
-}
+/// Upper bound on [`UringConfig::file_table_capacity`](crate::config::UringConfig).
+///
+/// The kernel's own limit is smaller still (`IORING_MAX_FIXED_FILES`), but it rejects an
+/// oversized table only *after* the sparse `-1` vector has been built — and that vector is
+/// four bytes per entry, so an unchecked `u32` would ask for gigabytes before the syscall got
+/// a chance to say no.
+const MAX_FILE_TABLE_CAPACITY: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UringRegistrationStats {
@@ -99,17 +29,11 @@ pub(crate) struct UringRegistrationStats {
     pub(crate) chunk_register_failures: u64,
     pub(crate) chunk_register_skipped_recent_failure: u64,
     pub(crate) submission_missing_chunk_info: u64,
+    /// Descriptors handed out without a kernel table entry because the table was full.
+    pub(crate) file_table_fallback_registrations: u64,
 }
 
 impl<'a> UringDriver<'a> {
-    #[inline]
-    fn advance_file_generation(generation: &mut u64) {
-        *generation = generation.wrapping_add(1);
-        if *generation == 0 {
-            *generation = INITIAL_FILE_GENERATION;
-        }
-    }
-
     #[inline]
     pub(crate) fn register_chunk_internal(
         &mut self,
@@ -120,29 +44,40 @@ impl<'a> UringDriver<'a> {
         self.submit_env().register_chunk(id, ptr, len)
     }
 
+    /// Clears the kernel table entry for `idx`, if it has one.
+    ///
+    /// Fallback slots live only in userspace, so releasing one is pure bookkeeping — skipping
+    /// the `register_files_update` there is not an optimisation, it is required: the kernel
+    /// table has no entry at that index to reset.
+    fn clear_kernel_file_entry(&mut self, idx: u32, scope: &'static str) -> UringResult<()> {
+        if !self.file_table.is_fixed(idx) {
+            return Ok(());
+        }
+        self.ring
+            .submitter()
+            .register_files_update(idx, &[-1])
+            .map(|_| ())
+            .map_err(|e| UringError::Registration.io_report(scope, e))
+    }
+
     fn unregister_file_slot(
         &mut self,
         idx: u32,
         advance_generation: bool,
         scope: &'static str,
     ) -> UringResult<()> {
-        let index = idx as usize;
-        if index >= self.file_slots.len() {
-            return Ok(());
-        }
-
-        let Some(entry) = self.file_slots[index].entry.take() else {
+        let Some(entry) = self.file_table.take_entry(idx) else {
             return Ok(());
         };
 
-        if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
-            self.file_slots[index].entry = Some(entry);
-            return Err(UringError::Registration.io_report(scope, e));
+        if let Err(report) = self.clear_kernel_file_entry(idx, scope) {
+            self.file_table.install_entry(idx, entry);
+            return Err(report);
         }
 
-        self.free_file_slots.push(idx);
+        self.file_table.release(idx);
         if advance_generation {
-            Self::advance_file_generation(&mut self.file_slots[index].generation);
+            self.file_table.advance_generation(idx);
         }
         Ok(())
     }
@@ -166,41 +101,29 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
-        if !self.file_table_initialized {
+        if !self.file_table.is_initialized() || !self.file_table.matches_generation(fd) {
             return Ok(());
         }
-        let idx = fd.fixed_index();
-        let index = idx as usize;
-        if index < self.file_slots.len() {
-            if self.file_slots[index].generation != fd.generation() {
-                return Ok(());
-            }
-            self.unregister_file_slot(idx, true, "driver.unregister_fixed_fd")?;
-        }
-        Ok(())
+        self.unregister_file_slot(fd.fixed_index(), true, "driver.unregister_fixed_fd")
     }
 
+    /// Retires the slot behind a `Close` whose descriptor the kernel already closed.
     pub(crate) fn unregister_close_owned_fd(&mut self, fd: IoFd) -> UringResult<()> {
-        if !self.file_table_initialized {
+        if !self.file_table.is_initialized() || !self.file_table.matches_generation(fd) {
             return Ok(());
         }
         let idx = fd.fixed_index();
-        let index = idx as usize;
-        if index >= self.file_slots.len() {
-            return Ok(());
-        }
-        if self.file_slots[index].generation != fd.generation() {
-            return Ok(());
-        }
-        let Some(entry) = self.file_slots[index].entry.take() else {
+        let Some(entry) = self.file_table.take_entry(idx) else {
             return Ok(());
         };
-        if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
-            self.file_slots[index].entry = Some(entry);
-            return Err(UringError::Registration.io_report("driver.unregister_close_owned_fd", e));
+        if let Err(report) = self.clear_kernel_file_entry(idx, "driver.unregister_close_owned_fd") {
+            self.file_table.install_entry(idx, entry);
+            return Err(report);
         }
-        self.free_file_slots.push(idx);
-        Self::advance_file_generation(&mut self.file_slots[index].generation);
+        self.file_table.release(idx);
+        self.file_table.advance_generation(idx);
+        // The `Close` operation already closed the descriptor; dropping the owned handle here
+        // would close a number the kernel may have handed to someone else.
         let _ = ManuallyDrop::new(entry);
         Ok(())
     }
@@ -210,73 +133,72 @@ impl<'a> UringDriver<'a> {
         fixed_fd: IoFd,
         raw: RawHandle,
     ) -> UringResult<()> {
-        if !self.file_table_initialized {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.replace_registered_fixed_fd")
-                .with_ctx("fd_fixed_index", fixed_fd.fixed_index())
-                .attach_note("registered file table is not initialized");
-        }
-
+        let scope = "driver.replace_registered_fixed_fd";
         let idx = fixed_fd.fixed_index();
-        let index = idx as usize;
-        let Some(slot) = self.file_slots.get_mut(index) else {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.replace_registered_fixed_fd")
+        let invalid = |note: &'static str| {
+            UringError::InvalidState
+                .push_ctx("scope", scope)
                 .with_ctx("fd_fixed_index", idx)
                 .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file index out of bounds");
+                .attach_note(note)
         };
-        if slot.generation != fixed_fd.generation() {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.replace_registered_fixed_fd")
-                .with_ctx("fd_fixed_index", idx)
-                .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file generation mismatch while replacing fd");
+
+        if !self.file_table.is_initialized() {
+            return invalid("registered file table is not initialized");
         }
-        if slot.entry.is_none() {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.replace_registered_fixed_fd")
-                .with_ctx("fd_fixed_index", idx)
-                .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file slot is empty while replacing fd");
+        if self.file_table.generation(idx).is_none() {
+            return invalid("registered file index out of bounds");
+        }
+        if !self.file_table.matches_generation(fixed_fd) {
+            return invalid("registered file generation mismatch while replacing fd");
+        }
+        if self.file_table.entry(idx).is_none() {
+            return invalid("registered file slot is empty while replacing fd");
         }
 
         let fd = raw.raw().as_fd();
-        self.ring
-            .submitter()
-            .register_files_update(idx, &[fd])
-            .map_err(|e| {
-                UringError::Registration.io_report(
-                    "driver.replace_registered_fixed_fd.register_files_update",
-                    e,
-                )
-            })?;
-        slot.entry = Some(RegisteredFileEntry::BorrowedFd {
-            fd,
-            kind: raw.kind(),
-        });
+        if self.file_table.is_fixed(idx) {
+            self.ring
+                .submitter()
+                .register_files_update(idx, &[fd])
+                .map_err(|e| {
+                    UringError::Registration.io_report(
+                        "driver.replace_registered_fixed_fd.register_files_update",
+                        e,
+                    )
+                })?;
+        }
+        self.file_table.install_entry(
+            idx,
+            RegisteredFileEntry::BorrowedFd {
+                fd,
+                kind: raw.kind(),
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn ensure_file_table_initialized(&mut self) -> UringResult<()> {
-        if self.file_table_initialized {
+        if self.file_table.is_initialized() {
             return Ok(());
         }
 
-        let capacity = self.ops.capacity().max(MIN_FILE_TABLE_CAPACITY);
-        let sparse = vec![-1; capacity];
-        self.ring.submitter().register_files(&sparse).map_err(|e| {
-            UringError::Registration.io_report("driver.ensure_file_table_initialized", e)
-        })?;
+        let capacity = self.file_table.fixed_capacity();
+        if capacity > MAX_FILE_TABLE_CAPACITY {
+            return UringError::InvalidInput
+                .push_ctx("scope", "driver.ensure_file_table_initialized")
+                .with_ctx("file_table_capacity", capacity)
+                .with_ctx("max_file_table_capacity", MAX_FILE_TABLE_CAPACITY)
+                .attach_note("configured registered file table capacity is too large");
+        }
+        if capacity > 0 {
+            let sparse = vec![-1; capacity];
+            self.ring.submitter().register_files(&sparse).map_err(|e| {
+                UringError::Registration.io_report("driver.ensure_file_table_initialized", e)
+            })?;
+        }
 
-        self.file_slots = (0..capacity)
-            .map(|_| FileSlot {
-                entry: None,
-                generation: INITIAL_FILE_GENERATION,
-            })
-            .collect();
-        self.free_file_slots = (0..capacity as u32).rev().collect();
-        self.file_table_initialized = true;
+        self.file_table.mark_initialized();
         Ok(())
     }
 
@@ -310,29 +232,18 @@ impl<'a> UringDriver<'a> {
     ) -> UringResult<Vec<IoFd>> {
         self.ensure_file_table_initialized()?;
 
-        let requested = files.len();
-        let available = self.free_file_slots.len();
-        if requested > available {
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.register_files_internal")
-                .with_ctx("requested_files", requested)
-                .with_ctx("free_file_slots", available)
-                .attach_note("io_uring registered file table exhausted");
-        }
-        if requested == 0 {
+        if files.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Claim every slot up front and register them in ascending order. `free_file_slots` is
-        // seeded in reverse, so a fresh table hands out consecutive indices and the whole batch
-        // collapses into a single `register_files_update` instead of one syscall per fd.
-        let mut slots = Vec::with_capacity(requested);
-        for _ in 0..requested {
-            slots.push(self.free_file_slots.pop().expect(
-                "register_files_internal capacity precheck guarantees enough free file slots",
-            ));
-        }
-        slots.sort_unstable();
+        let claimed = self
+            .file_table
+            .claim(files.len())
+            .push_ctx("scope", "driver.register_files_internal")?;
+        self.registration_stats.file_table_fallback_registrations = self
+            .registration_stats
+            .file_table_fallback_registrations
+            .saturating_add(claimed.direct.len() as u64);
 
         let entries = files
             .into_iter()
@@ -344,34 +255,50 @@ impl<'a> UringDriver<'a> {
                 RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
             })
             .collect::<Vec<_>>();
+
+        self.install_claimed_files(claimed, entries)
+    }
+
+    /// Publishes `entries` into `claimed`, telling the kernel about the fixed half.
+    ///
+    /// `entries` is paired with the slots in [`ClaimedSlots::in_input_order`], so the returned
+    /// descriptors line up with the caller's input.
+    fn install_claimed_files(
+        &mut self,
+        claimed: ClaimedSlots,
+        entries: Vec<RegisteredFileEntry>,
+    ) -> UringResult<Vec<IoFd>> {
+        debug_assert_eq!(claimed.fixed.len() + claimed.direct.len(), entries.len());
         let fds = entries
             .iter()
             .map(RegisteredFileEntry::fd)
             .collect::<Vec<_>>();
         let mut entries = entries.into_iter();
 
-        let mut registered_slots = Vec::with_capacity(requested);
+        let mut installed = Vec::with_capacity(fds.len());
         let mut cursor = 0usize;
-        while cursor < requested {
-            let run_end = consecutive_run_end(&slots, cursor);
-            let outcome = self.register_file_run(slots[cursor], &fds[cursor..run_end]);
+        while cursor < claimed.fixed.len() {
+            let run_end = consecutive_run_end(&claimed.fixed, cursor);
+            let outcome = self.register_file_run(claimed.fixed[cursor], &fds[cursor..run_end]);
 
             // The run's entries are recorded even when the update failed: a partial update may
             // have left some fds in the kernel table, and the rollback below needs the entries
             // in place to reset those slots to -1.
-            for idx in slots[cursor..run_end].iter().copied() {
+            for idx in claimed.fixed[cursor..run_end].iter().copied() {
                 let entry = entries
                     .next()
                     .expect("one registered file entry per claimed file slot");
-                self.file_slots[idx as usize].entry = Some(entry);
-                registered_slots.push(idx);
+                self.file_table.install_entry(idx, entry);
+                installed.push(idx);
             }
             cursor = run_end;
 
             if let Err(report) = outcome {
                 // Hand back the slots this batch never got to.
-                self.free_file_slots.extend_from_slice(&slots[cursor..]);
-                if let Err(rollback_report) = self.rollback_file_slots(&mut registered_slots) {
+                self.file_table
+                    .release_all(claimed.fixed[cursor..].iter().copied());
+                self.file_table.release_all(claimed.direct.iter().copied());
+                if let Err(rollback_report) = self.rollback_file_slots(&mut installed) {
                     return Err(rollback_report
                         .attach_note("rollback failed after registered file update failure"));
                 }
@@ -379,14 +306,22 @@ impl<'a> UringDriver<'a> {
             }
         }
 
-        // `slots` is sorted and `entries` was consumed in the same order, so slot `i` still
-        // belongs to input file `i`.
-        let fixed_fds = slots
-            .iter()
-            .copied()
-            .map(|idx| IoFd::fixed_with_generation(idx, self.file_slots[idx as usize].generation))
-            .collect();
-        Ok(fixed_fds)
+        // Fallback slots need no kernel round trip at all — the raw fd travels in the SQE.
+        for idx in claimed.direct.iter().copied() {
+            let entry = entries
+                .next()
+                .expect("one registered file entry per claimed file slot");
+            self.file_table.install_entry(idx, entry);
+        }
+
+        Ok(claimed
+            .in_input_order()
+            .map(|idx| {
+                self.file_table
+                    .descriptor(idx)
+                    .expect("installed slot exists")
+            })
+            .collect())
     }
 }
 
@@ -403,7 +338,7 @@ fn consecutive_run_end(slots: &[u32], start: usize) -> usize {
 mod tests {
     use super::consecutive_run_end;
 
-    /// Walks `slots` the way `register_files_internal` does, collecting one run per syscall.
+    /// Walks `slots` the way `install_claimed_files` does, collecting one run per syscall.
     fn runs(slots: &[u32]) -> Vec<&[u32]> {
         let mut runs = Vec::new();
         let mut cursor = 0;

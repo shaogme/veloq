@@ -1,5 +1,5 @@
 use crate::{
-    driver::{RegisteredFileEntry, SqeEnv},
+    driver::{RegisteredFileEntry, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
@@ -12,7 +12,7 @@ use io_uring::{opcode, squeue, types};
 use veloq_buf::{PoolKind, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
 
-use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd};
+use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd, sqe_with_fd};
 
 pub(crate) unsafe fn make_sqe_read_fixed(
     _kernel: &mut KernelRef<ReadFixed>,
@@ -26,8 +26,8 @@ pub(crate) unsafe fn make_sqe_read_fixed(
         .checked_read_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
     let offset = rw_op.offset;
-    let fixed_fd = resolve_file_fd(
-        env.file_slots,
+    let fd = resolve_file_fd(
+        env.file_table,
         rw_op.fd,
         "uring.op.submit.make_sqe_read_fixed",
     )?;
@@ -37,11 +37,15 @@ pub(crate) unsafe fn make_sqe_read_fixed(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(opcode::ReadFixed::new(fixed_fd, ptr, len, fixed_idx)
-            .offset(offset)
-            .build())
+        Ok(sqe_with_fd!(fd, |f| opcode::ReadFixed::new(
+            f, ptr, len, fixed_idx
+        )
+        .offset(offset)
+        .build()))
     } else {
-        Ok(opcode::Read::new(fixed_fd, ptr, len).offset(offset).build())
+        Ok(sqe_with_fd!(fd, |f| opcode::Read::new(f, ptr, len)
+            .offset(offset)
+            .build()))
     }
 }
 
@@ -85,8 +89,8 @@ pub(crate) unsafe fn make_sqe_write_fixed(
         .checked_write_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
     let offset = rw_op.offset;
-    let fixed_fd = resolve_file_fd(
-        env.file_slots,
+    let fd = resolve_file_fd(
+        env.file_table,
         rw_op.fd,
         "uring.op.submit.make_sqe_write_fixed",
     )?;
@@ -96,13 +100,15 @@ pub(crate) unsafe fn make_sqe_write_fixed(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(opcode::WriteFixed::new(fixed_fd, ptr, len, fixed_idx)
-            .offset(offset)
-            .build())
+        Ok(sqe_with_fd!(fd, |f| opcode::WriteFixed::new(
+            f, ptr, len, fixed_idx
+        )
+        .offset(offset)
+        .build()))
     } else {
-        Ok(opcode::Write::new(fixed_fd, ptr, len)
+        Ok(sqe_with_fd!(fd, |f| opcode::Write::new(f, ptr, len)
             .offset(offset)
-            .build())
+            .build()))
     }
 }
 
@@ -140,10 +146,8 @@ pub(crate) unsafe fn make_sqe_close(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let idx = close_op.fd.fixed_index() as usize;
-    if let Some(RegisteredFileEntry::BorrowedFd { .. }) =
-        env.file_slots.get(idx).and_then(|s| s.entry.as_ref())
-    {
+    let idx = close_op.fd.fixed_index();
+    if let Some(RegisteredFileEntry::BorrowedFd { .. }) = env.file_table.entry(idx) {
         return Err(UringError::InvalidInput
             .report(
                 "uring.op.submit.make_sqe_close",
@@ -153,12 +157,12 @@ pub(crate) unsafe fn make_sqe_close(
             .with_ctx("fd_fixed_index", close_op.fd.fixed_index())
             .attach_note("borrowed fd Close rejected"));
     }
-    let fixed_fd = resolve_any_fd(
-        env.file_slots,
+    let fd = resolve_any_fd(
+        env.file_table,
         close_op.fd,
         "uring.op.submit.make_sqe_close",
     )?;
-    Ok(opcode::Close::new(fixed_fd).build())
+    Ok(sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
 }
 
 pub(crate) unsafe fn make_sqe_fsync(
@@ -173,12 +177,14 @@ pub(crate) unsafe fn make_sqe_fsync(
         io_uring::types::FsyncFlags::empty()
     };
 
-    let fixed_fd = resolve_file_fd(
-        env.file_slots,
+    let fd = resolve_file_fd(
+        env.file_table,
         fsync_op.fd,
         "uring.op.submit.make_sqe_fsync",
     )?;
-    Ok(opcode::Fsync::new(fixed_fd).flags(flags).build())
+    Ok(sqe_with_fd!(fd, |f| opcode::Fsync::new(f)
+        .flags(flags)
+        .build()))
 }
 
 pub(crate) unsafe fn make_sqe_fsync_raw(
@@ -217,15 +223,15 @@ pub(crate) unsafe fn make_sqe_sync_range(
         sync_op.nbytes as u32
     };
 
-    let fixed_fd = resolve_file_fd(
-        env.file_slots,
+    let fd = resolve_file_fd(
+        env.file_table,
         sync_op.fd,
         "uring.op.submit.make_sqe_sync_range",
     )?;
-    Ok(opcode::SyncFileRange::new(fixed_fd, nbytes)
+    Ok(sqe_with_fd!(fd, |f| opcode::SyncFileRange::new(f, nbytes)
         .offset(sync_op.offset)
         .flags(sync_op.flags)
-        .build())
+        .build()))
 }
 
 pub(crate) unsafe fn make_sqe_sync_range_raw(
@@ -261,15 +267,18 @@ pub(crate) unsafe fn make_sqe_fallocate(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fixed_fd = resolve_file_fd(
-        env.file_slots,
+    let fd = resolve_file_fd(
+        env.file_table,
         fallocate_op.fd,
         "uring.op.submit.make_sqe_fallocate",
     )?;
-    Ok(opcode::Fallocate::new(fixed_fd, fallocate_op.len)
-        .offset(fallocate_op.offset)
-        .mode(fallocate_op.mode)
-        .build())
+    Ok(sqe_with_fd!(fd, |f| opcode::Fallocate::new(
+        f,
+        fallocate_op.len
+    )
+    .offset(fallocate_op.offset)
+    .mode(fallocate_op.mode)
+    .build()))
 }
 
 pub(crate) unsafe fn make_sqe_fallocate_raw(

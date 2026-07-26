@@ -9,7 +9,7 @@
 use crate::{
     config::BufferRegistrationMode,
     driver::{
-        FileSlot, MAX_CHUNKS, UringDriver, UringRegistrationStats,
+        FileTable, MAX_CHUNKS, UringDriver, UringRegistrationStats,
         registration::REGISTER_FAILURE_RETRY_COOLDOWN,
     },
     error::{UringError, UringResult},
@@ -31,7 +31,7 @@ use veloq_wheel::Wheel;
 /// disjoint from it and are handed out immutably: lazy chunk registration happens *after*
 /// `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
 pub(crate) struct SqeEnv<'d> {
-    pub(crate) file_slots: &'d [FileSlot],
+    pub(crate) file_table: &'d FileTable,
     registered_chunks: &'d BitSet,
 }
 
@@ -56,7 +56,7 @@ impl SqeEnv<'_> {
 pub(crate) struct SubmitEnv<'d, 'r> {
     pub(crate) ring: &'d mut IoUring,
     pub(crate) wheel: &'d mut Wheel<OpToken>,
-    file_slots: &'d [FileSlot],
+    file_table: &'d FileTable,
     registered_chunks: &'d mut BitSet,
     registrar: &'r (dyn BufferRegistrar + 'r),
     registration_stats: &'d mut UringRegistrationStats,
@@ -69,7 +69,7 @@ impl SubmitEnv<'_, '_> {
     #[inline]
     pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
         SqeEnv {
-            file_slots: self.file_slots,
+            file_table: self.file_table,
             registered_chunks: self.registered_chunks,
         }
     }
@@ -230,7 +230,7 @@ impl<'a> UringDriver<'a> {
             SubmitEnv {
                 ring: &mut self.ring,
                 wheel: &mut self.wheel,
-                file_slots: &self.file_slots,
+                file_table: &self.file_table,
                 registered_chunks: &mut self.registered_chunks,
                 registrar: self.registrar,
                 registration_stats: &mut self.registration_stats,
