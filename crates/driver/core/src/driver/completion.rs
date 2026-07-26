@@ -31,7 +31,7 @@ pub use table::{
 };
 pub use token::{
     CancelCompletionId, CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
-    OpTokenError, SubmitTokenContext, generation_is_newer, generation_is_older,
+    OpTokenError, SubmitTokenContext,
 };
 pub use types::{
     AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,

@@ -1,4 +1,4 @@
-use crate::slot;
+use crate::slot::{self, Generation};
 
 use super::super::super::{CompletionEvent, CompletionToken};
 use super::{CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionRaw};
@@ -34,7 +34,7 @@ impl CompletionAnomaly {
         }
     }
 
-    pub fn expected_generation(self) -> Option<u32> {
+    pub fn expected_generation(self) -> Option<Generation> {
         match self {
             Self::UnknownSlot {
                 expected_generation,
@@ -53,7 +53,7 @@ impl CompletionAnomaly {
         }
     }
 
-    pub fn actual_generation(self) -> Option<u32> {
+    pub fn actual_generation(self) -> Option<Generation> {
         match self {
             Self::StaleGeneration {
                 actual_generation, ..
@@ -133,7 +133,7 @@ impl CompletionAnomaly {
         reason: CompletionAnomalyReason,
         token: CompletionToken,
         index: usize,
-        generation: u32,
+        generation: Generation,
         state: slot::SlotState,
     ) -> Self {
         Self::SlotState {
@@ -147,7 +147,7 @@ impl CompletionAnomaly {
         }
     }
 
-    pub fn unknown_slot(token: CompletionToken, index: usize, generation: u32) -> Self {
+    pub fn unknown_slot(token: CompletionToken, index: usize, generation: Generation) -> Self {
         Self::UnknownSlot {
             token,
             index,
@@ -159,8 +159,8 @@ impl CompletionAnomaly {
     pub fn stale(
         token: CompletionToken,
         index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
+        expected_generation: Generation,
+        actual_generation: Generation,
         state: slot::SlotState,
     ) -> Self {
         Self::StaleGeneration {
@@ -176,7 +176,7 @@ impl CompletionAnomaly {
     pub fn non_active(
         token: CompletionToken,
         index: usize,
-        generation: u32,
+        generation: Generation,
         state: slot::SlotState,
     ) -> Self {
         Self::slot_state(
@@ -226,7 +226,7 @@ impl CompletionAnomaly {
         backend: CompletionBackend,
         backend_context: u64,
         index: usize,
-        expected_generation: u32,
+        expected_generation: Generation,
     ) -> Self {
         Self::BackendSpecific {
             code,
@@ -246,8 +246,8 @@ impl CompletionAnomaly {
         backend: CompletionBackend,
         backend_context: u64,
         index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
+        expected_generation: Generation,
+        actual_generation: Generation,
     ) -> Self {
         Self::BackendSpecific {
             code,

@@ -10,8 +10,8 @@ use crate::{
         registry::OpRegistry,
     },
     slot::{
-        self, CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotState,
-        SlotView,
+        self, CheckedSlotView, Generation, InFlightOrphaned, InFlightWaiting, SlotRegistryExt,
+        SlotState, SlotView,
     },
 };
 use veloq_std::sync::atomic::Ordering;
@@ -53,7 +53,8 @@ impl slot::SlotSpec for DummySlotSpec {
 }
 
 fn test_token(index: usize, generation: u32) -> OpToken {
-    OpToken::from_registry_parts(index, generation).expect("test token should be encodable")
+    OpToken::from_registry_parts(index, Generation::new(generation))
+        .expect("test token should be encodable")
 }
 
 fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
@@ -140,7 +141,7 @@ fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {
 
 fn arm_slot(registry: &mut OpRegistry<DummySlotSpec>) -> OpToken {
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
-    let token = test_token(handle.index, handle.generation);
+    let token = test_token(handle.index, handle.generation.get());
     registry
         .with_slot_storage_mut(token, |_result, payload, _sidecar| {
             *payload = Some(());
@@ -227,9 +228,9 @@ fn try_take_record_reports_future_generation_unavailable() {
                 kind,
                 CompletionAnomalyKind::NonActive {
                     index: 0,
-                    generation: 1,
+                    generation,
                     ..
-                }
+                } if generation == Generation::new(1)
             ));
         }
         PollRecordResult::Pending => panic!("future generation token must not stay pending"),
@@ -254,7 +255,7 @@ fn mark_waiting_does_not_activate_idle_future_generation() {
 #[test]
 fn mark_waiting_does_not_revive_orphaned_slot() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    table.slots[0].reset(1);
+    table.slots[0].reset(Generation::new(1));
     table.slots[0].set_state(SlotState::InFlightOrphaned, Ordering::Release);
     let token = test_token(0, 1);
 
@@ -270,7 +271,7 @@ fn mark_waiting_does_not_revive_orphaned_slot() {
 #[test]
 fn mark_orphaned_reports_stale_generation() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    table.slots[0].reset(2);
+    table.slots[0].reset(Generation::new(2));
     table.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
     let token = test_token(0, 1);
 
@@ -359,7 +360,9 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 0);
     assert!(
-        table.slots[0].generation(Ordering::Acquire) > 0x8000,
+        table.slots[0]
+            .generation(Ordering::Acquire)
+            .is_newer_than(Generation::new(0x8000)),
         "the test must actually cross the 15-bit boundary"
     );
 }

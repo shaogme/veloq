@@ -14,7 +14,7 @@ use std::{
 };
 use veloq_driver_core::{
     driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
-    slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+    slot::{Generation, Slot as CoreSlot, SlotSpec as CoreSlotSpec},
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
@@ -127,7 +127,10 @@ impl OverlappedEntry {
 
 impl Default for OverlappedEntry {
     fn default() -> Self {
-        Self::new(OpToken::from_registry_parts(0, 0).expect("zero token should be encodable"))
+        Self::new(
+            OpToken::from_registry_parts(0, Generation::ZERO)
+                .expect("zero token should be encodable"),
+        )
     }
 }
 
@@ -137,7 +140,7 @@ unsafe impl Send for OverlappedEntry {}
 /// State associated with an IOCP operation.
 #[derive(Default)]
 pub struct IocpOpState {
-    pub(crate) generation: u32,
+    pub(crate) generation: Generation,
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,

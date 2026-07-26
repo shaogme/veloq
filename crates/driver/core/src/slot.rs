@@ -32,9 +32,11 @@ pub type SlotCompletionData<Spec> = (
 );
 
 mod core;
+mod generation;
 mod table;
 
 pub use core::*;
+pub use generation::Generation;
 pub use table::*;
 
 pub trait SlotMarker: sealed::Sealed {}
@@ -372,7 +374,7 @@ pub enum SlotView<'a, Spec: SlotSpec> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotSnapshot {
     pub index: usize,
-    pub generation: u32,
+    pub generation: Generation,
     pub state: SlotState,
     pub has_op: bool,
     pub has_payload: bool,
@@ -414,7 +416,7 @@ pub enum CheckedSlotView<'a, Spec: SlotSpec> {
     Valid(SlotView<'a, Spec>),
     Missing {
         index: usize,
-        expected_generation: u32,
+        expected_generation: Generation,
     },
     Empty(SlotSnapshot),
     Stale(SlotSnapshot),
@@ -745,7 +747,7 @@ mod tests {
     fn slot_snapshot_try_token_uses_checked_user_index() {
         let snapshot = SlotSnapshot {
             index: 0,
-            generation: 3,
+            generation: Generation::new(3),
             state: SlotState::InFlightWaiting,
             has_op: true,
             has_payload: true,
@@ -756,6 +758,6 @@ mod tests {
             .expect("ordinary slot snapshot should encode");
 
         assert_eq!(token.index(), 0);
-        assert_eq!(token.generation(), 3);
+        assert_eq!(token.generation(), Generation::new(3));
     }
 }

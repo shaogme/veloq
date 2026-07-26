@@ -1,4 +1,4 @@
-use crate::slot;
+use crate::slot::{self, Generation};
 
 use super::{
     AnomalyAttach, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
@@ -6,11 +6,16 @@ use super::{
 };
 
 impl CompletionAnomalyKind {
-    pub const fn unknown_slot(index: usize, generation: u32) -> Self {
+    pub const fn unknown_slot(index: usize, generation: Generation) -> Self {
         Self::UnknownSlot { index, generation }
     }
 
-    pub const fn stale(index: usize, expected: u32, actual: u32, state: slot::SlotState) -> Self {
+    pub const fn stale(
+        index: usize,
+        expected: Generation,
+        actual: Generation,
+        state: slot::SlotState,
+    ) -> Self {
         Self::Stale {
             index,
             expected,
@@ -19,7 +24,7 @@ impl CompletionAnomalyKind {
         }
     }
 
-    pub const fn non_active(index: usize, generation: u32, state: slot::SlotState) -> Self {
+    pub const fn non_active(index: usize, generation: Generation, state: slot::SlotState) -> Self {
         Self::NonActive {
             index,
             generation,
@@ -52,7 +57,7 @@ impl CompletionAnomalyKind {
         backend: CompletionBackend,
         backend_context: u64,
         index: usize,
-        expected_generation: u32,
+        expected_generation: Generation,
     ) -> Self {
         Self::BackendSpecific {
             code,
@@ -71,8 +76,8 @@ impl CompletionAnomalyKind {
         backend: CompletionBackend,
         backend_context: u64,
         index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
+        expected_generation: Generation,
+        actual_generation: Generation,
     ) -> Self {
         Self::BackendSpecific {
             code,
@@ -109,7 +114,7 @@ impl CompletionAnomalyKind {
         }
     }
 
-    pub fn expected_generation(self) -> Option<u32> {
+    pub fn expected_generation(self) -> Option<Generation> {
         match self {
             Self::UnknownSlot { generation, .. } => Some(generation),
             Self::Stale { expected, .. } => Some(expected),
@@ -122,7 +127,7 @@ impl CompletionAnomalyKind {
         }
     }
 
-    pub fn actual_generation(self) -> Option<u32> {
+    pub fn actual_generation(self) -> Option<Generation> {
         match self {
             Self::Stale { actual, .. } => Some(actual),
             Self::NonActive { generation, .. } => Some(generation),

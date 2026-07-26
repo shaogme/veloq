@@ -27,7 +27,7 @@ use veloq_driver_core::{
         CompletionHookOutcome, CompletionIngress, CompletionSource, RawCompletion,
         SharedCompletionTable, UserCompletionEvent,
     },
-    slot::{InFlightOrphaned, InFlightWaiting, SlotState},
+    slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState},
 };
 use windows_sys::Win32::{
     Foundation::ERROR_OPERATION_ABORTED,
@@ -390,7 +390,7 @@ pub(crate) fn rio_malformed_context_kind(raw_context: u64) -> CompletionAnomalyK
 pub(crate) fn rio_missing_context_kind(
     raw_context: u64,
     index: usize,
-    generation: u32,
+    generation: Generation,
 ) -> CompletionAnomalyKind {
     CompletionAnomalyKind::backend_specific_missing(
         RIO_ANOMALY_MISSING,
@@ -404,8 +404,8 @@ pub(crate) fn rio_missing_context_kind(
 pub(crate) fn rio_stale_context_kind(
     raw_context: u64,
     index: usize,
-    expected_generation: u32,
-    actual_generation: u32,
+    expected_generation: Generation,
+    actual_generation: Generation,
 ) -> CompletionAnomalyKind {
     CompletionAnomalyKind::backend_specific_stale(
         RIO_ANOMALY_STALE,

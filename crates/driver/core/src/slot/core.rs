@@ -1,4 +1,4 @@
-use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
+use super::{Generation, SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::{
     DriverResult,
     driver::{CompletionCleanupGuard, UserCompletionEvent},
@@ -37,22 +37,34 @@ impl SlotState {
     }
 }
 
+/// `generation_bits` 是 [`Generation`] 的存储形态，不对外暴露：generation 的语义
+/// （回绕、只能按差值符号位比较）由 `Generation` 保证，位域只负责宽度。读写一律走
+/// [`PackedCoreState::generation`] / [`PackedCoreState::with_generation`]。
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
 pub struct PackedCoreState {
-    pub generation: u32,
+    pub(crate) generation_bits: u32,
     pub state: SlotState,
     pub flags: u24,
 }
 
 impl PackedCoreState {
+    /// 全新或刚被回收的 slot 状态：`Idle` + 清空 flags。
+    pub fn idle(generation: Generation) -> Self {
+        Self::new(generation.get(), SlotState::Idle, u24::new(0))
+    }
+
+    pub fn generation(self) -> Generation {
+        Generation::new(self.generation_bits())
+    }
+
     pub fn with_state(mut self, state: SlotState) -> Self {
         self.set_state(state);
         self
     }
 
-    pub fn with_generation(mut self, generation: u32) -> Self {
-        self.set_generation(generation);
+    pub fn with_generation(mut self, generation: Generation) -> Self {
+        self.set_generation_bits(generation.get());
         self
     }
 }
@@ -190,11 +202,7 @@ impl<Spec: SlotSpec> SlotData<Spec> {
 
     pub fn new() -> Self {
         Self {
-            core_state: AtomicPackedCoreState::new(PackedCoreState::new(
-                0,
-                SlotState::Idle,
-                u24::new(0),
-            )),
+            core_state: AtomicPackedCoreState::new(PackedCoreState::idle(Generation::ZERO)),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
@@ -208,7 +216,7 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         self.core_state.load(ordering).state()
     }
 
-    pub fn generation(&self, ordering: Ordering) -> u32 {
+    pub fn generation(&self, ordering: Ordering) -> Generation {
         self.core_state.load(ordering).generation()
     }
 
@@ -230,11 +238,9 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    pub(crate) fn reset(&self, generation: u32) {
-        self.core_state.store(
-            PackedCoreState::new(generation, SlotState::Idle, u24::new(0)),
-            Ordering::Release,
-        );
+    pub(crate) fn reset(&self, generation: Generation) {
+        self.core_state
+            .store(PackedCoreState::idle(generation), Ordering::Release);
     }
 
     pub(crate) fn free(&self) {

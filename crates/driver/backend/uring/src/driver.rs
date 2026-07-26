@@ -24,11 +24,15 @@ use crate::{
     error::{UringError, UringResult},
     op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
 };
-use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
-    Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
-    registry::{OpEntry, OpHandle},
+use veloq_driver_core::{
+    driver::{
+        CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
+        DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
+        RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable,
+        SubmitStatus,
+        registry::{OpEntry, OpHandle},
+    },
+    slot::Generation,
 };
 
 mod completion;
@@ -89,7 +93,7 @@ impl PendingCancel {
     }
 
     #[inline]
-    pub(crate) const fn user_parts(self) -> (usize, u32) {
+    pub(crate) const fn user_parts(self) -> (usize, Generation) {
         self.target.parts()
     }
 }
@@ -292,7 +296,7 @@ impl<'a> Driver for UringDriver<'a> {
                 index: id,
                 generation,
             }) => {
-                trace!(id, generation, "Reserved op slot");
+                trace!(id, generation = generation.get(), "Reserved op slot");
                 OpToken::from_registry_parts(id, generation).map_err(|err| {
                     UringError::InvalidState
                         .to_report()

@@ -10,7 +10,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use std::ffi::c_void;
-use veloq_driver_core::driver::OpToken;
+use veloq_driver_core::{driver::OpToken, slot::Generation};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub(crate) enum RioRequestContextDecode {
     },
     Stale {
         id: RioRequestContextId,
-        actual_generation: u32,
+        actual_generation: Generation,
     },
 }
 
@@ -105,12 +105,12 @@ const RIO_REQUEST_CONTEXT_INDEX_MASK: u64 = 0x00ff_ffff;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RioRequestContextId {
     index: usize,
-    generation: u32,
+    generation: Generation,
 }
 
 impl RioRequestContextId {
     #[inline]
-    pub(crate) fn new(index: usize, generation: u32) -> Self {
+    pub(crate) fn new(index: usize, generation: Generation) -> Self {
         assert!(
             index <= RIO_REQUEST_CONTEXT_INDEX_MASK as usize,
             "RIO request context index exceeds encodable range"
@@ -124,7 +124,7 @@ impl RioRequestContextId {
     }
 
     #[inline]
-    pub(crate) const fn generation(self) -> u32 {
+    pub(crate) const fn generation(self) -> Generation {
         self.generation
     }
 
@@ -132,7 +132,7 @@ impl RioRequestContextId {
     pub(crate) fn raw(self) -> u64 {
         (RIO_REQUEST_CONTEXT_MAGIC << RIO_REQUEST_CONTEXT_MAGIC_SHIFT)
             | ((self.index as u64) << RIO_REQUEST_CONTEXT_INDEX_SHIFT)
-            | self.generation as u64
+            | self.generation.get() as u64
     }
 
     #[inline]
@@ -143,7 +143,7 @@ impl RioRequestContextId {
         }
         let index =
             ((raw >> RIO_REQUEST_CONTEXT_INDEX_SHIFT) & RIO_REQUEST_CONTEXT_INDEX_MASK) as usize;
-        let generation = raw as u32;
+        let generation = Generation::new(raw as u32);
         Some(Self { index, generation })
     }
 }
@@ -328,7 +328,8 @@ mod tests {
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
         let socket_key = IocpHandle::for_socket(ptr::null_mut());
         RioOpRequestInit {
-            token: OpToken::from_registry_parts(11, 17).expect("test token should be encodable"),
+            token: OpToken::from_registry_parts(11, Generation::new(17))
+                .expect("test token should be encodable"),
             socket_inflight: SocketInflightToken::new(socket_key),
             op_kind: RioOpKind::Recv,
             request_id: 23,
@@ -357,7 +358,7 @@ mod tests {
                 },
                 ..
             }) if token
-                == OpToken::from_registry_parts(11, 17)
+                == OpToken::from_registry_parts(11, Generation::new(17))
                     .expect("test token should be encodable")));
     }
 
@@ -380,7 +381,7 @@ mod tests {
                 },
                 ..
             }) if token
-                == OpToken::from_registry_parts(11, 17)
+                == OpToken::from_registry_parts(11, Generation::new(17))
                     .expect("test token should be encodable")));
     }
 

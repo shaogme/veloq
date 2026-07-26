@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use veloq_buf::{FixedBuf, heap::ChunkId};
+use veloq_driver_core::slot::Generation;
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 use super::{
@@ -87,7 +88,7 @@ pub(crate) struct RioRegistry {
 
 #[derive(Default)]
 struct RioRequestContextSlot {
-    generation: u32,
+    generation: Generation,
     init: Option<RioOpRequestInit>,
     in_use: bool,
 }
@@ -189,9 +190,10 @@ impl RioRegistry {
         });
         let slot = &mut self.request_contexts[index];
         debug_assert!(!slot.in_use, "reusing active RIO request context slot");
-        let mut generation = slot.generation.wrapping_add(1);
-        if generation == 0 {
-            generation = 1;
+        // 0 是"未分配"哨兵，回绕时跳过它。
+        let mut generation = slot.generation.next();
+        if generation == Generation::ZERO {
+            generation = generation.next();
         }
         slot.generation = generation;
         slot.init = Some(init);

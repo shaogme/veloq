@@ -2,7 +2,7 @@ use crate::{
     DriverResult,
     driver::OpToken,
     slot::{
-        SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData,
+        Generation, SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData,
         SlotSidecarData, SlotSnapshot, SlotSpec, SlotState, SlotStorage, SlotTable,
     },
 };
@@ -34,7 +34,7 @@ pub struct LocalSlot<Spec: SlotSpec> {
     pub entry: OpEntry<RegistryPlatformData<Spec>>,
     pub storage: SlotStorageOf<Spec>,
     pub(crate) active: bool,
-    pub(crate) generation: u32,
+    pub(crate) generation: Generation,
 }
 
 impl<Spec: SlotSpec> LocalSlot<Spec> {
@@ -46,7 +46,7 @@ impl<Spec: SlotSpec> LocalSlot<Spec> {
             },
             storage: SlotStorageOf::<Spec>::new(),
             active: false,
-            generation: 0,
+            generation: Generation::ZERO,
         }
     }
 }
@@ -63,7 +63,7 @@ pub struct OpRegistry<Spec: SlotSpec> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpHandle {
     pub index: usize,
-    pub generation: u32,
+    pub generation: Generation,
 }
 
 pub struct AllocResult {
@@ -124,7 +124,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
                 continue;
             }
 
-            let new_gen = slot.generation(Ordering::Relaxed).wrapping_add(1);
+            let new_gen = slot.generation(Ordering::Relaxed).next();
             slot.reset(new_gen);
             slot.set_state(SlotState::Reserved, Ordering::Release);
 
@@ -288,7 +288,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.remove(token)
     }
 
-    fn recycle_at_index(&mut self, user_data: usize, generation: u32) {
+    fn recycle_at_index(&mut self, user_data: usize, generation: Generation) {
         let local = &mut self.local[user_data];
         local.active = false;
         let _ = local.op.take();
@@ -315,7 +315,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     ///
     /// 与 [`Self::remove`] 的区别是后者保留 `InFlightReady` 状态，让已到达的完成仍
     /// 可被 detached future 消费。释放一个尚未提交的预留 slot 应当用 `remove`。
-    pub fn recycle(&mut self, token: OpToken, next_generation: u32) -> bool {
+    pub fn recycle(&mut self, token: OpToken, next_generation: Generation) -> bool {
         let (user_data, generation) = token.parts();
         let local = match self.local.get(user_data) {
             Some(v) => v,

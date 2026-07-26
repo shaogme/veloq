@@ -1,4 +1,4 @@
-use crate::slot;
+use crate::slot::{self, Generation};
 
 use super::super::CompletionToken;
 
@@ -17,8 +17,8 @@ pub enum CompletionAnomalyReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendSlotRef {
     pub index: usize,
-    pub expected_generation: u32,
-    pub actual_generation: Option<u32>,
+    pub expected_generation: Generation,
+    pub actual_generation: Option<Generation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,17 +39,17 @@ pub struct CompletionRaw {
 pub enum CompletionAnomalyKind {
     UnknownSlot {
         index: usize,
-        generation: u32,
+        generation: Generation,
     },
     Stale {
         index: usize,
-        expected: u32,
-        actual: u32,
+        expected: Generation,
+        actual: Generation,
         state: slot::SlotState,
     },
     NonActive {
         index: usize,
-        generation: u32,
+        generation: Generation,
         state: slot::SlotState,
     },
     BackendContext {
@@ -105,14 +105,14 @@ pub enum CompletionAnomaly {
     UnknownSlot {
         token: CompletionToken,
         index: usize,
-        expected_generation: u32,
+        expected_generation: Generation,
         raw: Option<CompletionRaw>,
     },
     StaleGeneration {
         token: CompletionToken,
         index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
+        expected_generation: Generation,
+        actual_generation: Generation,
         state: slot::SlotState,
         raw: Option<CompletionRaw>,
     },
@@ -120,7 +120,7 @@ pub enum CompletionAnomaly {
         reason: CompletionAnomalyReason,
         token: CompletionToken,
         index: usize,
-        generation: u32,
+        generation: Generation,
         state: slot::SlotState,
         snapshot: Option<slot::SlotSnapshot>,
         raw: Option<CompletionRaw>,
@@ -137,8 +137,8 @@ pub enum CompletionAnomaly {
         backend: CompletionBackend,
         backend_context: u64,
         index: Option<usize>,
-        expected_generation: Option<u32>,
-        actual_generation: Option<u32>,
+        expected_generation: Option<Generation>,
+        actual_generation: Option<Generation>,
         raw: Option<CompletionRaw>,
     },
 }

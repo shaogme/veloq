@@ -1,5 +1,5 @@
 use crate::DriverError;
-use crate::slot;
+use crate::slot::{self, Generation};
 use diagweave::prelude::*;
 use std::{sync::Arc, task::Waker};
 use veloq_std::sync::atomic::Ordering;
@@ -7,8 +7,8 @@ use veloq_std::sync::atomic::Ordering;
 use super::{
     AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
     CompletionRecord, CompletionWritePermit, DriverCompletionDiagnosticsBackend, OpToken,
-    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent, generation_is_newer,
-    generation_is_older, run_completion_cleanup, types::CompletionMutationOutcome,
+    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
+    types::CompletionMutationOutcome,
 };
 
 pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
@@ -84,11 +84,11 @@ fn mutation_missing(token: OpToken) -> CompletionMutationOutcome {
 #[inline]
 fn mutation_generation_mismatch(
     idx: usize,
-    expected_generation: u32,
-    actual_generation: u32,
+    expected_generation: Generation,
+    actual_generation: Generation,
     state: slot::SlotState,
 ) -> CompletionMutationOutcome {
-    if generation_is_newer(actual_generation, expected_generation) {
+    if actual_generation.is_newer_than(expected_generation) {
         CompletionMutationOutcome::Rejected(AnomalyOutcome::Stale(CompletionAnomalyKind::stale(
             idx,
             expected_generation,
@@ -105,7 +105,7 @@ fn mutation_generation_mismatch(
 #[inline]
 fn mutation_non_active(
     idx: usize,
-    generation: u32,
+    generation: Generation,
     state: slot::SlotState,
 ) -> CompletionMutationOutcome {
     CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(
@@ -215,7 +215,7 @@ where
             let state = current.state();
             let cell_gen = current.generation();
 
-            if generation_is_older(generation, cell_gen) {
+            if generation.is_older_than(cell_gen) {
                 return self.rejected_completion(
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
                         CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
@@ -224,7 +224,7 @@ where
                     packet,
                 );
             }
-            if generation_is_newer(generation, cell_gen) {
+            if generation.is_newer_than(cell_gen) {
                 let outcome = if state == slot::SlotState::Idle {
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
                         CompletionAnomalyKind::non_active(idx, generation, state),
@@ -318,13 +318,13 @@ where
         let state = current.state();
         let cell_gen = current.generation();
 
-        if generation_is_newer(cell_gen, generation) {
+        if cell_gen.is_newer_than(generation) {
             let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
-        if generation_is_older(cell_gen, generation) {
+        if cell_gen.is_older_than(generation) {
             let kind = CompletionAnomalyKind::non_active(idx, generation, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
@@ -353,7 +353,7 @@ where
                 current,
                 current
                     .with_state(slot::SlotState::Idle)
-                    .with_generation(generation.wrapping_add(1)),
+                    .with_generation(generation.next()),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -497,7 +497,7 @@ where
                             current,
                             current
                                 .with_state(slot::SlotState::Idle)
-                                .with_generation(generation.wrapping_add(1)),
+                                .with_generation(generation.next()),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )

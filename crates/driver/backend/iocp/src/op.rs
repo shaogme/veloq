@@ -49,6 +49,7 @@ use veloq_driver_core::{
             WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
         },
     },
+    slot::Generation,
 };
 
 // ============================================================================
@@ -234,7 +235,8 @@ macro_rules! impl_iocp_op_erasure {
                 let op = IocpKernelOp {
                     vtable: <$OpType as IocpOpErasure>::vtable(),
                     header: OverlappedEntry::new(
-                        OpToken::from_registry_parts(0, 0).expect("zero token should be encodable"),
+                        OpToken::from_registry_parts(0, Generation::ZERO)
+                            .expect("zero token should be encodable"),
                     ),
                     payload: <$OpType as IocpOpErasure>::erase_kernel_payload(kernel_payload),
                 };

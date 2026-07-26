@@ -66,7 +66,7 @@ impl<'a> UringDriver<'a> {
             self.completion_diagnostics.backend().inc_cancel_submitted();
             trace!(
                 user_data,
-                generation,
+                generation = generation.get(),
                 cancel_id = cancel_id.raw(),
                 mode = ?request.mode,
                 "submitted async cancel"
@@ -119,7 +119,7 @@ impl<'a> UringDriver<'a> {
                         Err(err) => {
                             debug!(
                                 user_data,
-                                generation,
+                                generation = generation.get(),
                                 snapshot = ?err.snapshot,
                                 "reserved uring cancel could not prepare synthetic completion"
                             );
@@ -178,7 +178,7 @@ impl<'a> UringDriver<'a> {
                 let _ = self.accept_completion_anomaly_kind(kind, attach);
                 debug!(
                     user_data,
-                    generation,
+                    generation = generation.get(),
                     token = CompletionToken::user(request.target).raw(),
                     reason = ?reason,
                     "cancel request did not match an active uring slot"

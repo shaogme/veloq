@@ -585,7 +585,7 @@ mod tests {
     use slotmap::SlotMap;
     use std::{cell::Cell, sync::atomic::Ordering};
     use veloq_buf::{FixedBuf, NoopRegistrar};
-    use veloq_driver_core::driver::OpToken;
+    use veloq_driver_core::{driver::OpToken, slot::Generation};
 
     fn test_state_with_dispatch(addr_capacity: usize) -> RioState {
         let mut kernel = RioKernel::noop();
@@ -614,7 +614,8 @@ mod tests {
         RioSubmitPlan {
             fd: IoFd::fixed_with_generation(7, 9),
             handle,
-            token: OpToken::from_registry_parts(11, 17).expect("test token should be encodable"),
+            token: OpToken::from_registry_parts(11, Generation::new(17))
+                .expect("test token should be encodable"),
             op_kind: RioOpKind::RecvFrom,
             buffer_kind: RioSubmissionKind::Recv,
             buffer,
