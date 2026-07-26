@@ -7,8 +7,8 @@ use veloq_std::sync::atomic::Ordering;
 use super::{
     AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
     CompletionRecord, CompletionWritePermit, DriverCompletionDiagnosticsBackend, OpToken,
-    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
-    types::CompletionMutationOutcome,
+    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent, generation_is_newer,
+    generation_is_older, run_completion_cleanup, types::CompletionMutationOutcome,
 };
 
 pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
@@ -88,7 +88,7 @@ fn mutation_generation_mismatch(
     actual_generation: u32,
     state: slot::SlotState,
 ) -> CompletionMutationOutcome {
-    if actual_generation > expected_generation {
+    if generation_is_newer(actual_generation, expected_generation) {
         CompletionMutationOutcome::Rejected(AnomalyOutcome::Stale(CompletionAnomalyKind::stale(
             idx,
             expected_generation,
@@ -213,7 +213,7 @@ where
             let state = current.state();
             let cell_gen = current.generation();
 
-            if generation < cell_gen {
+            if generation_is_older(generation, cell_gen) {
                 return self.rejected_completion(
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
                         CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
@@ -222,7 +222,7 @@ where
                     packet,
                 );
             }
-            if generation > cell_gen {
+            if generation_is_newer(generation, cell_gen) {
                 let outcome = if state == slot::SlotState::Idle {
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
                         CompletionAnomalyKind::non_active(idx, generation, state),
@@ -316,13 +316,13 @@ where
         let state = current.state();
         let cell_gen = current.generation();
 
-        if cell_gen > generation {
+        if generation_is_newer(cell_gen, generation) {
             let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
-        if cell_gen < generation {
+        if generation_is_older(cell_gen, generation) {
             let kind = CompletionAnomalyKind::non_active(idx, generation, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });

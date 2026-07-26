@@ -5,8 +5,9 @@ use crate::{
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionAnomalyReason,
         CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard, CompletionControl,
-        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, HookResult, OpToken, PlatformOp, registry::OpRegistry,
+        CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, CompletionToken, HookResult, OpToken, PlatformOp,
+        registry::OpRegistry,
     },
     slot::{
         self, CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotState,
@@ -133,6 +134,11 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
 
 fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let token = arm_slot(&mut registry);
+    (registry, token)
+}
+
+fn arm_slot(registry: &mut OpRegistry<DummySlotSpec>) -> OpToken {
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
     let token = test_token(handle.index, handle.generation);
     registry
@@ -150,7 +156,7 @@ fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {
         .start_submission_with(None)
         .expect("reserved slot should start submission")
         .persist();
-    (registry, token)
+    token
 }
 
 fn accept_with_hooks(
@@ -158,10 +164,36 @@ fn accept_with_hooks(
     event: UserCompletionEvent,
     hooks: &mut TestHooks,
 ) -> CompletionFlowOutcome {
+    accept_ingress(registry, CompletionIngress::User(event), hooks)
+}
+
+/// 模拟内核回传：token 先编码成裸 `u64`，再由 `classify()` 解码回 `OpToken`。
+/// 只有走这条路径才会覆盖 `CompletionToken` 的编解码，`CompletionIngress::User`
+/// 是直接携带 `OpToken` 的，会绕过它。
+fn accept_kernel_raw(
+    registry: &mut OpRegistry<DummySlotSpec>,
+    token: OpToken,
+    res: i32,
+    hooks: &mut TestHooks,
+) -> CompletionFlowOutcome {
+    let envelope = CompletionEnvelope::from_raw_parts(
+        CompletionBackend::Core,
+        CompletionToken::user(token).raw(),
+        res,
+        0,
+    );
+    accept_ingress(registry, CompletionIngress::Kernel(envelope), hooks)
+}
+
+fn accept_ingress(
+    registry: &mut OpRegistry<DummySlotSpec>,
+    ingress: CompletionIngress,
+    hooks: &mut TestHooks,
+) -> CompletionFlowOutcome {
     let diagnostics = registry.shared.completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
     registry
-        .accept_completion(&table, &diagnostics, hooks, CompletionIngress::User(event))
+        .accept_completion(&table, &diagnostics, hooks, ingress)
         .expect("test completion should succeed")
 }
 
@@ -288,6 +320,48 @@ fn duplicate_completion_does_not_clear_ready_data() {
         }
     };
     assert_eq!(record.event.res(), 11);
+}
+
+/// 一轮 alloc/complete/consume 让 slot generation 推进 2。旧的 15 位 token 布局会在
+/// generation 跨过 `0x8000` 时把编码截断，完成回来后被判成 Stale 静默丢弃——slot 永远
+/// 停留在 `InFlightWaiting`，其 payload 永不归还。这里把单个 slot 跑满一整圈 15 位
+/// 空间，确认完成在边界两侧都能正确路由。
+#[test]
+fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
+    const ROUNDS: u32 = 0x8000 / 2 + 16;
+
+    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let table = registry.shared.clone();
+
+    for round in 0..ROUNDS {
+        let token = arm_slot(&mut registry);
+        let res = round as i32;
+        let mut hooks = TestHooks::default();
+        let outcome = accept_kernel_raw(&mut registry, token, res, &mut hooks);
+
+        assert_eq!(
+            outcome.user_completed,
+            1,
+            "round {round}: completion for generation {:#x} was not routed to its slot",
+            token.generation()
+        );
+        match table.try_take_record(token).unwrap() {
+            PollRecordResult::Ready(record) => assert_eq!(record.event.res(), res),
+            PollRecordResult::Pending => {
+                panic!("round {round}: recorded completion should be ready")
+            }
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("round {round}: recorded completion was dropped: {kind:?}")
+            }
+        }
+    }
+
+    let snapshot = table.completion_diagnostics().snapshot();
+    assert_eq!(snapshot.stale_completion, 0);
+    assert!(
+        table.slots[0].generation(Ordering::Acquire) > 0x8000,
+        "the test must actually cross the 15-bit boundary"
+    );
 }
 
 #[test]

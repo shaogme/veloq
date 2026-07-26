@@ -1,7 +1,40 @@
-const INDEX_LIMIT: u64 = 1 << 48;
+/// `CompletionToken` 的 user 布局（bit 63 为 0）：
+///
+/// ```text
+///  bit 63       : control flag，user token 恒为 0
+///  bits 31..=62 : generation（完整 32 位，与 `OpToken::generation` 等宽）
+///  bits 0..=30  : slot index（31 位）
+/// ```
+///
+/// generation 必须与 slot 侧的 `PackedCoreState::generation` **等宽**：内核只回传
+/// 这个 u64，解码出的 generation 一旦比 slot 侧窄，跨过窄宽度边界后完成就会被
+/// `record_completion` 判成 Stale 而静默丢弃——slot 永久停留在 `InFlightWaiting`，
+/// 其持有的 buffer 永不归还。index 侧留 31 位：它的实际上界是 ring 深度（默认
+/// 1024），31 位有五个数量级的余量。
+const INDEX_BITS: u32 = 31;
+const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
+const INDEX_LIMIT: u64 = 1 << INDEX_BITS;
+const GENERATION_SHIFT: u32 = INDEX_BITS;
 const CONTROL_TOKEN_FLAG: u64 = 1 << 63;
 const CONTROL_TOKEN_KIND_SHIFT: u32 = 48;
 const CONTROL_TOKEN_ID_SHIFT: u32 = 32;
+
+/// 判定 `a` 是否比 `b` 旧（`a` 落后于 `b`）。
+///
+/// generation 单调递增并在 `u32` 上自然回绕，因此新旧判定不能用裸 `<` / `>`：
+/// 跨过 `u32::MAX` 后大小关系会整体反转。改用差值的符号位——只要两者的实际距离
+/// 不超过 `u32::MAX / 2`（一次 alloc/complete/consume 只推进 2 代，真实距离是个
+/// 位数），结论就与"谁更新"一致。`a == b` 返回 `false`。
+#[inline]
+pub const fn generation_is_older(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+/// 判定 `a` 是否比 `b` 新。回绕语义见 [`generation_is_older`]。
+#[inline]
+pub const fn generation_is_newer(a: u32, b: u32) -> bool {
+    generation_is_older(b, a)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -63,13 +96,17 @@ pub struct OpToken {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpTokenError {
-    ReservedControlIndex { index: usize },
+    /// slot index 超出 `CompletionToken` 的 index 位宽，编码后会侵占 generation 位。
+    IndexOverflow { index: usize },
 }
 
 impl OpToken {
+    /// index 的上界（不含），即 `CompletionToken` 中 index 位域能表达的槽位数量。
+    pub const INDEX_LIMIT: usize = INDEX_LIMIT as usize;
+
     pub const fn try_new(index: usize, generation: u32) -> Result<Self, OpTokenError> {
         if index as u64 >= INDEX_LIMIT {
-            return Err(OpTokenError::ReservedControlIndex { index });
+            return Err(OpTokenError::IndexOverflow { index });
         }
         Ok(Self { index, generation })
     }
@@ -131,7 +168,7 @@ impl std::error::Error for CompletionTokenError {}
 impl CompletionToken {
     pub const fn user(token: OpToken) -> Self {
         let (index, generation) = token.parts();
-        Self(((generation as u64 & 0x7fff) << 48) | (index as u64 & 0x0000_ffff_ffff_ffff))
+        Self(((generation as u64) << GENERATION_SHIFT) | (index as u64 & INDEX_MASK))
     }
 
     pub(super) const fn from_raw(raw: u64) -> Self {
@@ -176,13 +213,13 @@ impl CompletionToken {
 
     pub fn classify(self) -> CompletionTokenClass {
         if (self.0 & CONTROL_TOKEN_FLAG) == 0 {
-            let raw_index = self.0 & 0x0000_ffff_ffff_ffff;
-            if raw_index <= usize::MAX as u64 {
-                let index = raw_index as usize;
-                let generation = ((self.0 >> 48) & 0x7fff) as u32;
-                if let Ok(token) = OpToken::try_new(index, generation) {
-                    return CompletionTokenClass::User(token);
-                }
+            // control flag 已确认为 0，故 `self.0 >> GENERATION_SHIFT` 至多 32 位，
+            // `as u32` 不会丢位——generation 是无损往返的。
+            let generation = (self.0 >> GENERATION_SHIFT) as u32;
+            if let Ok(index) = usize::try_from(self.0 & INDEX_MASK)
+                && let Ok(token) = OpToken::try_new(index, generation)
+            {
+                return CompletionTokenClass::User(token);
             }
         }
 
@@ -207,5 +244,93 @@ impl CompletionToken {
 impl From<CompletionToken> for u64 {
     fn from(value: CompletionToken) -> Self {
         value.raw()
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "loom"))]
+mod tests {
+    use super::*;
+
+    /// 覆盖旧 15 位布局的边界：`0x8000` 及以上的 generation 曾在编码时被截断，
+    /// 使完成回来后被判成 Stale 而静默丢弃。
+    const GENERATION_CASES: [u32; 10] = [
+        0,
+        1,
+        0x7ffe,
+        0x7fff,
+        0x8000,
+        0xffff,
+        0x1_0000,
+        0x7fff_ffff,
+        0x8000_0000,
+        u32::MAX,
+    ];
+
+    #[test]
+    fn user_token_round_trips_at_generation_boundaries() {
+        for generation in GENERATION_CASES {
+            for index in [0usize, 1, 7, 1023, 1024, OpToken::INDEX_LIMIT - 1] {
+                let token = OpToken::try_new(index, generation).expect("token should be encodable");
+                let round_tripped = CompletionToken::user(token)
+                    .op_token()
+                    .expect("user token should decode back to an OpToken");
+
+                assert_eq!(
+                    round_tripped, token,
+                    "index {index:#x} / generation {generation:#x} did not survive the round-trip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_token_never_collides_with_the_control_flag() {
+        for generation in GENERATION_CASES {
+            let token = OpToken::try_new(OpToken::INDEX_LIMIT - 1, generation).expect("token");
+            let raw = CompletionToken::user(token).raw();
+
+            assert_eq!(
+                raw & CONTROL_TOKEN_FLAG,
+                0,
+                "generation {generation:#x} leaked into the control flag"
+            );
+        }
+    }
+
+    #[test]
+    fn index_beyond_the_token_width_is_rejected() {
+        assert_eq!(
+            OpToken::try_new(OpToken::INDEX_LIMIT, 0),
+            Err(OpTokenError::IndexOverflow {
+                index: OpToken::INDEX_LIMIT
+            })
+        );
+        assert!(OpToken::try_new(OpToken::INDEX_LIMIT - 1, u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn control_tokens_do_not_decode_as_user_tokens() {
+        assert!(CompletionToken::waker(0).op_token().is_none());
+        assert!(CompletionToken::waker(u16::MAX).op_token().is_none());
+        assert!(
+            CompletionToken::cancel(CancelCompletionId::new(u16::MAX))
+                .op_token()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generation_ordering_survives_wraparound() {
+        assert!(generation_is_older(0, 1));
+        assert!(generation_is_newer(1, 0));
+        assert!(!generation_is_older(1, 1));
+        assert!(!generation_is_newer(1, 1));
+
+        // 回绕点：`u32::MAX` 的下一代是 0 / 1，裸 `<` 会把它们判反。
+        assert!(generation_is_newer(0, u32::MAX));
+        assert!(generation_is_newer(1, u32::MAX - 1));
+        assert!(generation_is_older(u32::MAX, 1));
+        assert!(generation_is_older(u32::MAX - 1, 0));
     }
 }
