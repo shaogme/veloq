@@ -4,17 +4,17 @@ use crate::{
     DriverCoreError,
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionAnomalyReason,
-        CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard, CompletionControl,
-        CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, CompletionToken, HookResult, OpToken, PlatformOp,
-        registry::OpRegistry,
+        CompletionBackend, CompletionBackendHooks, CompletionCleanup, CompletionCleanupGuard,
+        CompletionContinuation, CompletionControl, CompletionEnvelope, CompletionFlowExt,
+        CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+        CompletionToken, HookResult, OpToken, PlatformOp, registry::OpRegistry,
     },
     slot::{
         self, CheckedSlotView, Generation, InFlightOrphaned, InFlightWaiting, SlotRegistryExt,
         SlotState, SlotView,
     },
 };
-use veloq_std::sync::atomic::Ordering;
+use veloq_std::sync::atomic::{AtomicUsize, Ordering};
 
 struct DummyPlatformOp;
 
@@ -64,6 +64,25 @@ fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
 #[derive(Default)]
 struct TestHooks {
     cleanup: Option<CompletionCleanupGuard>,
+    /// 还要产出多少条 `More` 完成，用来模拟一个 multishot 操作。
+    remaining_more: usize,
+}
+
+impl TestHooks {
+    fn multishot(remaining_more: usize) -> Self {
+        Self {
+            cleanup: None,
+            remaining_more,
+        }
+    }
+
+    fn next_continuation(&mut self) -> CompletionContinuation {
+        if self.remaining_more == 0 {
+            return CompletionContinuation::Final;
+        }
+        self.remaining_more -= 1;
+        CompletionContinuation::More
+    }
 }
 
 impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
@@ -83,6 +102,20 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         slot: slot::Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+        let continuation = self.next_continuation();
+        if continuation.is_more() {
+            // multishot：slot 的 op 与 payload 必须原地留给内核后续的完成，记录里携带的
+            // 是**本次**完成新产出的东西（真实后端是一个 fd 或一个 FixedBuf）。
+            return Ok(CompletionHookOutcome::User {
+                event,
+                payload: (),
+                detail: None,
+                cleanup: self.cleanup.take().unwrap_or_default(),
+                continuation,
+                effect: (),
+            });
+        }
+
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -91,6 +124,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             payload: payload.expect("test slot payload should exist"),
             detail,
             cleanup: self.cleanup.take().unwrap_or_default(),
+            continuation,
             effect: (),
         })
     }
@@ -108,6 +142,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         drop(detail);
         Ok(CompletionHookOutcome::Cleanup {
             cleanup: self.cleanup.take().unwrap_or_default(),
+            continuation: CompletionContinuation::Final,
             effect: (),
         })
     }
@@ -496,4 +531,222 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 1);
+}
+
+// ---------------------------------------------------------------------------
+// multishot：一个 slot 产生多条完成
+// ---------------------------------------------------------------------------
+
+fn counting_cleanup(counter: &Arc<AtomicUsize>) -> CompletionCleanupGuard {
+    let counter = counter.clone();
+    CompletionCleanupGuard::new(CompletionCleanup::new(move || {
+        counter.fetch_add(1, Ordering::Release);
+        Ok(())
+    }))
+}
+
+fn take_ready(
+    table: &slot::SlotTable<DummySlotSpec>,
+    token: OpToken,
+) -> CompletionRecord<DummySlotSpec> {
+    match table.try_take_record(token).unwrap() {
+        PollRecordResult::Ready(record) => record,
+        PollRecordResult::Pending => panic!("a published completion must be takeable"),
+        PollRecordResult::Unavailable { kind, .. } => panic!("completion unavailable: {kind:?}"),
+    }
+}
+
+/// `More` 的完成不归还 slot、不推进 generation：同一个 token 必须能继续接收完成。
+#[test]
+fn a_multishot_slot_keeps_its_token_across_completions() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let mut hooks = TestHooks::multishot(2);
+
+    // 第一条 More。
+    let outcome = accept_kernel_raw(&mut registry, token, 1, &mut hooks);
+    assert_eq!(outcome.user_completed, 1);
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::InFlightWaiting);
+    assert!(status.ready, "the record must be published");
+    assert!(status.streaming, "the operation is still in flight");
+    assert_eq!(
+        table.slots[token.index()].generation(Ordering::Acquire),
+        token.generation(),
+        "a `More` completion must not invalidate the token"
+    );
+
+    // 取走它：信箱空了，但 slot 仍在途，所以既不归还也不推进 generation。
+    let record = take_ready(&table, token);
+    assert_eq!(record.event.res(), 1);
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::InFlightWaiting);
+    assert!(!status.ready);
+    assert!(status.streaming);
+    assert_eq!(
+        table.slots[token.index()].generation(Ordering::Acquire),
+        token.generation()
+    );
+    assert!(matches!(
+        table.try_take_record(token).unwrap(),
+        PollRecordResult::Pending
+    ));
+
+    // 第二条 More，同一个 token 照常路由。
+    let outcome = accept_kernel_raw(&mut registry, token, 2, &mut hooks);
+    assert_eq!(outcome.user_completed, 1);
+    assert_eq!(take_ready(&table, token).event.res(), 2);
+
+    // 第三条是 Final：这次才归还 slot 并让 token 失效。
+    let outcome = accept_kernel_raw(&mut registry, token, 3, &mut hooks);
+    assert_eq!(outcome.user_completed, 1);
+    assert!(
+        !table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .streaming
+    );
+    assert_eq!(take_ready(&table, token).event.res(), 3);
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert!(status.is_idle(), "a final completion must recycle the slot");
+    assert!(registry.alloc(()).is_ok());
+}
+
+/// 消费方跟不上时记录排队，且按到达顺序取出。
+///
+/// 这条同时是「终态判据为什么不能只看 `streaming`」的锚点：取走第一条（`More`）的那
+/// 一刻 `streaming` 已经被第二条（`Final`）清成 false，若据此收尾就会推进 generation，
+/// 把第二条永久锁在信箱里。
+#[test]
+fn queued_completions_are_taken_in_arrival_order() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let mut hooks = TestHooks::multishot(1);
+
+    let _ = accept_kernel_raw(&mut registry, token, 10, &mut hooks); // More
+    let _ = accept_kernel_raw(&mut registry, token, 20, &mut hooks); // Final
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert!(status.ready);
+    assert!(
+        !status.streaming,
+        "the final completion cleared `streaming`"
+    );
+
+    assert_eq!(take_ready(&table, token).event.res(), 10);
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert!(
+        status.ready,
+        "the queued second record must keep the mailbox non-empty"
+    );
+    assert_eq!(
+        table.slots[token.index()].generation(Ordering::Acquire),
+        token.generation(),
+        "taking a record with another one queued must not invalidate the token"
+    );
+
+    assert_eq!(take_ready(&table, token).event.res(), 20);
+    assert!(
+        table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .is_idle()
+    );
+}
+
+/// 放弃一个仍在途的 multishot：信箱清空、cleanup 全跑，但 slot 转入 `InFlightOrphaned`
+/// 且 **generation 不动**——内核后续的完成还要靠这个 token 找回 slot 才跑得到
+/// `orphan_cleanup`。
+#[test]
+fn orphaning_a_streaming_slot_keeps_it_in_flight() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let cleanups = Arc::new(AtomicUsize::new(0));
+
+    let mut hooks = TestHooks::multishot(2);
+    hooks.cleanup = Some(counting_cleanup(&cleanups));
+    let _ = accept_kernel_raw(&mut registry, token, 1, &mut hooks);
+    hooks.cleanup = Some(counting_cleanup(&cleanups));
+    let _ = accept_kernel_raw(&mut registry, token, 2, &mut hooks);
+    assert_eq!(cleanups.load(Ordering::Acquire), 0);
+
+    assert_eq!(
+        table.mark_orphaned(token),
+        CompletionMutationOutcome::Applied
+    );
+
+    assert_eq!(
+        cleanups.load(Ordering::Acquire),
+        2,
+        "every queued record's cleanup must run"
+    );
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::InFlightOrphaned);
+    assert!(!status.ready);
+    assert!(
+        status.streaming,
+        "the kernel is still going to complete this"
+    );
+    assert_eq!(
+        table.slots[token.index()].generation(Ordering::Acquire),
+        token.generation(),
+        "an in-flight multishot must keep its token valid for orphan cleanup"
+    );
+    assert!(!table.has_ready_completion());
+
+    // 内核的收尾完成仍然找得到这个 slot，走 orphan 路径。
+    let outcome = accept_kernel_raw(&mut registry, token, 0, &mut hooks);
+    assert_eq!(outcome.orphan_cleaned, 1);
+    assert!(
+        table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .is_idle()
+    );
+}
+
+/// 单发路径的回归锚点：`Final` 完成的行为与队列化之前逐条一致。
+#[test]
+fn a_final_completion_still_recycles_the_slot() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+
+    let mut hooks = TestHooks::default();
+    let outcome = accept_kernel_raw(&mut registry, token, 7, &mut hooks);
+    assert_eq!(outcome.user_completed, 1);
+
+    // 发布之后 slot 已被 finalize 归还，信箱里压着唯一一条记录。
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::Idle);
+    assert!(status.ready);
+    assert!(!status.streaming);
+    assert!(!status.is_idle());
+
+    assert_eq!(take_ready(&table, token).event.res(), 7);
+
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert!(status.is_idle());
+    assert_eq!(
+        table.slots[token.index()].generation(Ordering::Acquire),
+        token.generation().next(),
+        "consuming a final record must invalidate the token"
+    );
+}
+
+/// 信箱非空时，单发操作的第二条完成仍旧被拒——队列化不能顺手把这道防御放开。
+#[test]
+fn a_second_completion_on_a_single_shot_slot_is_still_rejected() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+
+    let mut hooks = TestHooks::default();
+    let _ = accept_kernel_raw(&mut registry, token, 1, &mut hooks);
+    let outcome = accept_with_hooks(&mut registry, test_event(token, 2), &mut hooks);
+    assert_eq!(outcome.anomaly, 1);
+
+    // 信箱里仍旧只有第一条。
+    assert_eq!(take_ready(&table, token).event.res(), 1);
+    assert!(matches!(
+        table.try_take_record(token).unwrap(),
+        PollRecordResult::Unavailable { .. }
+    ));
 }

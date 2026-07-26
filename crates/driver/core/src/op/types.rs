@@ -22,6 +22,8 @@ pub enum OpKind {
     UdpRecv = 16,
     UdpSend = 17,
     UdpConnect = 18,
+    AcceptMulti = 19,
+    AcceptedSocket = 20,
 }
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
@@ -153,6 +155,23 @@ pub struct Accept<H: Handle, A: SockAddr> {
     /// Parsed remote address (populated after completion).
     pub remote_addr: Option<std::net::SocketAddr>,
 }
+
+/// Accept connections on a listening socket until the operation is cancelled.
+///
+/// One submission, many completions (io_uring multishot). Each completion carries a new
+/// connection; the operation stays armed until it is cancelled or the kernel terminates it.
+pub struct AcceptMulti<H: Handle> {
+    pub fd: IoFd<H>,
+}
+
+/// One connection produced by an [`AcceptMulti`] stream.
+///
+/// Deliberately carries no address: `IORING_OP_ACCEPT`'s multishot variant has no `addr` /
+/// `addrlen` fields at all, because several completions sharing one address buffer would
+/// overwrite each other. The accepted descriptor arrives as the operation's `Completion`
+/// (from the CQE's result), and the peer address has to be recovered with `getpeername`
+/// afterwards — see `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2.
+pub struct AcceptedSocket;
 
 /// Send data to a specific address (UDP).
 pub struct SendTo<H: Handle> {

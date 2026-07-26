@@ -23,9 +23,9 @@ mod submit;
 pub(crate) use payload::UringOpPayload;
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
-    Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
-    ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
-    UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
+    Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
+    OpSend, Open, ReadFixed, ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout,
+    UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
 pub(crate) use submit::sqe_with_fd;
 
@@ -58,6 +58,18 @@ pub(crate) type GetTimeoutFn =
 pub(crate) type ResolveChunksFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [ChunkId]) -> usize;
 
+/// 为一条完成构造它自己的产物（item）。
+///
+/// 返回 `None` 表示这个操作是单发的——完成的产物就是 slot 里那个提交 payload，完成路径
+/// 照旧把它取走。返回 `Some` 表示这是 multishot：提交 payload 必须留在 slot 里（内核还
+/// 会用），记录里携带的是这里新造的东西。
+pub(crate) type MultishotItemFn = unsafe fn(
+    op: &mut UringKernelOp,
+    payload: &mut UringUserPayload,
+    result: i32,
+    flags: u32,
+) -> UringResult<Option<UringUserPayload>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {
     /// Submit a Standard SQE to the ring
@@ -74,6 +86,7 @@ pub(crate) struct OpVTable {
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,
     pub(crate) resolve_chunks: ResolveChunksFn,
+    pub(crate) multishot_item: MultishotItemFn,
 }
 
 // ============================================================================

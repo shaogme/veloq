@@ -1,11 +1,12 @@
 pub(crate) use veloq_driver_core::op::types::{
-    Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
-    FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open,
-    ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend,
-    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
-    SyncFileRangeRaw as CoreSyncFileRangeRaw, Timeout, UdpConnect as CoreUdpConnect,
-    UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend,
-    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
+    Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, AcceptedSocket, Close as CoreClose,
+    Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
+    Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open, ReadFixed as CoreReadFixed,
+    ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend, SendTo as CoreSendTo,
+    SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw, Timeout,
+    UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
+    UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
+    WriteRaw as CoreWriteRaw,
 };
 
 use crate::config::{SockAddrStorage, UringRawHandle};
@@ -30,6 +31,7 @@ pub(crate) type SyncFileRangeRaw = CoreSyncFileRangeRaw<UringRawHandle>;
 pub(crate) type Fallocate = CoreFallocate<UringRawHandle>;
 pub(crate) type FallocateRaw = CoreFallocateRaw<UringRawHandle>;
 pub(crate) type Accept = CoreAccept<UringRawHandle, SockAddrStorage>;
+pub(crate) type AcceptMulti = CoreAcceptMulti<UringRawHandle>;
 pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
 pub(crate) type UdpRecvFrom = CoreUdpRecvFrom<UringRawHandle>;
 pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
@@ -53,6 +55,11 @@ pub enum UringUserPayload {
     Fallocate(Fallocate),
     FallocateRaw(FallocateRaw),
     Accept(Accept),
+    /// multishot accept 的**提交** payload：一直留在 slot 里直到操作终止。
+    AcceptMulti(AcceptMulti),
+    /// multishot accept **每条完成**的产物。与上一个变体的区别见
+    /// [`veloq_driver_core::op::IntoMultishotOp`]。
+    AcceptedSocket(AcceptedSocket),
     SendTo(SendTo),
     UdpRecvFrom(UdpRecvFrom),
     Open(Open),
@@ -186,6 +193,7 @@ pub(crate) enum UringOpPayload {
     Fallocate(KernelRef<Fallocate>),
     FallocateRaw(KernelRef<FallocateRaw>),
     Accept(AcceptPayload),
+    AcceptMulti(KernelRef<AcceptMulti>),
     SendTo(SendToPayload),
     UdpRecvFrom(UdpRecvFromPayload),
     Open(OpenPayload),

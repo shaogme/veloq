@@ -18,10 +18,8 @@ pub(crate) use payload::{
     KernelRef, OpenPayload, PayloadRef, SendToPayload, UdpRecvFromPayload, kernel_ref,
 };
 use spec::{IocpOpErasure, IocpOpSpec};
-pub(crate) use state::{
-    BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, IocpSlotSpec, Slot,
-};
-pub use state::{IocpOpState, OverlappedEntry};
+pub(crate) use state::{BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, Slot};
+pub use state::{IocpOpState, IocpSlotSpec, OverlappedEntry};
 pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
 
 use std::sync::Arc;

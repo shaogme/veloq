@@ -9,9 +9,10 @@ use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
 use veloq_driver_core::{
     driver::{
-        CompletionBackendHooks, CompletionControl, CompletionFlowExt, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, CompletionToken, DriverSubmitResult, OpToken,
-        SharedCompletionTable, SubmitStatus, SyntheticCompletionSource, UserCompletionEvent,
+        CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFlowExt,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+        DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
+        SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{
         CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
@@ -98,6 +99,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                 payload,
                 detail,
                 cleanup,
+                // IOCP 没有 multishot：一次提交恰好对应一条完成。
+                continuation: CompletionContinuation::Final,
                 effect: (),
             })
         } else {
@@ -124,6 +127,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         let _ = guard.take_completion_data();
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
+            continuation: CompletionContinuation::Final,
             effect: (),
         })
     }

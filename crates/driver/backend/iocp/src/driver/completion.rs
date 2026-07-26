@@ -4,9 +4,9 @@ use diagweave::prelude::*;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
-        CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
-        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, SyntheticCompletionSource, UserCompletionEvent,
+        CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
+        CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -172,6 +172,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
+            continuation: CompletionContinuation::Final,
             effect: socket_inflight
                 .map(IocpBackendEffect::SocketInflight)
                 .unwrap_or_default(),
@@ -383,6 +384,7 @@ fn complete_iocp_waiting_slot(
         let _data = std::mem::take(guard.platform_mut());
         return Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
+            continuation: CompletionContinuation::Final,
             effect,
         });
     }
@@ -414,6 +416,8 @@ fn complete_iocp_waiting_slot(
             payload,
             detail: detail.or_else(|| io_detail.take()),
             cleanup,
+            // IOCP 没有 multishot：一次提交恰好对应一条完成。
+            continuation: CompletionContinuation::Final,
             effect,
         })
     } else {
@@ -472,6 +476,7 @@ fn complete_cancel_waiting_slot(
         drop(detail);
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
+            continuation: CompletionContinuation::Final,
             effect: IocpBackendEffect::None,
         })
     }

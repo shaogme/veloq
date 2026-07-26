@@ -223,6 +223,20 @@ pub trait Driver {
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>>;
 
+    /// 本 driver 当前可用的可选能力。默认全否——后端不实现就等于没有。
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities::default()
+    }
+
+    /// 记录一个能力在运行期被内核拒绝（典型是 `-EINVAL`），后续不再尝试。
+    ///
+    /// 存在的理由是**探测拿不到的东西只能靠试**：`IORING_OP_ACCEPT` 从 5.5 就有，
+    /// multishot 是 5.19 才加的一个标志位，`IORING_REGISTER_PROBE` 分不出这两者。与其
+    /// 去解析 `uname`（发行版内核的版本号并不可靠），不如让第一次提交去问内核，然后把
+    /// 答案缓存下来——代价是每个 driver 至多一次失败的提交。
+    #[doc(hidden)]
+    fn note_capability_rejected(&mut self, _capability: DriverCapability) {}
+
     fn drain_cancel_requests(
         &mut self,
     ) -> DriverResult<CancelDrainOutcome, SlotError<Self::SlotSpec>> {
@@ -344,6 +358,15 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
         self.provider.with_driver_ref(|d| d.create_waker())
     }
 
+    fn capabilities(&self) -> DriverCapabilities {
+        self.provider.with_driver_ref(|d| d.capabilities())
+    }
+
+    fn note_capability_rejected(&mut self, capability: DriverCapability) {
+        self.provider
+            .with_driver_mut(|d| d.note_capability_rejected(capability))
+    }
+
     fn drain_cancel_requests(
         &mut self,
     ) -> DriverResult<CancelDrainOutcome, SlotError<Self::SlotSpec>> {
@@ -392,6 +415,26 @@ impl CancelDrainOutcome {
             }
         }
     }
+}
+
+/// 后端可选能力的集合。
+///
+/// 全 `false` 是**合法且必须能工作**的配置：IOCP 一个都没有，Linux 5.6–5.18 也没有
+/// （multishot accept / buf ring 要 5.19，multishot recv 要 6.0，而仓库声明的最低内核是
+/// 5.6）。所以「不支持时怎么办」是一条会被真实测试覆盖的主路径，不是兼容层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriverCapabilities {
+    pub accept_multi: bool,
+    pub recv_multi: bool,
+    pub provided_buffers: bool,
+}
+
+/// [`DriverCapabilities`] 里的单个条目，供运行期降级使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverCapability {
+    AcceptMulti,
+    RecvMulti,
+    ProvidedBuffers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

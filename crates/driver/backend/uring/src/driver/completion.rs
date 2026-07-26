@@ -19,10 +19,10 @@ use crate::{
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
-        CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
-        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, Driver, DriverCompletionDiagnostics, OpToken, PlatformOp, RawCompletion,
-        SyntheticCompletionSource, UserCompletionEvent,
+        CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
+        CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, Driver, DriverCompletionDiagnostics, OpToken,
+        PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -268,9 +268,21 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
             | CompletionSource::User
             | CompletionSource::Backend(_) => event.raw().res,
         };
-        let cleanup = cleanup_orphaned_slot(slot, res);
+        // 一个已放弃的 multishot 会继续投递完成，每一条都要跑 cleanup（accept 的话就是
+        // 关掉那个内核已经建好的连接），但只有终态那条才能归还 slot。
+        let continuation = if io_uring::cqueue::more(event.raw().flags) {
+            CompletionContinuation::More
+        } else {
+            CompletionContinuation::Final
+        };
+        let cleanup = if continuation.is_more() {
+            cleanup_orphaned_streaming_slot(slot, res)
+        } else {
+            cleanup_orphaned_slot(slot, res)
+        };
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
+            continuation,
             effect: UringBackendEffect::None,
         })
     }
@@ -578,10 +590,19 @@ fn complete_kernel_waiting_slot(
     token: OpToken,
     raw: RawCompletion,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
-    let (final_res, cleanup) = match slot.with_op_and_payload_mut(|op, payload| {
+    // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
+    // core 只见 `CompletionContinuation`（见 `DRIVER_REVIEW.md` §4.2(a)）。
+    let continuation = if io_uring::cqueue::more(raw.flags) {
+        CompletionContinuation::More
+    } else {
+        CompletionContinuation::Final
+    };
+
+    let (final_res, cleanup, item) = match slot.with_op_and_payload_mut(|op, payload| {
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
         let cleanup = op.completion_cleanup(raw.res);
-        (final_res, cleanup)
+        let item = unsafe { (op.vtable.multishot_item)(op, payload, raw.res, raw.flags) };
+        (final_res, cleanup, item)
     }) {
         Ok(result) => result,
         Err(err) => {
@@ -591,20 +612,53 @@ fn complete_kernel_waiting_slot(
             ));
         }
     };
+    let item = item?;
+    let res_code = driver_result_to_event_res(&final_res);
+    let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags);
+    let res_is_ok = final_res.is_ok();
+    // 完成本身的错误在没有更具体的 `detail` 时充当 detail，与队列化之前逐条等价。
+    let mut res_error = final_res.err();
+
+    if continuation.is_more() {
+        // slot 原地不动：op 与提交 payload 还要给内核后续的完成用，cell 也必须停在
+        // `InFlightWaiting` 才能继续路由。
+        let Some(item) = item else {
+            return Err(UringError::InvalidState.report(
+                "uring.complete_kernel_waiting_slot",
+                "kernel reported IORING_CQE_F_MORE for an operation that produces no item",
+            ));
+        };
+        return Ok(CompletionHookOutcome::User {
+            event,
+            payload: item,
+            detail: res_error.take().map(Err),
+            cleanup,
+            continuation,
+            effect: UringBackendEffect::None,
+        });
+    }
 
     let mut completed = slot.complete();
-    let res_code = driver_result_to_event_res(&final_res);
-
-    let (payload, mut detail) = completed.take_completion_data();
-    let Some(payload) = payload else {
-        drop(detail);
-        return Err(UringError::InvalidState.report(
-            "uring.complete_kernel_waiting_slot",
-            "slot payload missing on completion",
-        ));
+    let (submit_payload, detail) = completed.take_completion_data();
+    // multishot 的终态完成同样产出一条 item，提交 payload（监听 socket 之类）到此为止。
+    let payload = match item {
+        Some(item) => {
+            drop(submit_payload);
+            item
+        }
+        None => {
+            let Some(payload) = submit_payload else {
+                drop(detail);
+                return Err(UringError::InvalidState.report(
+                    "uring.complete_kernel_waiting_slot",
+                    "slot payload missing on completion",
+                ));
+            };
+            payload
+        }
     };
 
-    let effect = if final_res.is_ok() {
+    let effect = if res_is_ok {
         match &payload {
             UringUserPayload::Close(close) => UringBackendEffect::CloseCompleted { fd: close.fd },
             _ => UringBackendEffect::None,
@@ -613,18 +667,15 @@ fn complete_kernel_waiting_slot(
         UringBackendEffect::None
     };
 
-    if detail.is_none()
-        && let Err(err) = final_res
-    {
-        detail = Some(Err(err));
-    }
+    let detail = detail.or_else(|| res_error.take().map(Err));
     let _ = completed.take_op();
 
     Ok(CompletionHookOutcome::User {
-        event: UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags),
+        event,
         payload,
         detail,
         cleanup,
+        continuation,
         effect,
     })
 }
@@ -650,6 +701,8 @@ fn complete_timer_waiting_slot(
         payload,
         detail,
         cleanup: CompletionCleanupGuard::default(),
+        // 软件定时器只会触发一次。
+        continuation: CompletionContinuation::Final,
         effect: UringBackendEffect::None,
     })
 }
@@ -687,6 +740,8 @@ fn complete_submission_failure_slot(
         payload,
         detail: detail.or(report.map(Err)),
         cleanup,
+        // 提交失败的操作从未进入内核，不会再有完成。
+        continuation: CompletionContinuation::Final,
         effect: UringBackendEffect::None,
     })
 }
@@ -716,6 +771,8 @@ fn complete_local_cancel_slot(
             payload,
             detail,
             cleanup,
+            // 本地取消是这个操作的终点，不管它原本是不是 multishot。
+            continuation: CompletionContinuation::Final,
             effect: UringBackendEffect::None,
         }),
         (CancelMode::UserVisible, None) => {
@@ -730,10 +787,23 @@ fn complete_local_cancel_slot(
             drop(detail);
             Ok(CompletionHookOutcome::Cleanup {
                 cleanup,
+                continuation: CompletionContinuation::Final,
                 effect: UringBackendEffect::None,
             })
         }
     }
+}
+
+/// 一个仍在途的、已被放弃的 multishot 收到中间完成：只取 cleanup，**不掏空 slot**。
+///
+/// 与 [`cleanup_orphaned_slot`] 的差别就在这里——那个会 `take_op` / `take_completion_data`，
+/// 而内核还要用它们继续投递完成。
+fn cleanup_orphaned_streaming_slot(
+    mut slot: Slot<'_, InFlightOrphaned>,
+    cqe_res: i32,
+) -> CompletionCleanupGuard {
+    slot.with_op_mut(|op| op.orphan_cleanup(cqe_res))
+        .unwrap_or_default()
 }
 
 fn cleanup_orphaned_slot(slot: Slot<'_, InFlightOrphaned>, cqe_res: i32) -> CompletionCleanupGuard {

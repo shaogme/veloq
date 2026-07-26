@@ -296,13 +296,11 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
         let cell = &self.shared.slots[user_data];
         if cell.status(Ordering::Acquire).ready {
-            // `reset` 会清掉 `ready` 标志位，但不动 `completion_data`。已就绪的完成
-            // 必须在这里取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot
-            // 里，直到该 slot 下一次被 `record_completion` 覆盖才释放——slot 若不再
-            // 被复用就是永久泄漏。
-            self.shared.clear_ready_completion();
-            let record_data = cell.completion_with_record_data(mem::take);
-            self.shared.run_discarded_record_cleanup(record_data);
+            // `reset` 会清掉 `ready` 标志位，但不动信箱本身。已就绪的完成必须在这里
+            // 取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot 里，直到该
+            // slot 下一次被 `record_completion` 覆盖才释放——slot 若不再被复用就是
+            // 永久泄漏。multishot 可能压着不止一条，所以是排空而不是取一条。
+            self.shared.drain_mailbox_cleanup(cell);
         }
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);

@@ -15,7 +15,7 @@ use crate::{
         DriverSubmitResult, OpToken, PollRecordResult, RemoteCancelSender, RemoteWaker,
         SharedCompletionTable, SubmitStatus,
     },
-    op::{DriverProvider, IntoPlatformOp, Op},
+    op::{DriverProvider, IntoMultishotOp, IntoPlatformOp, Op},
     slot::{SlotError, SlotSpec},
 };
 
@@ -212,6 +212,8 @@ where
             payload: payload_erased,
             detail,
             mut cleanup,
+            // 单发操作恒为 `Final`；流的终点判定是 `MultishotOp` 的事。
+            continuation: _,
         } = record;
         let payload = match Op::try_payload_from_erased(payload_erased) {
             Ok(payload) => payload,
@@ -622,5 +624,199 @@ impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
 
     fn from_current_context() -> Self {
         Self::new()
+    }
+}
+
+/// 一个 multishot 操作产出的完成流。
+///
+/// 与 [`DetachedOp`] 的差别只在「一条 vs 多条」：提交、取消、waker 注册、`Drop` 时的
+/// orphan 处理全部同构。流的终点由记录自己携带的
+/// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定——取到
+/// `Final` 的那一条之后，`poll_next` 返回 `None`。
+pub struct MultishotOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec>,
+{
+    pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
+    pub(crate) cancel_sender: Option<RemoteCancelSender>,
+    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
+    pub(crate) token: Option<OpToken>,
+    /// 提交就失败了：产出这一个错误项，然后流结束。
+    pub(crate) immediate_failure: Option<DriverReport<Spec::Error>>,
+    pub(crate) finished: bool,
+    pub(crate) _phantom: std::marker::PhantomData<fn() -> (T, Spec)>,
+}
+
+impl<T, Spec> MultishotOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec>,
+{
+    pub(crate) fn failed(report: DriverReport<Spec::Error>) -> Self {
+        Self {
+            completion_table: None,
+            cancel_sender: None,
+            cancel_waker: None,
+            token: None,
+            immediate_failure: Some(report),
+            finished: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn armed(
+        completion_table: SharedCompletionTable<Spec>,
+        cancel_sender: RemoteCancelSender,
+        cancel_waker: Arc<dyn RemoteWaker<Spec::Error>>,
+        token: OpToken,
+    ) -> Self {
+        Self {
+            completion_table: Some(completion_table),
+            cancel_sender: Some(cancel_sender),
+            cancel_waker: Some(cancel_waker),
+            token: Some(token),
+            immediate_failure: None,
+            finished: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// 该操作是否仍在内核里（用于诊断与测试）。
+    pub fn is_armed(&self) -> bool {
+        !self.finished && self.token.is_some()
+    }
+
+    fn take_one(&mut self) -> Poll<Option<MultishotItem<T, Spec>>> {
+        let (Some(table), Some(token)) = (self.completion_table.as_ref(), self.token) else {
+            self.finished = true;
+            return Poll::Ready(None);
+        };
+
+        match table.try_take_record(token) {
+            Ok(PollRecordResult::Ready(record)) => {
+                if record.continuation.is_final() {
+                    // 终态记录被取走的同时 slot 已经归还、generation 已经推进，token 从此
+                    // 失效——`Drop` 不能再拿它去 mark_orphaned/cancel。
+                    self.finished = true;
+                    self.token = None;
+                }
+                Poll::Ready(Some(item_from_record::<T, Spec>(record)))
+            }
+            Ok(PollRecordResult::Unavailable { kind, attach }) => {
+                self.finished = true;
+                self.token = None;
+                Poll::Ready(Some(OpResult::ResourceLost(
+                    OpError::from_completion_anomaly(kind, attach),
+                )))
+            }
+            Ok(PollRecordResult::Pending) => Poll::Pending,
+            Err(report) => {
+                self.finished = true;
+                self.token = None;
+                Poll::Ready(Some(OpResult::ResourceLost(OpError::new(
+                    LostReason::Other,
+                    report,
+                ))))
+            }
+        }
+    }
+}
+
+type MultishotItem<T, Spec> = OpResult<
+    <T as IntoMultishotOp<Spec>>::Item,
+    <Spec as SlotSpec>::Error,
+    <T as IntoPlatformOp<Spec>>::Completion,
+>;
+
+#[inline]
+fn item_from_record<T, Spec>(record: CompletionRecord<Spec>) -> MultishotItem<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec>,
+{
+    let CompletionRecord {
+        event,
+        payload: payload_erased,
+        detail,
+        mut cleanup,
+        continuation: _,
+    } = record;
+    let item = match T::try_item_from_erased(payload_erased) {
+        Ok(item) => item,
+        Err(report) => {
+            let _ = cleanup.run();
+            return OpResult::ResourceLost(OpError::payload_projection(report));
+        }
+    };
+    cleanup.disarm();
+    let res =
+        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
+    let completion = T::complete_item(item, res);
+    OpResult::Completed(completion.result, completion.output)
+}
+
+impl<T, Spec> futures_core::Stream for MultishotOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec>,
+{
+    type Item = MultishotItem<T, Spec>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if let Some(report) = this.immediate_failure.take() {
+            this.finished = true;
+            return Poll::Ready(Some(OpResult::ResourceLost(OpError::new(
+                LostReason::Other,
+                report,
+            ))));
+        }
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
+        if let Poll::Ready(item) = this.take_one() {
+            return Poll::Ready(item);
+        }
+
+        // 注册与发布竞速：注册之后再取一次，避免丢唤醒（与 `DetachedOp::poll` 同构）。
+        if let (Some(table), Some(token)) = (this.completion_table.as_ref(), this.token) {
+            table.register_waker(token, cx.waker());
+        }
+        this.take_one()
+    }
+}
+
+unsafe impl<T, Spec> std::marker::Send for MultishotOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec> + std::marker::Send,
+    T::Item: std::marker::Send,
+{
+}
+
+impl<T, Spec> Drop for MultishotOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoMultishotOp<Spec>,
+{
+    fn drop(&mut self) {
+        // token 仍在说明操作还没终止：既要放弃信箱里剩下的记录（`mark_orphaned` 会逐条
+        // 跑它们的 cleanup），也要请求内核取消，否则 multishot 会一直投递下去。
+        if let Some(token) = self.token {
+            if let Some(table) = self.completion_table.as_ref() {
+                table.mark_orphaned(token);
+            }
+            if let Some(cancel_sender) = self.cancel_sender.as_ref() {
+                let _ = cancel_sender.send(CancelRequest::abandon(token));
+            }
+        }
+        if let Some(cancel_waker) = self.cancel_waker.as_ref()
+            && let Err(e) = cancel_waker.wake()
+        {
+            trace!("MultishotOp cancel wake failed: {}", e);
+        }
     }
 }

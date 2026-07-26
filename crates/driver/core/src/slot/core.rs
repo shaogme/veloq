@@ -1,16 +1,19 @@
 use super::{Generation, SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::{
     DriverResult,
-    driver::{CompletionCleanupGuard, UserCompletionEvent},
+    driver::{CompletionCleanupGuard, CompletionContinuation, UserCompletionEvent},
 };
 use bilge::prelude::*;
 use std::{
     fmt::{self, Debug},
     marker::PhantomData,
 };
-use veloq_std::sync::{
-    Mutex,
-    atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+use veloq_std::{
+    collections::VecDeque,
+    sync::{
+        Mutex,
+        atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    },
 };
 use veloq_waker::AtomicWaker;
 
@@ -33,36 +36,46 @@ pub enum SlotState {
     InFlightOrphaned,
 }
 
-/// cell 的完整可观测状态：生命周期 + 两个信箱标志位。
+/// cell 的完整可观测状态：生命周期 + 三个信箱标志位。
 ///
 /// 诊断与 [`crate::slot::SlotSnapshot`] 携带的是它而不是裸 [`SlotState`]，否则
 /// 「Idle 且信箱里压着一条未消费的完成」会被记成一个信息量为零的 `Idle`。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SlotStatus {
     pub state: SlotState,
-    /// 信箱里有一条已发布、尚未被消费的完成记录。
+    /// 信箱**非空**：至少有一条已发布、尚未被消费的完成记录。
+    ///
+    /// 是「非空」而不是「有一条」——multishot 操作可以在消费方来取之前压进多条。
+    /// 条数只在信箱锁内有意义，原子字上只需要这个谓词。
     pub ready: bool,
-    /// driver 线程正在发布完成记录，远端修改必须自旋等待。
+    /// 有人正在改信箱（driver 线程发布，或消费方取走），其它修改必须自旋等待。
     pub finalizing: bool,
+    /// 这个 slot 上有一个**尚未终止**的 multishot 操作：内核还会继续投递完成。
+    ///
+    /// 它与 `ready` 是两回事：`ready` 说的是「信箱里有没有货」，`streaming` 说的是
+    /// 「还会不会再有货」。终态收尾（归还 slot、推进 generation）要求两者同时为假。
+    pub streaming: bool,
 }
 
 impl SlotStatus {
-    pub const fn new(state: SlotState, ready: bool, finalizing: bool) -> Self {
+    pub const fn new(state: SlotState, ready: bool, finalizing: bool, streaming: bool) -> Self {
         Self {
             state,
             ready,
             finalizing,
+            streaming,
         }
     }
 
     pub const fn of(state: SlotState) -> Self {
-        Self::new(state, false, false)
+        Self::new(state, false, false, false)
     }
 
     /// slot 可被 [`crate::driver::registry::OpRegistry::alloc`] 重新分配的充要条件。
     ///
     /// 注意 `ready` 也会让 slot 保持不可分配：detached future 仍可能来消费信箱里的
-    /// 那条完成。
+    /// 那条完成。`streaming` 不必单独判断——未终止的 multishot 操作必然让生命周期停在
+    /// `InFlightWaiting` 或 `InFlightOrphaned`，`state` 这一项已经挡住了。
     pub const fn is_idle(self) -> bool {
         matches!(self.state, SlotState::Idle) && !self.ready
     }
@@ -76,6 +89,9 @@ impl Debug for SlotStatus {
         }
         if self.finalizing {
             f.write_str("+finalizing")?;
+        }
+        if self.streaming {
+            f.write_str("+streaming")?;
         }
         Ok(())
     }
@@ -91,7 +107,8 @@ pub struct PackedCoreState {
     pub state: SlotState,
     pub ready: bool,
     pub finalizing: bool,
-    reserved_bits: u28,
+    pub streaming: bool,
+    reserved_bits: u27,
 }
 
 impl PackedCoreState {
@@ -99,7 +116,7 @@ impl PackedCoreState {
     ///
     /// `reserved_bits` 由 bilge 的保留字段约定自动置零，不出现在构造参数里。
     pub fn idle(generation: Generation) -> Self {
-        Self::new(generation.get(), SlotState::Idle, false, false)
+        Self::new(generation.get(), SlotState::Idle, false, false, false)
     }
 
     pub fn generation(self) -> Generation {
@@ -107,7 +124,12 @@ impl PackedCoreState {
     }
 
     pub fn status(self) -> SlotStatus {
-        SlotStatus::new(self.state(), self.ready(), self.finalizing())
+        SlotStatus::new(
+            self.state(),
+            self.ready(),
+            self.finalizing(),
+            self.streaming(),
+        )
     }
 
     pub fn with_state(mut self, state: SlotState) -> Self {
@@ -122,6 +144,11 @@ impl PackedCoreState {
 
     pub fn with_finalizing(mut self, finalizing: bool) -> Self {
         self.set_finalizing(finalizing);
+        self
+    }
+
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.set_streaming(streaming);
         self
     }
 
@@ -217,45 +244,94 @@ pub struct SlotData<Spec: SlotSpec> {
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_data: Mutex<CompletionData<Spec>>,
+    pub(crate) completion_mailbox: Mutex<CompletionMailbox<Spec>>,
     pub(crate) completion_waker: AtomicWaker,
     marker: SlotMarker<Spec>,
 }
 
-#[derive(Default)]
-pub(crate) enum CompletionData<Spec: SlotSpec> {
-    #[default]
-    Empty,
-    User {
-        event: UserCompletionEvent,
-        payload: SlotPayload<Spec>,
-        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
-        cleanup: CompletionCleanupGuard,
-    },
+/// 一条已发布、等待被消费的完成。
+pub(crate) struct MailboxRecord<Spec: SlotSpec> {
+    pub(crate) event: UserCompletionEvent,
+    pub(crate) payload: SlotPayload<Spec>,
+    pub(crate) detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    pub(crate) cleanup: CompletionCleanupGuard,
+    /// 取走这条之后该操作是否还会再产出完成。消费方（`MultishotOp`）靠它判断流的
+    /// 终点；cell 上的 `streaming` 位负责的是状态机的收尾，两者来源相同但用途不同。
+    pub(crate) continuation: CompletionContinuation,
 }
 
-impl<Spec: SlotSpec> fmt::Debug for CompletionData<Spec>
+/// slot 的完成信箱。
+///
+/// 单发操作最多只会压进一条记录，所以第一条**内联**在 `head` 里，`rest` 永远是空的
+/// `VecDeque`（不分配）。只有 multishot 在消费方跟不上时才会用到 `rest`——把队列做成
+/// 无条件的 `VecDeque` 会让每一个普通 read/write 都付一次堆分配。
+pub(crate) struct CompletionMailbox<Spec: SlotSpec> {
+    head: Option<MailboxRecord<Spec>>,
+    rest: VecDeque<MailboxRecord<Spec>>,
+}
+
+impl<Spec: SlotSpec> CompletionMailbox<Spec> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            head: None,
+            rest: VecDeque::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    pub(crate) fn push(&mut self, record: MailboxRecord<Spec>) {
+        if self.head.is_none() {
+            self.head = Some(record);
+        } else {
+            self.rest.push_back(record);
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<MailboxRecord<Spec>> {
+        let record = self.head.take()?;
+        self.head = self.rest.pop_front();
+        Some(record)
+    }
+}
+
+impl<Spec: SlotSpec> Default for CompletionMailbox<Spec> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Spec: SlotSpec> fmt::Debug for MailboxRecord<Spec>
 where
     SlotPayload<Spec>: fmt::Debug,
     SlotCompletion<Spec>: fmt::Debug,
     SlotError<Spec>: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("Empty"),
-            Self::User {
-                event,
-                payload,
-                detail,
-                cleanup,
-            } => f
-                .debug_struct("User")
-                .field("event", event)
-                .field("payload", payload)
-                .field("detail", detail)
-                .field("cleanup", cleanup)
-                .finish(),
-        }
+        f.debug_struct("MailboxRecord")
+            .field("event", &self.event)
+            .field("payload", &self.payload)
+            .field("detail", &self.detail)
+            .field("cleanup", &self.cleanup)
+            .field("continuation", &self.continuation)
+            .finish()
+    }
+}
+
+impl<Spec: SlotSpec> fmt::Debug for CompletionMailbox<Spec>
+where
+    SlotPayload<Spec>: fmt::Debug,
+    SlotCompletion<Spec>: fmt::Debug,
+    SlotError<Spec>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionMailbox")
+            .field("head", &self.head)
+            .field("queued", &self.rest.len())
+            .finish()
     }
 }
 
@@ -268,7 +344,7 @@ impl<Spec: SlotSpec> SlotData<Spec> {
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
-            completion_data: Mutex::new(CompletionData::<Spec>::default()),
+            completion_mailbox: Mutex::new(CompletionMailbox::<Spec>::new()),
             completion_waker: AtomicWaker::new(),
             marker: PhantomData,
         }
@@ -330,12 +406,12 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
+    pub(crate) fn with_mailbox<F, X>(&self, f: F) -> X
     where
-        F: FnOnce(&mut CompletionData<Spec>) -> X,
+        F: FnOnce(&mut CompletionMailbox<Spec>) -> X,
     {
-        let mut data = self.completion_data.lock();
-        f(&mut *data)
+        let mut mailbox = self.completion_mailbox.lock();
+        f(&mut *mailbox)
     }
 }
 

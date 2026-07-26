@@ -57,6 +57,8 @@ where
         payload: payload_erased,
         mut detail,
         mut cleanup,
+        // IOCP 恒为 `Final`。
+        continuation: _,
     } = record;
     let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
     let res = detail

@@ -1,9 +1,12 @@
 use crate::{
+    OwnedRawHandle, RawHandle,
+    config::UringRawHandle,
     driver::{SqeEnv, SqeFd},
     error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
     op::{
-        Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
+        Accept, AcceptMulti, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom,
+        UdpSend,
         payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvFromPayload},
     },
 };
@@ -115,6 +118,31 @@ pub(crate) unsafe fn make_sqe_accept(
     let addr = &mut val.addr.0 as *mut _ as *mut _;
     let addr_len = &mut val.addr_len as *mut _;
     Ok(sqe_with_fd!(fd, |f| opcode::Accept::new(f, addr, addr_len).build()))
+}
+
+/// 把 accept 完成的结果（一个裸 fd）变成一个拥有所有权的句柄。
+///
+/// 单发 `Accept` 与 multishot `AcceptMulti` 共用，两者的 `Completion` 是同一个东西。
+pub(crate) fn accepted_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
+    res.map(|raw| unsafe {
+        OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(raw as i32)))
+    })
+}
+
+pub(crate) unsafe fn make_sqe_accept_multi(
+    _kernel: &mut KernelRef<AcceptMulti>,
+    val: &mut AcceptMulti,
+    env: &SqeEnv<'_>,
+    _token: SubmitTokenContext,
+) -> UringResult<squeue::Entry> {
+    let fd = resolve_socket_fd(
+        env.file_table,
+        val.fd,
+        "uring.op.submit.make_sqe_accept_multi",
+    )?;
+    // `AcceptMulti` 没有 addr/addrlen 字段：内核不回填对端地址，因为多条完成共享一个
+    // 地址缓冲会互相覆盖。地址由门面层在拿到 fd 之后用 `getpeername` 补。
+    Ok(sqe_with_fd!(fd, |f| opcode::AcceptMulti::new(f).build()))
 }
 
 pub(crate) unsafe fn on_complete_accept(

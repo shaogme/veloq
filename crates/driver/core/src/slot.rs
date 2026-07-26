@@ -524,9 +524,9 @@ mod tests {
     use super::*;
     use crate::driver::{
         CompletionAccess, CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard,
-        CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, CompletionToken, HookResult, PlatformOp, PollRecordResult,
-        SharedCompletionTable, UserCompletionEvent,
+        CompletionContinuation, CompletionControl, CompletionFlowExt, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, CompletionToken, HookResult, PlatformOp,
+        PollRecordResult, SharedCompletionTable, UserCompletionEvent,
     };
     use crate::{DriverCoreError, DriverError};
 
@@ -595,6 +595,7 @@ mod tests {
                 payload: payload.expect("test slot payload should exist"),
                 detail,
                 cleanup: CompletionCleanupGuard::default(),
+                continuation: CompletionContinuation::Final,
                 effect: (),
             })
         }
@@ -613,6 +614,7 @@ mod tests {
             drop(detail);
             Ok(CompletionHookOutcome::Cleanup {
                 cleanup: CompletionCleanupGuard::default(),
+                continuation: CompletionContinuation::Final,
                 effect: (),
             })
         }

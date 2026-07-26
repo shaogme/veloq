@@ -126,6 +126,14 @@ impl Socket {
         to_socket_addr(buf).attach_note("decode local socket address failed")
     }
 
+    /// Returns the peer address of a connected socket.
+    ///
+    /// The uring backend needs this because multishot accept does not report the peer address;
+    /// IOCP has it here so the facade's accept stream has one shape on both platforms.
+    pub fn peer_addr(&self) -> IocpResult<SocketAddr> {
+        peer_addr_of_socket(&self.inner)
+    }
+
     /// Sets TCP_NODELAY option.
     pub fn set_nodelay(&self, nodelay: bool) -> IocpResult<()> {
         let val = if nodelay { 1i32 } else { 0i32 };
@@ -258,4 +266,31 @@ impl PlatformSocket for Socket {
     fn set_broadcast(&self, broadcast: bool) -> IocpResult<()> {
         Socket::set_broadcast(self, broadcast)
     }
+}
+
+/// Returns the peer address of a connected socket, given only its raw handle.
+///
+/// The facade's accept stream needs this on both platforms: the uring backend because multishot
+/// accept never reports the peer address, and IOCP so that the two paths have one shape. See
+/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2.
+pub fn peer_addr_of_handle(handle: IocpHandle) -> IocpResult<SocketAddr> {
+    peer_addr_of_socket(&SafeSocket(handle.as_socket()))
+}
+
+fn peer_addr_of_socket(socket: &SafeSocket) -> IocpResult<SocketAddr> {
+    // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
+    let mut storage =
+        unsafe { std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>() };
+    let mut len = std::mem::size_of_val(&storage) as i32;
+    // SAFETY: storage and len are valid pointers to local variables.
+    unsafe {
+        socket
+            .getpeername(&mut storage as *mut _ as *mut SOCKADDR, &mut len)
+            .attach_note("socket getpeername failed")?;
+    }
+
+    // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
+    let buf =
+        unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
+    to_socket_addr(buf).attach_note("decode peer socket address failed")
 }

@@ -23,9 +23,9 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
-        CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, RawCompletion,
-        SharedCompletionTable, UserCompletionEvent,
+        CompletionBackendIngressAction, CompletionContinuation, CompletionControl,
+        CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource,
+        RawCompletion, SharedCompletionTable, UserCompletionEvent,
     },
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
@@ -329,6 +329,8 @@ fn complete_rio_waiting_slot(
             payload,
             detail: detail.or(Some(completion)),
             cleanup,
+            // RIO 也没有 multishot：一次请求恰好对应一条完成。
+            continuation: CompletionContinuation::Final,
             effect,
         })
     } else {
@@ -379,7 +381,11 @@ fn complete_rio_orphaned_slot(
     let _ = guard.take_op();
     let _ = guard.take_completion_data();
     let _ = take(guard.platform_mut());
-    CompletionHookOutcome::Cleanup { cleanup, effect }
+    CompletionHookOutcome::Cleanup {
+        cleanup,
+        continuation: CompletionContinuation::Final,
+        effect,
+    }
 }
 
 pub(crate) const RIO_ANOMALY_MALFORMED: u16 = 1;

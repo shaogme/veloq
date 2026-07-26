@@ -32,6 +32,7 @@ veloq-buf.workspace = true
 veloq-std.workspace = true
 
 crossbeam-utils.workspace = true
+futures-core.workspace = true
 tracing.workspace = true
 diagweave.workspace = true
 

@@ -1,5 +1,5 @@
 use diagweave::prelude::*;
-use io_uring::IoUring;
+use io_uring::{IoUring, opcode};
 use std::{
     collections::{HashMap, VecDeque},
     io, mem, ptr,
@@ -27,9 +27,9 @@ use crate::{
 use veloq_driver_core::{
     driver::{
         CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
-        DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-        RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable,
-        SubmitStatus,
+        DriveOutcome, Driver, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
+        SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
         registry::{OpEntry, OpHandle},
     },
     slot::Generation,
@@ -46,6 +46,19 @@ pub use lifecycle::UringOpState;
 pub(crate) use registration::{
     FileTable, MAX_CHUNKS, RegisteredFileEntry, SqeFd, UringRegistrationStats,
 };
+
+/// 从 opcode 探测结果得出乐观的能力集合。
+///
+/// 「乐观」是关键：opcode 在场只说明**可能**支持 multishot 变体，真正的判定推迟到第一次
+/// 提交（见 [`Driver::note_capability_rejected`]）。`provided_buffers` 是唯一能在这里确定
+/// 的一项——`register_buf_ring` 成功与否就是答案，但它属于阶段 2，本阶段恒为 `false`。
+fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
+    DriverCapabilities {
+        accept_multi: probe.is_supported(opcode::Accept::CODE),
+        recv_multi: probe.is_supported(opcode::Recv::CODE),
+        provided_buffers: false,
+    }
+}
 
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
@@ -160,6 +173,7 @@ pub struct UringDriver<'a> {
     /// Last failed registration attempt per chunk, indexed by [`ChunkId`]; `MAX_CHUNKS` long.
     pub(crate) chunk_register_failure_at: Box<[Option<Instant>]>,
     pub(crate) file_table: FileTable,
+    pub(crate) capabilities: DriverCapabilities,
 }
 
 impl<'a> UringDriver<'a> {
@@ -197,6 +211,15 @@ impl<'a> UringDriver<'a> {
 
         let waker_fd = Self::create_event_fd("driver.new.eventfd")?;
 
+        // opcode 探测只能回答「这个 opcode 存在吗」，回答不了「它的 multishot 变体存在
+        // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
+        // 剩下的由第一次提交去问（`note_capability_rejected`）。
+        let mut ring_probe = io_uring::Probe::new();
+        if ring.submitter().register_probe(&mut ring_probe).is_err() {
+            debug!("IORING_REGISTER_PROBE unavailable; assuming no optional opcodes");
+            ring_probe = io_uring::Probe::new();
+        }
+
         debug!("Initalized UringDriver with {} entries", entries);
 
         let is_waked = Arc::new(AtomicBool::new(false));
@@ -229,6 +252,7 @@ impl<'a> UringDriver<'a> {
             registration_mode: config.registration_mode,
             chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
+            capabilities: probe_capabilities(&ring_probe),
         };
 
         driver.submit_waker()?;
@@ -442,6 +466,25 @@ impl<'a> Driver for UringDriver<'a> {
             state: self.waker_state.clone(),
             is_waked: self.is_waked.clone(),
         })
+    }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        self.capabilities
+    }
+
+    fn note_capability_rejected(&mut self, capability: DriverCapability) {
+        let slot = match capability {
+            DriverCapability::AcceptMulti => &mut self.capabilities.accept_multi,
+            DriverCapability::RecvMulti => &mut self.capabilities.recv_multi,
+            DriverCapability::ProvidedBuffers => &mut self.capabilities.provided_buffers,
+        };
+        if *slot {
+            debug!(
+                ?capability,
+                "kernel rejected an optional capability; disabling it"
+            );
+            *slot = false;
+        }
     }
 }
 

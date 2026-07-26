@@ -49,7 +49,15 @@ impl SlotSpec for DummySlotSpec {
     type CompletionDiagnostics = ();
 }
 
-struct TestHooks;
+struct TestHooks {
+    continuation: CompletionContinuation,
+}
+
+impl TestHooks {
+    fn with_continuation(continuation: CompletionContinuation) -> Self {
+        Self { continuation }
+    }
+}
 
 impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     type BackendIngress = ();
@@ -68,6 +76,17 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+        if self.continuation.is_more() {
+            // multishot：slot 的 op 与 payload 留给内核后续的完成。
+            return Ok(CompletionHookOutcome::User {
+                event,
+                payload: (),
+                detail: None,
+                cleanup: CompletionCleanupGuard::default(),
+                continuation: self.continuation,
+                effect: (),
+            });
+        }
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -76,6 +95,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             payload: payload.expect("loom test payload should exist"),
             detail,
             cleanup: CompletionCleanupGuard::default(),
+            continuation: self.continuation,
             effect: (),
         })
     }
@@ -93,6 +113,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         drop(detail);
         Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
+            continuation: CompletionContinuation::Final,
             effect: (),
         })
     }
@@ -134,10 +155,19 @@ fn active_registry() -> (
 }
 
 fn accept_completion(registry: &Mutex<OpRegistry<DummySlotSpec>>, token: OpToken, res: i32) {
+    accept_completion_with(registry, token, res, CompletionContinuation::Final)
+}
+
+fn accept_completion_with(
+    registry: &Mutex<OpRegistry<DummySlotSpec>>,
+    token: OpToken,
+    res: i32,
+    continuation: CompletionContinuation,
+) {
     let mut registry = registry.lock();
     let diagnostics = registry.shared.completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
-    let mut hooks = TestHooks;
+    let mut hooks = TestHooks::with_continuation(continuation);
     registry
         .accept_completion(
             &table,
@@ -207,7 +237,12 @@ fn test_detached_drop_race_loom() {
         producer.join().unwrap();
         consumer.join().unwrap();
 
-        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
+        assert_eq!(
+            table.debug_get_state(0),
+            CELL_STATE_IDLE,
+            "status = {}",
+            table.debug_status_string(0)
+        );
     });
 }
 
@@ -316,6 +351,78 @@ fn test_two_consumers_at_most_one_ready_loom() {
         c2.join().unwrap();
 
         assert!(ready_count.load(Ordering::SeqCst) <= 1);
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
+    });
+}
+
+/// 消费方现在也抢 `finalizing`（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §4.3），所以
+/// 「取一条」与「发布下一条」是一对真正的并发写入者。断言是：两条记录一条都不丢，且
+/// 终态完成之后 slot 必须回到可复用。
+#[test]
+fn test_multishot_take_races_with_publish_loom() {
+    loom::model(|| {
+        use loom::sync::atomic::{AtomicUsize, Ordering};
+
+        let (registry, table, token) = active_registry();
+        let taken = Arc::new(AtomicUsize::new(0));
+
+        // 第一条 `More` 单线程发布，把 cell 带进 streaming 状态。
+        accept_completion_with(&registry, token, 1, CompletionContinuation::More);
+
+        let registry_cloned = registry.clone();
+        let producer = thread::spawn(move || {
+            accept_completion_with(&registry_cloned, token, 2, CompletionContinuation::Final);
+        })
+        .unwrap();
+
+        let consumer_table = table.clone();
+        let consumer_taken = taken.clone();
+        let consumer = thread::spawn(move || {
+            if let PollRecordResult::Ready(_) = consumer_table.try_take_record(token).unwrap() {
+                consumer_taken.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        // 不论交错顺序如何，两条记录合计必须恰好能被取到两次。
+        while let PollRecordResult::Ready(_) = table.try_take_record(token).unwrap() {
+            taken.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(taken.load(Ordering::SeqCst), 2, "no record may be lost");
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
+    });
+}
+
+/// 放弃一个仍在途的 multishot 与它的下一条完成竞争：generation 不能被推进，否则内核
+/// 后续的完成会被判 stale 丢掉，`orphan_cleanup` 永远跑不到。
+#[test]
+fn test_orphan_races_with_multishot_publish_loom() {
+    loom::model(|| {
+        let (registry, table, token) = active_registry();
+
+        accept_completion_with(&registry, token, 1, CompletionContinuation::More);
+
+        let registry_cloned = registry.clone();
+        let producer = thread::spawn(move || {
+            accept_completion_with(&registry_cloned, token, 2, CompletionContinuation::Final);
+        })
+        .unwrap();
+
+        let table_cloned = table.clone();
+        let consumer = thread::spawn(move || {
+            table_cloned.mark_orphaned(token);
+        })
+        .unwrap();
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        // 收尾：无论谁先跑，剩下的记录都要能被排空，slot 最终回到可复用。
+        while let PollRecordResult::Ready(_) = table.try_take_record(token).unwrap() {}
+        table.discard_ready_records(token);
         assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
     });
 }

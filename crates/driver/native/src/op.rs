@@ -5,10 +5,10 @@ use crate::SockAddrStorage;
 use veloq_driver_core::{
     IoFd as CoreIoFd,
     op::types::{
-        Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect,
-        Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync,
-        FsyncRaw as CoreFsyncRaw, ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw,
-        Recv as CoreRecv, Send as CoreSend, SendTo as CoreSendTo,
+        Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, Close as CoreClose,
+        Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
+        Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, ReadFixed as CoreReadFixed,
+        ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend, SendTo as CoreSendTo,
         SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
         UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
         UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
@@ -17,9 +17,9 @@ use veloq_driver_core::{
 };
 pub use veloq_driver_core::{
     op::{
-        DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
-        OpKind, OpResult, OpSubmitter as CoreOpSubmitter,
-        types::{Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
+        DetachedOp, DetachedSubmitter, DriverProvider, IntoMultishotOp, IntoPlatformOp, LocalOp,
+        LocalSubmitter, MultishotOp, Op, OpKind, OpResult, OpSubmitter as CoreOpSubmitter,
+        types::{AcceptedSocket, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
     },
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
 };
@@ -61,6 +61,7 @@ pub type FileSyncFileRangeRaw = CoreSyncFileRangeRaw<PlatformRawHandle>;
 pub type UdpConnect = CoreUdpConnect<PlatformRawHandle, SockAddrStorage>;
 pub type Connect = CoreConnect<PlatformRawHandle, SockAddrStorage>;
 pub type Accept = CoreAccept<PlatformRawHandle, SockAddrStorage>;
+pub type AcceptMulti = CoreAcceptMulti<PlatformRawHandle>;
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + StdSend + Sync {
     type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend>: Future<

@@ -12,5 +12,5 @@ pub use config::{
 pub use diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot};
 pub use driver::{UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
-pub use net::{Socket, socket_addr_to_storage, to_socket_addr};
+pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};
 pub use op::{UringOp, UringSlotSpec, UringUserPayload};

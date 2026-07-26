@@ -6,10 +6,11 @@ use crate::{
     driver::SqeEnv,
     error::{UringError, UringResult},
     op::{
-        Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
-        ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw,
-        Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload,
-        UringSlotSpec, UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
+        Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync,
+        FsyncRaw, OpSend, OpVTable, Open, ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy,
+        SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
+        UringKernelOp, UringOpPayload, UringSlotSpec, UringUserPayload, Wakeup, WriteFixed,
+        WriteRaw, payload, submit,
     },
 };
 use io_uring::squeue;
@@ -17,7 +18,9 @@ use std::time::Duration;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, SubmitTokenContext},
-    op::{IntoPlatformOp, OpCompletion, OpKind, payload_projection_mismatch_report},
+    op::{
+        IntoMultishotOp, IntoPlatformOp, OpCompletion, OpKind, payload_projection_mismatch_report,
+    },
 };
 
 pub(crate) trait UringOpSpec: Sized + Send + 'static {
@@ -74,6 +77,18 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         _chunks: &mut [ChunkId],
     ) -> usize {
         0
+    }
+
+    /// 为一条完成造出它自己的产物。默认 `None` —— 单发操作的产物就是提交 payload 本身。
+    ///
+    /// multishot 操作必须覆盖它：提交 payload 要留在 slot 里给内核后续的完成用。
+    fn multishot_item(
+        _kernel: &mut Self::KernelPayload,
+        _payload: &mut Self,
+        _result: i32,
+        _flags: u32,
+    ) -> UringResult<Option<UringUserPayload>> {
+        Ok(None)
     }
 
     fn map_completion(payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion>;
@@ -182,6 +197,24 @@ where
     S::resolve_chunks(kernel, user, chunks)
 }
 
+pub(crate) unsafe fn multishot_item_shim<S>(
+    op: &mut UringKernelOp,
+    payload: &mut UringUserPayload,
+    result: i32,
+    flags: u32,
+) -> UringResult<Option<UringUserPayload>>
+where
+    S: UringOpErasure,
+{
+    let Some(kernel) = S::kernel_payload_mut(&mut op.payload) else {
+        return Ok(None);
+    };
+    let Some(user) = S::user_payload_mut(payload) else {
+        return Ok(None);
+    };
+    S::multishot_item(kernel, user, result, flags)
+}
+
 macro_rules! impl_uring_op_erasure {
     ($OpType:ty, $user_variant:ident, $kernel_variant:ident, $completion:ty) => {
         impl UringOpErasure for $OpType {
@@ -242,6 +275,7 @@ macro_rules! impl_uring_op_erasure {
                     strategy: <$OpType as UringOpSpec>::STRATEGY,
                     get_timeout: get_timeout_shim::<$OpType>,
                     resolve_chunks: resolve_chunks_shim::<$OpType>,
+                    multishot_item: multishot_item_shim::<$OpType>,
                 };
                 &TABLE
             }
@@ -355,6 +389,30 @@ impl_uring_op_erasure!(SyncFileRangeRaw, SyncFileRangeRaw, SyncRangeRaw, usize);
 impl_uring_op_erasure!(Fallocate, Fallocate, Fallocate, usize);
 impl_uring_op_erasure!(FallocateRaw, FallocateRaw, FallocateRaw, usize);
 impl_uring_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
+impl_uring_op_erasure!(AcceptMulti, AcceptMulti, AcceptMulti, OwnedRawHandle);
+
+/// multishot accept 的每条完成产出一个 [`AcceptedSocket`]（新连接的 fd 走
+/// `Completion`），而 slot 里始终是提交 payload `AcceptMulti { fd }`。
+impl IntoMultishotOp<UringSlotSpec> for AcceptMulti {
+    type Item = AcceptedSocket;
+
+    fn try_item_from_erased(erased: UringUserPayload) -> UringResult<Self::Item> {
+        match erased {
+            UringUserPayload::AcceptedSocket(item) => Ok(item),
+            _ => Err(payload_projection_mismatch_report::<UringError>(
+                "AcceptedSocket",
+                "UringUserPayload",
+            )),
+        }
+    }
+
+    fn complete_item(
+        item: Self::Item,
+        res: UringResult<usize>,
+    ) -> OpCompletion<Self::Item, UringError, Self::Completion> {
+        OpCompletion::new(submit::accepted_handle_from_res(res), item)
+    }
+}
 impl_uring_op_erasure!(SendTo, SendTo, SendTo, usize);
 impl_uring_op_erasure!(UdpRecvFrom, UdpRecvFrom, UdpRecvFrom, usize);
 impl_uring_op_erasure!(Open, Open, Open, OwnedRawHandle);

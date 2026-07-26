@@ -5,6 +5,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
+use std::os::fd::RawFd;
 use std::{
     io,
     mem::{MaybeUninit, size_of, zeroed},
@@ -150,6 +151,10 @@ impl Socket {
         .attach_note("socket.local_addr.decode")
     }
 
+    pub fn peer_addr(&self) -> UringResult<SocketAddr> {
+        peer_addr_of_handle(self.fd.raw())
+    }
+
     pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
         self.setsockopt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay as c_int)
     }
@@ -263,6 +268,30 @@ impl SocketAddrCodec for SockAddrStorage {
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
         socket_addr_to_storage(addr)
     }
+}
+
+/// 取一个已连接 socket 的对端地址。
+///
+/// multishot accept 不回填地址（`IORING_OP_ACCEPT` 的 multishot 变体没有 addr 字段），
+/// 所以门面层拿到新 fd 之后要用这条同步系统调用补齐——见
+/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2。
+pub fn peer_addr_of_handle(handle: UringRawHandle) -> UringResult<SocketAddr> {
+    peer_addr_of(handle.as_fd())
+}
+
+fn peer_addr_of(fd: RawFd) -> UringResult<SocketAddr> {
+    let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as socklen_t;
+    let ret =
+        unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if ret < 0 {
+        return Err(UringError::Socket
+            .io_report("socket.peer_addr.getpeername", io::Error::last_os_error()));
+    }
+    to_socket_addr(unsafe {
+        slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
+    })
+    .attach_note("socket.peer_addr.decode")
 }
 
 pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {

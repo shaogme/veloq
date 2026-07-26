@@ -9,8 +9,8 @@ use crate::{
 use diagweave::DiagnosticError;
 
 use super::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionDispatch,
-    CompletionEnvelope, CompletionPacket, DriverCompletionDiagnostics,
+    AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionContinuation,
+    CompletionDispatch, CompletionEnvelope, CompletionPacket, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
     RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
     dispatch_envelope, finalize_orphaned_checked, finalize_waiting_checked, route_user_completion,
@@ -81,11 +81,17 @@ where
         payload: SlotPayload<Spec>,
         detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
         cleanup: CompletionCleanupGuard,
+        /// 这条完成之后该操作是否还会再投递完成。单发路径一律 `Final`——写成显式字段
+        /// 而不是隐式默认，是为了让每个后端 hook 都在自己那一行声明这件事。
+        continuation: CompletionContinuation,
         effect: Effect,
     },
 
     Cleanup {
         cleanup: CompletionCleanupGuard,
+        /// 同 [`CompletionHookOutcome::User`]：一个**已放弃**的 multishot 仍然会一条条
+        /// 投递完成，每一条都要跑 cleanup，但只有最后一条才能归还 slot。
+        continuation: CompletionContinuation,
         effect: Effect,
     },
     Anomaly {
@@ -427,31 +433,42 @@ where
             payload,
             detail,
             cleanup,
+            continuation,
             effect,
         } => {
             hooks.finish_backend_effect(effect)?;
             let record = record_user_completion::<Spec>(
                 table,
                 diagnostics,
-                CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
+                CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup)
+                    .with_continuation(continuation),
             );
-            finish_waiting_if_needed(registry, finalize, event)?;
+            // `More` 的完成不归还 slot：op 与 payload 还要留给内核后续的完成，cell 也
+            // 必须停在 `InFlightWaiting` 才能继续路由。
+            if continuation.is_final() {
+                finish_waiting_if_needed(registry, finalize, event)?;
+            }
             Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Cleanup {
             mut cleanup,
+            continuation,
             effect,
         } => {
             hooks.finish_backend_effect(effect)?;
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
-            match finalize {
-                Some(FinalizeAction::Waiting(event)) => {
-                    finish_waiting_if_needed(registry, finalize, event)?;
+            // `More`：操作还在内核里，slot 必须留着——否则后续的完成落到一个已归还
+            // （甚至已被重新分配）的 slot 上，`orphan_cleanup` 再也跑不到。
+            if continuation.is_final() {
+                match finalize {
+                    Some(FinalizeAction::Waiting(event)) => {
+                        finish_waiting_if_needed(registry, finalize, event)?;
+                    }
+                    Some(FinalizeAction::Orphaned(event)) => {
+                        finish_orphaned(registry, event)?;
+                    }
+                    None => {}
                 }
-                Some(FinalizeAction::Orphaned(event)) => {
-                    finish_orphaned(registry, event)?;
-                }
-                None => {}
             }
             Ok(CompletionFlowOutcome::orphan_cleaned())
         }

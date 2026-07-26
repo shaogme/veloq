@@ -233,6 +233,8 @@ fn wait_completion(
                     payload: _,
                     mut detail,
                     mut cleanup,
+                    // 这些测试提交的都是单发操作。
+                    continuation: _,
                 } = record;
                 cleanup.disarm();
                 return detail

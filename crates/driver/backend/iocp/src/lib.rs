@@ -23,6 +23,6 @@ pub use diagnostics::{
 pub use driver::{CloseMode, IocpDriver, IocpOpState};
 pub use error::{IocpError, IocpResult};
 pub use net::addr::{SockAddrStorage, socket_addr_to_storage, to_socket_addr};
-pub use net::socket::Socket;
-pub use op::{IocpKernelOp, IocpOp, IocpUserPayload};
+pub use net::socket::{Socket, peer_addr_of_handle};
+pub use op::{IocpKernelOp, IocpOp, IocpSlotSpec, IocpUserPayload};
 pub use win32::{IoCompletionPort, OwnedHandle, SafeSocket};

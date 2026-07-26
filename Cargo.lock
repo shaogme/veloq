@@ -1370,6 +1370,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "diagweave",
+ "futures-core",
  "futures-util",
  "libc",
  "tracing",
@@ -1421,6 +1422,7 @@ dependencies = [
  "bilge",
  "crossbeam-utils",
  "diagweave",
+ "futures-core",
  "libc",
  "loom",
  "tracing",

@@ -5,9 +5,35 @@ use super::{
     DriverCompletionDiagnostics, OpToken, UserCompletionEvent,
 };
 
+/// 一条完成之后，该操作是否还会再投递完成。
+///
+/// 后端把自己的表示（io_uring 的 `IORING_CQE_F_MORE`、IOCP 的「没有这回事」）翻译成
+/// 这个枚举交给 core——core 不解读后端 flags，见 `DRIVER_REVIEW.md` §4.2(a)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompletionContinuation {
+    /// 该操作到此终止：slot 可以归还，token 随这条完成被消费而失效。
+    #[default]
+    Final,
+    /// 该操作仍在内核里，还会继续投递完成。slot 与 token 都必须保持有效。
+    More,
+}
+
+impl CompletionContinuation {
+    #[inline]
+    pub const fn is_final(self) -> bool {
+        matches!(self, Self::Final)
+    }
+
+    #[inline]
+    pub const fn is_more(self) -> bool {
+        matches!(self, Self::More)
+    }
+}
+
 pub struct CompletionPacket<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
     pub input: CompletionInput<Spec>,
+    pub continuation: CompletionContinuation,
 }
 
 pub struct UserCompletion<Spec: SlotSpec> {
@@ -46,7 +72,15 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
                 detail,
                 cleanup,
             }),
+            continuation: CompletionContinuation::Final,
         }
+    }
+
+    /// 标记这条完成之后还会有更多（multishot）。默认是 [`CompletionContinuation::Final`]，
+    /// 所以所有单发路径的构造点都不必改。
+    pub fn with_continuation(mut self, continuation: CompletionContinuation) -> Self {
+        self.continuation = continuation;
+        self
     }
 
     pub fn user(
@@ -80,6 +114,11 @@ pub struct CompletionRecord<Spec: SlotSpec> {
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
+    /// 取走这条记录之后，该操作是否还会再产出完成。
+    ///
+    /// 单发操作恒为 [`CompletionContinuation::Final`]，所以 `LocalOp` / `DetachedOp`
+    /// 直接忽略它；`MultishotOp` 用它判断流到此为止。
+    pub continuation: CompletionContinuation,
 }
 
 impl<Spec: SlotSpec> CompletionRecord<Spec> {
