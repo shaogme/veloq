@@ -10,11 +10,12 @@ use veloq_driver_core::{
         Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, Close as CoreClose,
         Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
         Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, ReadFixed as CoreReadFixed,
-        ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvProvided as CoreRecvProvided,
-        Send as CoreSend, SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
-        SyncFileRangeRaw as CoreSyncFileRangeRaw, UdpConnect as CoreUdpConnect,
-        UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend,
-        Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
+        ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvMulti as CoreRecvMulti,
+        RecvProvided as CoreRecvProvided, Send as CoreSend, SendTo as CoreSendTo,
+        SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
+        UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
+        UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
+        WriteRaw as CoreWriteRaw,
     },
 };
 pub use veloq_driver_core::{
@@ -48,6 +49,9 @@ pub type Recv = CoreRecv<PlatformRawHandle>;
 /// Only the io_uring backend implements this operation — IOCP has no provided buffers, so its
 /// `capabilities().provided_buffers` is always `false` and nothing ever submits one.
 pub type RecvProvided = CoreRecvProvided<PlatformRawHandle>;
+/// Only the io_uring backend implements this operation, and only from Linux 6.0 — see
+/// `capabilities().recv_multi`, which is `false` everywhere else.
+pub type RecvMulti = CoreRecvMulti<PlatformRawHandle>;
 pub type Send = CoreSend<PlatformRawHandle>;
 pub type UdpRecv = CoreUdpRecv<PlatformRawHandle>;
 pub type UdpSend = CoreUdpSend<PlatformRawHandle>;

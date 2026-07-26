@@ -24,9 +24,9 @@ pub(crate) use payload::UringOpPayload;
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
     Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
-    OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvProvided, SendTo, SyncFileRange,
-    SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed,
-    WriteRaw,
+    OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided, SendTo,
+    SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup,
+    WriteFixed, WriteRaw,
 };
 pub(crate) use submit::sqe_with_fd;
 

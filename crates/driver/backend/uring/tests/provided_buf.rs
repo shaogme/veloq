@@ -12,10 +12,13 @@ use std::{
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf, NoopRegistrar};
 use veloq_driver_core::{
     driver::{
-        CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken, PollRecordResult,
-        RegisterFd,
+        CancelRequest, CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken,
+        PollRecordResult, RegisterFd,
     },
-    op::{IntoPlatformOp, types::RecvProvided as CoreRecvProvided},
+    op::{
+        IntoPlatformOp,
+        types::{RecvMulti as CoreRecvMulti, RecvProvided as CoreRecvProvided},
+    },
 };
 use veloq_driver_uring::{
     IoFd, ProvidedBufConfig, RawHandle, UringConfig, UringDriver, UringOp, UringRawHandle,
@@ -23,6 +26,7 @@ use veloq_driver_uring::{
 };
 
 type RecvProvided = CoreRecvProvided<UringRawHandle>;
+type RecvMulti = CoreRecvMulti<UringRawHandle>;
 
 /// 一个只会走堆分配的池。
 ///
@@ -94,6 +98,18 @@ impl SocketPair {
         assert_eq!(written, data.len() as isize, "short write to socketpair");
     }
 
+    /// 关掉发送端的写方向：接收端读到 EOF，而两个 fd 都还活着。
+    fn shutdown_tx(&self) {
+        // SAFETY: `tx` 是本结构持有的 fd。
+        let rc = unsafe { libc::shutdown(self.tx, libc::SHUT_WR) };
+        assert_eq!(
+            rc,
+            0,
+            "shutdown failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     fn register_rx(&self, driver: &mut UringDriver<'static>) -> IoFd {
         let raw = RawHandle::new(UringRawHandle::for_socket(self.rx));
         driver
@@ -115,14 +131,14 @@ impl Drop for SocketPair {
     }
 }
 
-fn submit_recv_provided(driver: &mut UringDriver<'static>, fd: IoFd) -> OpToken {
-    let (kernel, payload) =
-        <RecvProvided as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(RecvProvided {
-            fd,
-        });
+fn submit_op<T>(driver: &mut UringDriver<'static>, user_op: T) -> OpToken
+where
+    T: IntoPlatformOp<UringSlotSpec>,
+{
+    let (kernel, payload) = T::into_kernel_and_payload(user_op);
     let mut op: Option<UringOp> = Some(kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<RecvProvided as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+    slot.set_payload(T::payload_into_erased(payload));
     match slot.submit(&mut op) {
         DriverSubmitResult::Submitted(_) => {
             let token = slot.persist().token();
@@ -130,8 +146,75 @@ fn submit_recv_provided(driver: &mut UringDriver<'static>, fd: IoFd) -> OpToken 
             token
         }
         DriverSubmitResult::Failed { report, status } => {
-            panic!("submit RecvProvided failed: status={status:?}, error={report}")
+            panic!(
+                "submit {} failed: status={status:?}, error={report}",
+                std::any::type_name::<T>()
+            )
         }
+    }
+}
+
+fn submit_recv_provided(driver: &mut UringDriver<'static>, fd: IoFd) -> OpToken {
+    submit_op(driver, RecvProvided { fd })
+}
+
+/// 提交一条 multishot recv。
+///
+/// 返回 `None` 表示内核不认识它——`IORING_OP_RECV` 从 5.6 就在，它的 multishot 变体要 6.0，
+/// 而仓库声明的最低内核是 5.6，所以那是支持区间的一部分而不是失败。
+///
+/// 判据是「提交之后立刻有没有一条完成」：被接受的 multishot 在数据到来之前什么都不产出，
+/// 被拒绝的那条 `-EINVAL` 由 `io_uring_enter` 同步产生，第一次 drive 就在队列里。
+fn arm_recv_multi(driver: &mut UringDriver<'static>, fd: IoFd) -> Option<OpToken> {
+    let token = submit_op(driver, RecvMulti { fd });
+    for _ in 0..3 {
+        driver.drive(DriveMode::Poll).expect("drive failed");
+        match driver.completion_table().try_take_record(token).unwrap() {
+            PollRecordResult::Pending => std::thread::sleep(Duration::from_millis(1)),
+            PollRecordResult::Ready(record) => {
+                assert_eq!(
+                    record.event.res(),
+                    -libc::EINVAL,
+                    "a multishot recv must not complete before any data arrives"
+                );
+                eprintln!("skipping multishot-recv test: kernel has no multishot recv");
+                return None;
+            }
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("completion record unavailable right after submit: {kind:?}")
+            }
+        }
+    }
+    Some(token)
+}
+
+/// 取消一条已经 orphan 掉的操作，并把它的终态完成收干净。
+///
+/// 少了这一步就把 driver 丢掉，等于在内核仍持有环指针时反注册并 munmap——`UringDriver` 的
+/// 析构确实会 close ring fd 让内核取消一切在途操作，但那发生在 `unregister_buf_ring` 之后
+/// （见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.4）。
+///
+/// 「收干净了」的判据是 token 变成 `Unavailable`：slot 归还的同时 generation 推进，这正是
+/// 终态完成落地的证据。
+fn drain_cancelled(driver: &mut UringDriver<'static>, token: OpToken) {
+    driver
+        .cancel_op(CancelRequest::abandon(token))
+        .expect("cancel failed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        driver.drive(DriveMode::Poll).expect("drive failed");
+        if matches!(
+            driver.completion_table().try_take_record(token),
+            Ok(PollRecordResult::Unavailable { .. })
+        ) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cancelled operation never settled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -326,5 +409,110 @@ fn a_discarded_completion_returns_its_buffer_to_the_ring() {
     assert_eq!(res, b"after".len() as i32);
     assert_eq!(buf.expect("buffer after an orphan").as_slice(), b"after");
 
+    driver.unregister_files(vec![fd]).unwrap();
+}
+
+/// 一次提交，N 条完成，每条各带一个内核挑的 buffer。
+///
+/// 这条用例同时锚定阶段 1 与阶段 2 的交集：token 跨越 N 条完成始终有效（slot 没被归还、
+/// generation 没推进），而每条完成各自从环里取走一个 buffer 又各自补回去。ROUNDS 特意大于
+/// 环深——补充路径要是没接上，第 ENTRIES + 1 轮就会 `-ENOBUFS`。
+#[test]
+fn recv_multi_delivers_every_chunk_from_one_submission() {
+    const ENTRIES: u16 = 4;
+    const ROUNDS: usize = 12;
+
+    let Some(mut driver) = new_driver_or_skip(ENTRIES, 256) else {
+        return;
+    };
+    let sock = SocketPair::new();
+    let fd = sock.register_rx(&mut driver);
+
+    let Some(token) = arm_recv_multi(&mut driver, fd) else {
+        driver.unregister_files(vec![fd]).unwrap();
+        return;
+    };
+
+    for round in 0..ROUNDS {
+        // 一次一条：等这一轮的完成到手再发下一条，否则内核会把两轮的数据并进一个 buffer。
+        let payload = format!("round-{round}");
+        sock.send(payload.as_bytes());
+
+        let (res, buf) = take_completion(&mut driver, token);
+        assert_eq!(
+            res,
+            payload.len() as i32,
+            "round {round} read the wrong length"
+        );
+        let buf = buf.unwrap_or_else(|| panic!("round {round} produced no buffer"));
+        assert_eq!(buf.as_slice(), payload.as_bytes(), "round {round} content");
+    }
+
+    let stats = driver.provided_buf_stats().expect("the ring is registered");
+    assert_eq!(stats.handed_out, ROUNDS as u64);
+    assert_eq!(stats.refilled, ENTRIES as u64 + ROUNDS as u64);
+    assert_eq!(
+        stats.available, ENTRIES,
+        "every consumed entry must have been replaced"
+    );
+
+    // 对端关闭：内核以 `res == 0` 结束这条 multishot，流的终点就是这一条。
+    sock.shutdown_tx();
+    let (res, _buf) = take_completion(&mut driver, token);
+    assert_eq!(res, 0, "EOF must arrive as a zero-length completion");
+
+    driver.unregister_files(vec![fd]).unwrap();
+}
+
+/// 一条被放弃的 multishot recv 收到完成时，它选中的 buffer 要原样还回环。
+///
+/// 与 [`a_discarded_completion_returns_its_buffer_to_the_ring`] 的差别在于「取消不等于结
+/// 束」在 multishot 上还要多说一句：内核会**接着**投递，每一条都带一个 bid。所以这里发两
+/// 次数据，断言环两次都补得回来——只处理第一条的实现在这里会被抓住。
+#[test]
+fn a_cancelled_recv_multi_returns_its_buffer_to_the_ring() {
+    const ENTRIES: u16 = 2;
+
+    let Some(mut driver) = new_driver_or_skip(ENTRIES, 256) else {
+        return;
+    };
+    let sock = SocketPair::new();
+    let fd = sock.register_rx(&mut driver);
+
+    let Some(token) = arm_recv_multi(&mut driver, fd) else {
+        driver.unregister_files(vec![fd]).unwrap();
+        return;
+    };
+
+    // 数据还没来就放弃：slot 转 `InFlightOrphaned`，而 multishot 仍在内核里。
+    driver.completion_table().mark_orphaned(token);
+
+    for expected_returns in 1..=2u64 {
+        sock.send(b"orphaned");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            driver.drive(DriveMode::Poll).expect("drive failed");
+            let stats = driver.provided_buf_stats().expect("the ring is registered");
+            if stats.returned >= expected_returns {
+                assert_eq!(stats.handed_out, 0, "nobody consumed these completions");
+                assert_eq!(
+                    stats.available, ENTRIES,
+                    "a discarded completion must leave the ring full"
+                );
+                // 还回环用的是原来那个 buffer，不是新从池里取的。
+                assert_eq!(stats.refilled, ENTRIES as u64);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orphaned completion {expected_returns} never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // 环没被削短——上面每一轮的 `available == ENTRIES` 就是这句话。这里不再另开一条 recv
+    // 来验证：那条 multishot 还在内核里 armed 着，会跟新 recv 抢同一个 socket 上的数据。
+    drain_cancelled(&mut driver, token);
     driver.unregister_files(vec![fd]).unwrap();
 }

@@ -655,6 +655,172 @@ fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
     });
 }
 
+/// 一条 `RecvStream` 连续产出每一段数据，对端关闭时正常结束。
+///
+/// 在 6.0+ 的内核上这只对应**一次** SQE 提交；5.19–5.x 上自动走每次重新提交单发
+/// `RecvProvided` 的路径。两条路径的可观测行为必须一致，所以这个测试对两者都跑得通——那正
+/// 是它的价值。
+///
+/// 「对端关闭 → 流结束」是这里最容易写错的一条：`recv` 读到 0 字节在流的语义里只有一种意
+/// 思，所以它是 `None` 而不是一个空 buffer。
+///
+/// 客户端**特意用一条普通 OS socket**，不是 [`TcpStream`]：一条 armed 的 multishot 会钉住
+/// 本 ring 的固定文件表资源节点，于是在它在途期间被反注册的 socket 并不会真的关掉，对端也
+/// 就收不到 FIN（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §9.6）。那是驱动层的既有问题，
+/// 不该由这条用例来承担。
+#[cfg(target_os = "linux")]
+#[test]
+fn recv_multi_streams_every_chunk_until_the_peer_closes() {
+    const ROUNDS: usize = 8;
+
+    run_test_with_provided_buffers(async |ctx| {
+        use veloq_driver_native::driver::Driver;
+
+        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
+            eprintln!("skipping: kernel has no provided buffer ring");
+            return;
+        }
+
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+
+            let mut client = std::net::TcpStream::connect(listen_addr).expect("Failed to connect");
+            for round in 0..ROUNDS {
+                client
+                    .write_all(format!("round-{round}").as_bytes())
+                    .expect("write failed");
+                // 一次一条，别让内核把两轮的数据合成一个 buffer 交上来。
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(client);
+        });
+
+        let (stream, _peer) = listener.accept().await.expect("Accept failed");
+        let mut chunks = stream.recv_multi().expect("recv_multi must be available");
+
+        for round in 0..ROUNDS {
+            let buf = chunks
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("recv stream ended early at {round}"))
+                .unwrap_or_else(|e| panic!("recv_multi round {round} failed: {e}"));
+            assert_eq!(
+                buf.as_slice(),
+                format!("round-{round}").as_bytes(),
+                "round {round} content"
+            );
+        }
+
+        // 对端关闭之后流结束，而不是无限产出空 buffer。
+        assert!(
+            chunks.next().await.is_none(),
+            "the stream must end when the peer closes"
+        );
+        assert_eq!(chunks.rearms(), 0, "a 256-deep ring must not run dry here");
+
+        client.join().expect("client thread panicked");
+    });
+}
+
+/// 丢弃一条仍在途的 `RecvStream` 之后，连接还能继续用。
+///
+/// 覆盖的是取消路径：句柄的 `Drop` 把 slot 收进 `InFlightOrphaned`，内核随后的完成才找得到
+/// slot 去跑 `orphan_cleanup`——而 multishot recv 的 orphan cleanup 要把内核挑走的 buffer
+/// 还回环。漏掉的话环会一次比一次短，最后所有 recv 都 `-ENOBUFS`。
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_a_recv_stream_leaves_the_connection_usable() {
+    run_test_with_provided_buffers(async |ctx| {
+        use veloq_driver_native::driver::Driver;
+
+        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
+            eprintln!("skipping: kernel has no provided buffer ring");
+            return;
+        }
+
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let (stream, _peer) = listener.accept().await.expect("Accept failed");
+
+                // 开一条流、不取任何东西就丢弃：multishot 已经提交给内核了。
+                drop(stream.recv_multi().expect("recv_multi must be available"));
+                yield_now().await;
+
+                // 取消是异步的：在它生效之前那条已被放弃的 recv 仍会从同一条连接上取走数
+                // 据（取走后走 orphan cleanup 直接丢掉）。所以客户端发很多次，断言的是
+                // 「新流最终收得到东西」，不是「第一段数据归新流」。
+                let mut chunks = stream.recv_multi().expect("recv_multi must be available");
+                let buf = chunks
+                    .next()
+                    .await
+                    .expect("recv stream ended early")
+                    .expect("recv failed after an earlier stream was dropped");
+                assert!(buf.as_slice().starts_with(b"chunk"));
+            });
+
+            s.spawn_boxed(async move {
+                let stream = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+                for _ in 0..16 {
+                    let mut buf = ctx.alloc(nz!(64));
+                    buf.as_slice_mut()[..5].copy_from_slice(b"chunk");
+                    buf.set_len(5);
+                    if stream.send(buf).await.is_err() {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            });
+        })
+        .await
+        .unwrap();
+    });
+}
+
+/// 没开这项能力时 `recv_multi` 明确报错，而不是悄悄退回普通 recv。
+///
+/// 与 `recv_provided` 同一个理由、同一个出口：调用方没有交出 buffer，「换一条路」意味着运
+/// 行时得凭空造一个。这条在两个平台上都跑——IOCP 恒无此能力。
+#[test]
+fn recv_multi_reports_a_runtime_without_provided_buffers() {
+    run_test(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let (stream, _peer) = listener.accept().await.expect("Accept failed");
+                let err = stream
+                    .recv_multi()
+                    .err()
+                    .expect("a runtime without provided buffers must refuse");
+                assert!(
+                    format!("{err}").contains("provided buffers are not available"),
+                    "unexpected error: {err}"
+                );
+            });
+
+            s.spawn_boxed(async move {
+                let stream = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+                // 撑到服务端问完为止，否则连接先断、错误就变成别的了。
+                yield_now().await;
+                drop(stream);
+            });
+        })
+        .await
+        .unwrap();
+    });
+}
+
 /// 没开这项能力时 `recv_provided` 明确报错，而不是悄悄退回普通 recv。
 ///
 /// 退回去是错的：调用方没有交出 buffer，「悄悄换一条路」意味着运行时得凭空造一个，那就把

@@ -12,6 +12,7 @@ use crate::{
         accept_stream::AcceptStream,
         common::{InnerSocket, SocketToken, SocketTokenPtr},
         error::NetError,
+        recv_stream::RecvStream,
     },
     runtime::context::Ctx,
 };
@@ -232,6 +233,28 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
             .and_then(|provided| provided.buf)
             .ok_or(NetError::ProvidedBufferMissing)
             .trans()
+    }
+
+    /// 把这条连接变成一条数据流，每一项的 buffer 由内核在数据到达时才从 provided buffer
+    /// 环里挑。
+    ///
+    /// 与反复 `recv_provided()` 语义相同，但在支持 multishot recv 的内核（6.0+）上只提交
+    /// 一次 SQE、只占一个 slot；不支持时退回「每次重新提交一次单发 recv」。两条路径都要求
+    /// 运行时开了 provided buffers（[`crate::config::Config::uring_provided_buffers`]），
+    /// 否则返回 [`NetError::ProvidedBuffersUnavailable`]——**这是内核语义不是设计选择**，
+    /// 见 [`RecvStream`]。
+    ///
+    /// 对端关闭时流正常结束。流在当前 worker 上提交，与这个 socket 上的其它操作一样。
+    #[cfg(target_os = "linux")]
+    pub fn recv_multi(&self) -> Result<RecvStream<'rt, 'reg, S, P>> {
+        RecvStream::new(self.ctx, self.inner.clone(), self.submitter)
+    }
+
+    /// IOCP 没有 provided buffer，恒返回 [`NetError::ProvidedBuffersUnavailable`]。签名与
+    /// Linux 一致，调用方不必写 `cfg`。
+    #[cfg(not(target_os = "linux"))]
+    pub fn recv_multi(&self) -> Result<RecvStream<'rt, 'reg, S, P>> {
+        Err(NetError::ProvidedBuffersUnavailable)?
     }
 
     async fn send_subset_direct(

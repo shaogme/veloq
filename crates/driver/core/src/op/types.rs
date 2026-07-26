@@ -26,6 +26,7 @@ pub enum OpKind {
     AcceptedSocket = 20,
     RecvProvided = 21,
     ProvidedBuf = 22,
+    RecvMulti = 23,
 }
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
@@ -183,6 +184,21 @@ pub struct AcceptedSocket;
 /// ten thousand idle connections no longer pin ten thousand receive buffers. See
 /// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.1.
 pub struct RecvProvided<H: Handle> {
+    pub fd: IoFd<H>,
+}
+
+/// Receive from a socket until the operation is cancelled, each completion carrying a buffer the
+/// kernel picked out of the driver's provided-buffer ring.
+///
+/// The intersection of [`AcceptMulti`] and [`RecvProvided`], and it needs nothing either of them
+/// did not already need: the submit payload stays in the slot for the kernel to keep receiving
+/// into, and every completion's record payload is a [`ProvidedBuf`].
+///
+/// A provided-buffer ring is not optional here — it is the kernel's rule, not a design choice:
+/// the multishot variant of `IORING_OP_RECV` forces `IOSQE_BUFFER_SELECT`, because a single
+/// caller-supplied buffer could not possibly hold several completions' worth of data. See
+/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §6.
+pub struct RecvMulti<H: Handle> {
     pub fd: IoFd<H>,
 }
 

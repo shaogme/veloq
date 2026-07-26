@@ -5,8 +5,8 @@ use crate::{
     error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
     op::{
-        Accept, AcceptMulti, Connect, OpSend, Recv, RecvProvided, SendTo, UdpConnect, UdpRecv,
-        UdpRecvFrom, UdpSend,
+        Accept, AcceptMulti, Connect, OpSend, Recv, RecvMulti, RecvProvided, SendTo, UdpConnect,
+        UdpRecv, UdpRecvFrom, UdpSend,
         payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvFromPayload},
     },
 };
@@ -53,6 +53,28 @@ pub(crate) unsafe fn make_sqe_recv_provided(
     .buf_group(bgid)
     .build()
     .flags(squeue::Flags::BUFFER_SELECT)))
+}
+
+/// A recv that stays armed, each completion drawing its own buffer from the ring.
+///
+/// `len` is deliberately left at the opcode's default of `0`, unlike
+/// [`make_sqe_recv_provided`]: multishot completions are sized by the kernel one at a time, so
+/// there is no single length this submission could name. See
+/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §9.4.
+///
+/// `RecvMulti::build` sets `IOSQE_BUFFER_SELECT` unconditionally — the kernel refuses a
+/// multishot recv without buffer selection, which is why this operation exists only once a ring
+/// is registered.
+pub(crate) unsafe fn make_sqe_recv_multi(
+    _kernel: &mut KernelRef<RecvMulti>,
+    val: &mut RecvMulti,
+    env: &SqeEnv<'_>,
+    _token: SubmitTokenContext,
+) -> UringResult<squeue::Entry> {
+    const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
+    let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
+    let fd = resolve_socket_fd(env.file_table, val.fd, SCOPE)?;
+    Ok(sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()))
 }
 
 pub(crate) unsafe fn make_sqe_send(
