@@ -130,17 +130,20 @@ impl RioRegistry {
         mem: (*const u8, usize),
         env: RioEnv<'_>,
     ) -> RioResult<()> {
-        if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
-            && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
-        {
-            self.registration_stats
-                .chunk_register_skipped_recent_failure = self
-                .registration_stats
-                .chunk_register_skipped_recent_failure
-                .saturating_add(1);
-            return RioError::ResourceExhaustion
-                .with_ctx("chunk_id", id.raw())
-                .attach_note("RIO chunk registration skipped due to recent failure");
+        if let Some(last_fail) = self.chunk_register_failures_recent.get(&id).copied() {
+            if last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN {
+                self.registration_stats
+                    .chunk_register_skipped_recent_failure = self
+                    .registration_stats
+                    .chunk_register_skipped_recent_failure
+                    .saturating_add(1);
+                return RioError::ResourceExhaustion
+                    .with_ctx("chunk_id", id.raw())
+                    .attach_note("RIO chunk registration skipped due to recent failure");
+            }
+            // The cooldown expired: drop the record now instead of keeping it until this chunk
+            // happens to register successfully again.
+            self.chunk_register_failures_recent.remove(&id);
         }
 
         let (ptr, len) = mem;

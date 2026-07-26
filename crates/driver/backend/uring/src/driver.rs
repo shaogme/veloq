@@ -149,11 +149,14 @@ pub struct UringDriver<'a> {
 
     pub(crate) wheel: Wheel<OpToken>,
     pub(crate) timer_buffer: Vec<OpToken>,
+    /// Reused across `process_completions_internal` calls so draining the CQ never allocates.
+    pub(crate) cqe_buffer: Vec<(u64, i32, u32)>,
     pub(crate) last_timer_poll: Instant,
     pub(crate) registrar: &'a (dyn BufferRegistrar + 'a),
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) chunk_register_failures_recent: HashMap<ChunkId, Instant>,
+    /// Last failed registration attempt per chunk, indexed by [`ChunkId`]; `MAX_CHUNKS` long.
+    pub(crate) chunk_register_failure_at: Box<[Option<Instant>]>,
     pub(crate) file_slots: Vec<FileSlot>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
@@ -219,11 +222,12 @@ impl<'a> UringDriver<'a> {
 
             wheel: Wheel::new(WheelConfig::default()),
             timer_buffer: Vec::new(),
+            cqe_buffer: Vec::with_capacity(entries as usize),
             last_timer_poll: Instant::now(),
             registrar,
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
-            chunk_register_failures_recent: HashMap::new(),
+            chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
             file_slots: Vec::new(),
             free_file_slots: Vec::new(),
             file_table_initialized: false,

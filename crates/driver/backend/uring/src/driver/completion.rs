@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    mem,
     num::NonZeroU8,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -335,14 +336,7 @@ impl<'a> UringDriver<'a> {
             }
         }
 
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
-        let ticks = elapsed.as_millis() as u64 / tick_ms;
-        if ticks > 0 {
-            self.advance_timers(elapsed)?;
-            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
-        }
+        self.advance_timer_clock()?;
 
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
@@ -351,19 +345,47 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
-    pub(crate) fn advance_timers(&mut self, elapsed: Duration) -> UringResult<()> {
-        self.wheel.advance(elapsed, &mut self.timer_buffer);
+    /// Advances the timer wheel by however many whole ticks elapsed since the last poll.
+    ///
+    /// `Wheel::new` already normalises the tick to at least 1ms, but the divisor is clamped
+    /// here as well so this arithmetic does not silently depend on a `veloq-wheel` internal.
+    fn advance_timer_clock(&mut self) -> UringResult<()> {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
+        let tick_ms = (self.wheel.tick_duration().as_millis() as u64).max(1);
+        let ticks = elapsed.as_millis() as u64 / tick_ms;
+        if ticks > 0 {
+            self.advance_timers(elapsed)?;
+            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
+        }
+        Ok(())
+    }
 
-        let timer_buffer = std::mem::take(&mut self.timer_buffer);
-        for token in timer_buffer {
+    pub(crate) fn advance_timers(&mut self, elapsed: Duration) -> UringResult<()> {
+        // The buffer is owned by the driver purely to keep its allocation across polls; it is
+        // moved out for the duration of the drain so completions may take `&mut self`.
+        let mut timer_buffer = mem::take(&mut self.timer_buffer);
+        timer_buffer.clear();
+        self.wheel.advance(elapsed, &mut timer_buffer);
+
+        let mut first_error = None;
+        for &token in &timer_buffer {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
-            let _ = self.accept_synthetic_completion(
+            let outcome = self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
                 UringSyntheticCompletion::None,
-            )?;
+            );
+            if let Err(report) = outcome
+                && first_error.is_none()
+            {
+                first_error = Some(report);
+            }
         }
-        Ok(())
+
+        timer_buffer.clear();
+        self.timer_buffer = timer_buffer;
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
@@ -374,14 +396,7 @@ impl<'a> UringDriver<'a> {
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
 
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
-        let ticks = elapsed.as_millis() as u64 / tick_ms;
-        if ticks > 0 {
-            self.advance_timers(elapsed)?;
-            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
-        }
+        self.advance_timer_clock()?;
 
         self.flush_cancellations()?;
         self.flush_backlog()?;
@@ -395,7 +410,11 @@ impl<'a> UringDriver<'a> {
                 .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
         };
 
-        let mut cqes = Vec::new();
+        // The CQEs are copied out of the ring first so that the borrow of `self.ring` ends
+        // before the routing loop needs `&mut self`. The buffer lives on the driver to keep
+        // its allocation across polls, and is moved out for the same reason.
+        let mut cqes = mem::take(&mut self.cqe_buffer);
+        cqes.clear();
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
@@ -407,7 +426,8 @@ impl<'a> UringDriver<'a> {
         }
 
         let mut progress = CompletionProgress::default();
-        for (raw_token, cqe_res, cqe_flags) in cqes {
+        let mut first_error = None;
+        for &(raw_token, cqe_res, cqe_flags) in &cqes {
             let outcome = self.accept_completion_ingress(
                 CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
                     COMP_BACKEND_URING,
@@ -416,11 +436,20 @@ impl<'a> UringDriver<'a> {
                     cqe_flags,
                 )),
                 UringSyntheticCompletion::None,
-            )?;
-            progress.merge(outcome);
+            );
+            match outcome {
+                Ok(outcome) => progress.merge(outcome),
+                Err(report) => {
+                    if first_error.is_none() {
+                        first_error = Some(report);
+                    }
+                }
+            }
         }
 
-        Ok(progress)
+        cqes.clear();
+        self.cqe_buffer = cqes;
+        first_error.map_or(Ok(progress), Err)
     }
 
     pub(crate) fn accept_synthetic_completion(

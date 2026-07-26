@@ -15,15 +15,19 @@ use crate::{
     common::{IocpErrorContext, IocpWaker, iocp_msg},
     error::{IocpError, IocpResult},
     op::{IocpSlotSpec, OverlappedEntry},
-    win32::{CompletionStatus, IoCompletionPort, Overlapped},
+    win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
 };
 
 use super::{IocpDriver, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND_IOCP};
+
+/// Completions dequeued per `GetQueuedCompletionStatusEx` call, matching `MAX_RIO_RESULTS`.
+const MAX_IOCP_BATCH: usize = 128;
 
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
     table: SharedCompletionTable<IocpSlotSpec>,
+    batch: CompletionBatch,
 }
 
 impl CompletionPump {
@@ -32,11 +36,20 @@ impl CompletionPump {
             port: Arc::new(port),
             is_notified: Arc::new(AtomicBool::new(false)),
             table,
+            batch: CompletionBatch::with_capacity(MAX_IOCP_BATCH),
         }
     }
 
-    pub(super) fn port(&self) -> &IoCompletionPort {
-        self.port.as_ref()
+    /// Dequeues a batch of completions, returning how many are available via [`Self::status`].
+    ///
+    /// The batch buffer is owned by the pump so that draining never allocates. Callers must
+    /// finish reading the batch before requesting the next one.
+    pub(super) fn fill_batch(&mut self, wait_ms: u32) -> IocpResult<usize> {
+        self.port.get_status_batch(&mut self.batch, wait_ms)
+    }
+
+    pub(super) fn status(&self, index: usize) -> Option<CompletionStatus> {
+        self.batch.status(index)
     }
 
     pub(super) fn port_arc(&self) -> Arc<IoCompletionPort> {
@@ -116,23 +129,26 @@ impl TimerEngine {
 
 impl<'a> IocpDriver<'a> {
     pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpResult<usize> {
-        let status = self
+        let count = self
             .completion
-            .port()
-            .get_status(duration_to_wait_ms(timeout))
+            .fill_batch(duration_to_wait_ms(timeout))
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to poll IOCP status")?;
 
-        match status {
-            CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => self.handle_completion_status(bytes, key, overlapped, success, error_code),
-            CompletionStatus::Timeout => Ok(0),
+        let mut drained = 0usize;
+        let mut first_error = None;
+        for index in 0..count {
+            match self.handle_batch_entry(index) {
+                Ok(handled) => drained += handled,
+                Err(report) => {
+                    if first_error.is_none() {
+                        first_error = Some(report);
+                    }
+                }
+            }
         }
+
+        first_error.map_or(Ok(drained), Err)
     }
 
     /// Retrieves completion events from the I/O completion port.
@@ -140,29 +156,42 @@ impl<'a> IocpDriver<'a> {
         let _ = self.drain_cancel_requests()?;
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
-        let status = self.completion.port().get_status(wait_ms);
+        let batched = self.completion.fill_batch(wait_ms);
         let now = Instant::now();
         self.timer.advance_to(now);
         self.process_timers()?;
 
-        let status = status
+        let count = batched
             .attach_note("failed to get IOCP completion status")
             .trans()?;
 
-        match status {
-            CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                let _ =
-                    self.handle_completion_status(bytes, key, overlapped, success, error_code)?;
+        // Every entry is routed even if one of them fails, so a single corrupt completion
+        // cannot drop the rest of the batch on the floor; the first error is reported.
+        let mut first_error = None;
+        for index in 0..count {
+            if let Err(report) = self.handle_batch_entry(index)
+                && first_error.is_none()
+            {
+                first_error = Some(report);
             }
-            CompletionStatus::Timeout => {}
         }
-        Ok(())
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Routes the `index`-th entry of the batch currently held by the completion pump.
+    fn handle_batch_entry(&mut self, index: usize) -> IocpResult<usize> {
+        let Some(CompletionStatus {
+            bytes,
+            key,
+            overlapped,
+            success,
+            error_code,
+        }) = self.completion.status(index)
+        else {
+            return Ok(0);
+        };
+        self.handle_completion_status(bytes, key, overlapped, success, error_code)
     }
 
     pub(super) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
@@ -214,7 +243,7 @@ impl<'a> IocpDriver<'a> {
             }
             IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
                 IocpErrorContext::CompletionWait,
-                "GetQueuedCompletionStatus failed with null overlapped",
+                "GetQueuedCompletionStatusEx reported a failure with null overlapped",
             )
             .with_ctx("os_error_code", error_code.unwrap_or(0))
             .with_ctx("completion_key", key)
@@ -278,7 +307,7 @@ impl<'a> IocpDriver<'a> {
                 .with_ctx("raw_res", res)
                 .with_ctx("raw_flags", flags)
                 .attach_note(
-                    "The Completion Key received from GetQueuedCompletionStatus does not match \
+                    "The Completion Key received from GetQueuedCompletionStatusEx does not match \
                      the expected key mapped to the submitted token. This indicates a programming \
                      bug or memory corruption during Socket/File registration to the completion port."
                 ));

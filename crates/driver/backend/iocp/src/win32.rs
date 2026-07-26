@@ -4,14 +4,17 @@ use crate::error::{IocpError, IocpResult};
 use veloq_driver_core::driver::CompletionToken;
 use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+    Foundation::{
+        CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, RtlNtStatusToDosError,
+        WAIT_TIMEOUT,
+    },
     Networking::WinSock::{
         INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname,
         listen, setsockopt,
     },
     System::IO::{
-        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-        PostQueuedCompletionStatus,
+        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED,
+        OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
     },
 };
 
@@ -381,50 +384,44 @@ impl IoCompletionPort {
         Ok(CancelRequestResult::Submitted)
     }
 
-    /// Retrieves a completion status from the port.
-    pub fn get_status(&self, timeout_ms: u32) -> IocpResult<CompletionStatus> {
-        let mut bytes = 0;
-        let mut key = 0;
-        let mut overlapped = ptr::null_mut();
+    /// Dequeues up to `batch.capacity()` completion statuses in a single syscall.
+    ///
+    /// Returns the number of entries retrieved, which is `0` when the wait timed out. The
+    /// entries stay in `batch` and are decoded through [`CompletionBatch::status`].
+    pub fn get_status_batch(
+        &self,
+        batch: &mut CompletionBatch,
+        timeout_ms: u32,
+    ) -> IocpResult<usize> {
+        batch.len = 0;
+        let capacity = batch.entries.len() as u32;
+        let mut removed: u32 = 0;
 
-        // SAFETY: GetQueuedCompletionStatus is called with valid pointers to local variables.
+        // SAFETY: `batch.entries` is a live slice of `capacity` OVERLAPPED_ENTRY values and
+        // `removed` is a valid local; the port handle is owned by `self`.
         let res = unsafe {
-            GetQueuedCompletionStatus(
+            GetQueuedCompletionStatusEx(
                 self.0.as_raw(),
-                &mut bytes,
-                &mut key,
-                &mut overlapped,
+                batch.entries.as_mut_ptr(),
+                capacity,
+                &mut removed,
                 timeout_ms,
+                0,
             )
         };
 
         if res == 0 {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
-            if overlapped.is_null() {
-                if err == WAIT_TIMEOUT {
-                    return Ok(CompletionStatus::Timeout);
-                }
-                return Err(IocpError::Win32
-                    .io_report("GetQueuedCompletionStatus", from_raw_os_error(err as i32)));
-            } else {
-                return Ok(CompletionStatus::Completed {
-                    bytes,
-                    key,
-                    overlapped: overlapped as *mut Overlapped,
-                    success: false,
-                    error_code: Some(err),
-                });
+            if err == WAIT_TIMEOUT {
+                return Ok(0);
             }
+            return Err(IocpError::Win32
+                .io_report("GetQueuedCompletionStatusEx", from_raw_os_error(err as i32)));
         }
 
-        Ok(CompletionStatus::Completed {
-            bytes,
-            key,
-            overlapped: overlapped as *mut Overlapped,
-            success: true,
-            error_code: None,
-        })
+        batch.len = (removed as usize).min(batch.entries.len());
+        Ok(batch.len)
     }
 
     /// Returns the raw HANDLE of the completion port.
@@ -433,14 +430,128 @@ impl IoCompletionPort {
     }
 }
 
+/// Reusable buffer of `OVERLAPPED_ENTRY` slots backing [`IoCompletionPort::get_status_batch`].
+pub struct CompletionBatch {
+    entries: Box<[OVERLAPPED_ENTRY]>,
+    len: usize,
+}
+
+impl CompletionBatch {
+    /// Creates a batch buffer able to hold `capacity` (at least one) completion entries.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: (0..capacity.max(1))
+                .map(|_| OVERLAPPED_ENTRY::default())
+                .collect(),
+            len: 0,
+        }
+    }
+
+    /// Decodes the `index`-th retrieved entry, or `None` when `index` is past the batch.
+    pub fn status(&self, index: usize) -> Option<CompletionStatus> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries.get(index).map(CompletionStatus::from_entry)
+    }
+}
+
 /// Represents the status of a completed I/O operation.
-pub enum CompletionStatus {
-    Completed {
-        bytes: u32,
-        key: usize,
-        overlapped: *mut Overlapped,
-        success: bool,
-        error_code: Option<u32>,
-    },
-    Timeout,
+#[derive(Clone, Copy)]
+pub struct CompletionStatus {
+    pub bytes: u32,
+    pub key: usize,
+    pub overlapped: *mut Overlapped,
+    pub success: bool,
+    pub error_code: Option<u32>,
+}
+
+impl CompletionStatus {
+    /// Rebuilds the `GetQueuedCompletionStatus` view of a batched `OVERLAPPED_ENTRY`.
+    ///
+    /// `GetQueuedCompletionStatusEx` reports no per-entry error: the operation's `NTSTATUS`
+    /// lives in the `Internal` field of the OVERLAPPED the kernel completed, and mapping it
+    /// through `RtlNtStatusToDosError` is exactly what `GetQueuedCompletionStatus` does before
+    /// returning `FALSE`. Entries posted by `PostQueuedCompletionStatus` carry no OVERLAPPED
+    /// and therefore no status, matching the `TRUE` those posts get from the non-Ex call.
+    fn from_entry(entry: &OVERLAPPED_ENTRY) -> Self {
+        let overlapped = entry.lpOverlapped.cast::<Overlapped>();
+        let status = if overlapped.is_null() {
+            0
+        } else {
+            // SAFETY: a non-null `lpOverlapped` points at the OVERLAPPED the kernel just
+            // completed; its owner keeps it alive until the completion is observed here.
+            unsafe { (*entry.lpOverlapped).Internal as u32 as NTSTATUS }
+        };
+
+        // `NT_SUCCESS(status)` is `status >= 0`.
+        let error_code = (status < 0).then(|| {
+            // SAFETY: RtlNtStatusToDosError is a pure NTSTATUS -> Win32 error mapping.
+            unsafe { RtlNtStatusToDosError(status) }
+        });
+
+        Self {
+            bytes: entry.dwNumberOfBytesTransferred,
+            key: entry.lpCompletionKey,
+            overlapped,
+            success: error_code.is_none(),
+            error_code,
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_status_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{
+        ERROR_OPERATION_ABORTED, STATUS_CANCELLED, STATUS_PENDING,
+    };
+
+    fn entry_with(overlapped: *mut OVERLAPPED, bytes: u32, key: usize) -> OVERLAPPED_ENTRY {
+        OVERLAPPED_ENTRY {
+            lpCompletionKey: key,
+            lpOverlapped: overlapped,
+            Internal: 0,
+            dwNumberOfBytesTransferred: bytes,
+        }
+    }
+
+    #[test]
+    fn posted_entry_without_overlapped_is_a_success() {
+        let status = CompletionStatus::from_entry(&entry_with(ptr::null_mut(), 0, 42));
+
+        assert!(status.success);
+        assert_eq!(status.error_code, None);
+        assert_eq!(status.key, 42);
+    }
+
+    #[test]
+    fn successful_overlapped_entry_reports_transferred_bytes() {
+        let mut overlapped = Overlapped::zeroed();
+        overlapped.0.Internal = STATUS_PENDING as u32 as usize;
+        let status = CompletionStatus::from_entry(&entry_with(overlapped.as_mut_ptr(), 1024, 7));
+
+        assert!(status.success, "a non-negative NTSTATUS is NT_SUCCESS");
+        assert_eq!(status.error_code, None);
+        assert_eq!(status.bytes, 1024);
+    }
+
+    #[test]
+    fn cancelled_overlapped_entry_maps_to_the_win32_error_code() {
+        let mut overlapped = Overlapped::zeroed();
+        // The kernel stores the operation's NTSTATUS in `OVERLAPPED::Internal`; this is the
+        // same source `GetQueuedCompletionStatus` converts into its `GetLastError` value.
+        overlapped.0.Internal = STATUS_CANCELLED as u32 as usize;
+        let status = CompletionStatus::from_entry(&entry_with(overlapped.as_mut_ptr(), 0, 7));
+
+        assert!(!status.success);
+        assert_eq!(status.error_code, Some(ERROR_OPERATION_ABORTED));
+    }
+
+    #[test]
+    fn batch_only_exposes_entries_from_the_last_fill() {
+        let batch = CompletionBatch::with_capacity(4);
+
+        assert!(batch.status(0).is_none(), "a fresh batch holds no entries");
+    }
 }

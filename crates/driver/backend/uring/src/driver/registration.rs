@@ -119,20 +119,6 @@ impl<'a> UringDriver<'a> {
         ptr: *const u8,
         len: usize,
     ) -> UringResult<()> {
-        if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
-            && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
-        {
-            self.registration_stats
-                .chunk_register_skipped_recent_failure = self
-                .registration_stats
-                .chunk_register_skipped_recent_failure
-                .saturating_add(1);
-            return UringError::Registration
-                .push_ctx("scope", "driver.register_chunk_internal")
-                .with_ctx("chunk_id", id.raw())
-                .attach_note("recent chunk registration failure cooldown");
-        }
-
         let index = id.as_usize();
         if index >= MAX_CHUNKS {
             return UringError::InvalidInput
@@ -140,6 +126,23 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("chunk_id", index)
                 .with_ctx("max_chunks", MAX_CHUNKS)
                 .attach_note("chunk id exceeds maximum registered chunk count");
+        }
+
+        if let Some(last_fail) = self.chunk_register_failure_at[index] {
+            if last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN {
+                self.registration_stats
+                    .chunk_register_skipped_recent_failure = self
+                    .registration_stats
+                    .chunk_register_skipped_recent_failure
+                    .saturating_add(1);
+                return UringError::Registration
+                    .push_ctx("scope", "driver.register_chunk_internal")
+                    .with_ctx("chunk_id", id.raw())
+                    .attach_note("recent chunk registration failure cooldown");
+            }
+            // The cooldown expired: drop the record now instead of letting it sit here for
+            // the lifetime of the driver.
+            self.chunk_register_failure_at[index] = None;
         }
 
         let iovecs = [libc::iovec {
@@ -162,15 +165,14 @@ impl<'a> UringDriver<'a> {
                 .registration_stats
                 .chunk_register_failures
                 .saturating_add(1);
-            self.chunk_register_failures_recent
-                .insert(id, Instant::now());
+            self.chunk_register_failure_at[index] = Some(Instant::now());
             return Err(UringError::Registration
                 .io_report("driver.register_chunk_internal.register_buffers_update", e));
         }
 
         // Mark as registered in local bitset
         let _ = self.registered_chunks.set(index);
-        self.chunk_register_failures_recent.remove(&id);
+        self.chunk_register_failure_at[index] = None;
         self.registration_stats.chunk_register_success = self
             .registration_stats
             .chunk_register_success
@@ -339,6 +341,30 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    /// Registers `fds` into the `fds.len()` consecutive table slots starting at `start`.
+    fn register_file_run(&mut self, start: u32, fds: &[i32]) -> UringResult<()> {
+        let updated = self
+            .ring
+            .submitter()
+            .register_files_update(start, fds)
+            .map_err(|e| {
+                UringError::Registration
+                    .io_report("driver.register_files_internal.register_files_update", e)
+            })?;
+        if updated != fds.len() {
+            return UringError::Registration
+                .push_ctx(
+                    "scope",
+                    "driver.register_files_internal.register_files_update",
+                )
+                .with_ctx("start_index", start)
+                .with_ctx("requested_files", fds.len())
+                .with_ctx("updated_files", updated)
+                .attach_note("io_uring updated fewer registered file entries than requested");
+        }
+        Ok(())
+    }
+
     pub(crate) fn register_files_internal<'h>(
         &mut self,
         files: Vec<RegisterFd<'h, UringRawHandle>>,
@@ -354,36 +380,117 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("free_file_slots", available)
                 .attach_note("io_uring registered file table exhausted");
         }
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut fixed_fds = Vec::with_capacity(files.len());
-        let mut registered_slots = Vec::with_capacity(files.len());
-        for file in files {
-            let entry = match file {
+        // Claim every slot up front and register them in ascending order. `free_file_slots` is
+        // seeded in reverse, so a fresh table hands out consecutive indices and the whole batch
+        // collapses into a single `register_files_update` instead of one syscall per fd.
+        let mut slots = Vec::with_capacity(requested);
+        for _ in 0..requested {
+            slots.push(self.free_file_slots.pop().expect(
+                "register_files_internal capacity precheck guarantees enough free file slots",
+            ));
+        }
+        slots.sort_unstable();
+
+        let entries = files
+            .into_iter()
+            .map(|file| match file {
                 RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd {
                     fd: b.raw().as_fd(),
                     kind: b.kind(),
                 },
                 RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
-            };
-            let fd = entry.fd();
-            let idx = self.free_file_slots.pop().expect(
-                "register_files_internal capacity precheck guarantees enough free file slots",
-            );
-            if let Err(e) = self.ring.submitter().register_files_update(idx, &[fd]) {
-                self.free_file_slots.push(idx);
-                let report = UringError::Registration
-                    .io_report("driver.register_files_internal.register_files_update", e);
+            })
+            .collect::<Vec<_>>();
+        let fds = entries
+            .iter()
+            .map(RegisteredFileEntry::fd)
+            .collect::<Vec<_>>();
+        let mut entries = entries.into_iter();
+
+        let mut registered_slots = Vec::with_capacity(requested);
+        let mut cursor = 0usize;
+        while cursor < requested {
+            let run_end = consecutive_run_end(&slots, cursor);
+            let outcome = self.register_file_run(slots[cursor], &fds[cursor..run_end]);
+
+            // The run's entries are recorded even when the update failed: a partial update may
+            // have left some fds in the kernel table, and the rollback below needs the entries
+            // in place to reset those slots to -1.
+            for idx in slots[cursor..run_end].iter().copied() {
+                let entry = entries
+                    .next()
+                    .expect("one registered file entry per claimed file slot");
+                self.file_slots[idx as usize].entry = Some(entry);
+                registered_slots.push(idx);
+            }
+            cursor = run_end;
+
+            if let Err(report) = outcome {
+                // Hand back the slots this batch never got to.
+                self.free_file_slots.extend_from_slice(&slots[cursor..]);
                 if let Err(rollback_report) = self.rollback_file_slots(&mut registered_slots) {
                     return Err(rollback_report
                         .attach_note("rollback failed after registered file update failure"));
                 }
                 return Err(report);
             }
-            let slot = &mut self.file_slots[idx as usize];
-            slot.entry = Some(entry);
-            registered_slots.push(idx);
-            fixed_fds.push(IoFd::fixed_with_generation(idx, slot.generation));
         }
+
+        // `slots` is sorted and `entries` was consumed in the same order, so slot `i` still
+        // belongs to input file `i`.
+        let fixed_fds = slots
+            .iter()
+            .copied()
+            .map(|idx| IoFd::fixed_with_generation(idx, self.file_slots[idx as usize].generation))
+            .collect();
         Ok(fixed_fds)
+    }
+}
+
+/// Returns the end (exclusive) of the run of consecutive indices starting at `start`.
+fn consecutive_run_end(slots: &[u32], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < slots.len() && slots[end] == slots[end - 1] + 1 {
+        end += 1;
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consecutive_run_end;
+
+    /// Walks `slots` the way `register_files_internal` does, collecting one run per syscall.
+    fn runs(slots: &[u32]) -> Vec<&[u32]> {
+        let mut runs = Vec::new();
+        let mut cursor = 0;
+        while cursor < slots.len() {
+            let end = consecutive_run_end(slots, cursor);
+            runs.push(&slots[cursor..end]);
+            cursor = end;
+        }
+        runs
+    }
+
+    #[test]
+    fn a_fresh_file_table_registers_the_whole_batch_in_one_call() {
+        assert_eq!(runs(&[0, 1, 2, 3]), vec![&[0, 1, 2, 3][..]]);
+    }
+
+    #[test]
+    fn holes_in_the_free_list_split_the_batch_into_runs() {
+        assert_eq!(
+            runs(&[1, 2, 5, 9, 10]),
+            vec![&[1, 2][..], &[5][..], &[9, 10][..]]
+        );
+    }
+
+    #[test]
+    fn a_single_slot_is_one_run() {
+        assert_eq!(runs(&[7]), vec![&[7][..]]);
     }
 }
