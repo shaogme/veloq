@@ -116,8 +116,8 @@ pub struct CompletionRecord<Spec: SlotSpec> {
     pub cleanup: CompletionCleanupGuard,
     /// 取走这条记录之后，该操作是否还会再产出完成。
     ///
-    /// 单发操作恒为 [`CompletionContinuation::Final`]，所以 `LocalOp` / `DetachedOp`
-    /// 直接忽略它；`MultishotOp` 用它判断流到此为止。
+    /// 单发操作恒为 [`CompletionContinuation::Final`]，于是 `LocalOp` / `DetachedOp` 的流
+    /// 在第一项之后就结束；multishot 靠它判断流到此为止。
     pub continuation: CompletionContinuation,
 }
 

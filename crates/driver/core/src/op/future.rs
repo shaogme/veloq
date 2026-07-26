@@ -11,12 +11,12 @@ use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
     driver::{
         AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomalyKind,
-        CompletionAnomalyReason, CompletionRecord, CompletionToken, CompletionValue, Driver,
-        DriverSubmitResult, OpToken, PollRecordResult, RemoteCancelSender, RemoteWaker,
-        SharedCompletionTable, SubmitStatus,
+        CompletionAnomalyReason, CompletionContinuation, CompletionRecord, CompletionToken,
+        CompletionValue, Driver, DriverSubmitResult, OpToken, PollRecordResult, RemoteCancelSender,
+        RemoteWaker, SharedCompletionTable, SubmitStatus,
     },
-    op::{DriverProvider, IntoMultishotOp, IntoPlatformOp, Op},
-    slot::{SlotError, SlotSpec},
+    op::{DriverProvider, IntoPlatformOp, Op, SingleShotOp},
+    slot::{SlotError, SlotPayload, SlotSpec},
 };
 
 use diagweave::prelude::*;
@@ -201,61 +201,87 @@ where
     }
 }
 
-impl<T, E, R> OpResult<T, E, R>
-where
-    E: DriverError,
-{
-    #[inline]
-    pub(crate) fn from_completion_record<Op, Spec>(record: CompletionRecord<Spec>) -> Poll<Self>
-    where
-        Spec: SlotSpec<Error = E>,
-        Op: IntoPlatformOp<Spec, Output = T, Completion = R>,
-    {
-        let CompletionRecord {
-            event,
-            payload: payload_erased,
-            detail,
-            mut cleanup,
-            // 单发操作恒为 `Final`；流的终点判定是 `MultishotOp` 的事。
-            continuation: _,
-        } = record;
-        let payload = match Op::try_payload_from_erased(payload_erased) {
-            Ok(payload) => payload,
-            Err(report) => {
-                let _ = cleanup.run();
-                return Poll::Ready(Self::ResourceLost(OpError::payload_projection(report)));
-            }
-        };
-        cleanup.disarm();
-        let res =
-            detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
-        let completion = Op::complete(payload, res);
-        Poll::Ready(Self::Completed(completion.result, completion.output))
-    }
+/// 一个操作产出的一项：单发操作只有一项，multishot 每条完成一项。
+pub type OpItem<T, Spec> = OpResult<
+    <T as IntoPlatformOp<Spec>>::Output,
+    <Spec as SlotSpec>::Error,
+    <T as IntoPlatformOp<Spec>>::Completion,
+>;
 
-    #[inline]
-    pub(crate) fn poll_table_once<Op, Spec>(
-        table: &dyn CompletionAccess<Spec>,
-        token: OpToken,
-    ) -> Poll<Self>
-    where
-        Spec: SlotSpec<Error = E>,
-        Op: IntoPlatformOp<Spec, Output = T, Completion = R>,
-    {
-        match table.try_take_record(token) {
-            Ok(PollRecordResult::Ready(record)) => Self::from_completion_record::<Op, Spec>(record),
-            Ok(PollRecordResult::Unavailable { kind, attach }) => Poll::Ready(Self::ResourceLost(
-                OpError::from_completion_anomaly(kind, attach),
-            )),
-            Ok(PollRecordResult::Pending) => Poll::Pending,
-            Err(report) => Poll::Ready(Self::ResourceLost(OpError::new(LostReason::Other, report))),
+/// 把一条完成记录投影成用户可见的一项，并带出「这个操作还会不会再产出完成」。
+///
+/// 投影失败时那条记录的 `cleanup` 必须跑——完成式 I/O 下内核可能已经在记录里放了资源
+/// （accept 出来的 fd 之类），丢弃记录不等于丢弃资源。
+#[inline]
+fn item_from_record<T, Spec>(
+    record: CompletionRecord<Spec>,
+) -> (OpItem<T, Spec>, CompletionContinuation)
+where
+    Spec: SlotSpec,
+    T: IntoPlatformOp<Spec>,
+{
+    let CompletionRecord {
+        event,
+        payload: erased,
+        detail,
+        mut cleanup,
+        continuation,
+    } = record;
+
+    let payload = match T::try_record_from_erased(erased) {
+        Ok(payload) => payload,
+        Err(report) => {
+            let _ = cleanup.run();
+            return (
+                OpResult::ResourceLost(OpError::payload_projection(report)),
+                continuation,
+            );
         }
+    };
+    cleanup.disarm();
+    let res =
+        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
+    let completion = T::complete(payload, res);
+    (
+        OpResult::Completed(completion.result, completion.output),
+        continuation,
+    )
+}
+
+/// 从完成表里取一条记录。`Pending` 表示信箱是空的而操作仍在途。
+///
+/// 取不到记录的那几种异常都算终态：token 已经指不到有效的 slot 了，再等下去也不会有东西。
+#[inline]
+fn poll_record_once<T, Spec>(
+    table: &dyn CompletionAccess<Spec>,
+    token: OpToken,
+) -> Poll<(OpItem<T, Spec>, CompletionContinuation)>
+where
+    Spec: SlotSpec,
+    T: IntoPlatformOp<Spec>,
+{
+    match table.try_take_record(token) {
+        Ok(PollRecordResult::Ready(record)) => Poll::Ready(item_from_record::<T, Spec>(record)),
+        Ok(PollRecordResult::Unavailable { kind, attach }) => Poll::Ready((
+            OpResult::ResourceLost(OpError::from_completion_anomaly(kind, attach)),
+            CompletionContinuation::Final,
+        )),
+        Ok(PollRecordResult::Pending) => Poll::Pending,
+        Err(report) => Poll::Ready((
+            OpResult::ResourceLost(OpError::new(LostReason::Other, report)),
+            CompletionContinuation::Final,
+        )),
     }
 }
 
 type DetachedOpMarker<T, Spec> = (T, Spec);
 
-/// A Future representing a detached operation.
+/// 一个已提交操作的句柄，不借用驱动。
+///
+/// 它是一条**完成流**（[`futures_core::Stream`]）：单发操作的流只有一项，multishot 的流
+/// 每条完成一项，终点由记录携带的
+/// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定。单发操作
+/// （[`SingleShotOp`]）额外实现 [`Future`]，于是 `.await` 直接拿那唯一的一项。
 pub struct DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
@@ -265,11 +291,86 @@ where
     pub(crate) cancel_sender: Option<RemoteCancelSender>,
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
     pub(crate) token: Option<OpToken>,
-    pub(crate) immediate_failure: Option<(DriverReport<Spec::Error>, T::UserPayload)>,
-    pub(crate) immediate_resource_lost: Option<OpError<Spec::Error>>,
+    /// 提交阶段就已经定局的那一项（同步失败或资源丢失）。取走它之后就再没有别的来源，
+    /// 流随即结束——所以它和 `token` 不会同时是 `Some`。
+    pub(crate) immediate: Option<OpItem<T, Spec>>,
     pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, Spec>>,
 }
 
+impl<T, Spec> DetachedOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: IntoPlatformOp<Spec>,
+{
+    /// 操作已经进了内核：后续的项都从完成表取。
+    pub(crate) fn armed(
+        completion_table: SharedCompletionTable<Spec>,
+        cancel_sender: RemoteCancelSender,
+        cancel_waker: Arc<dyn RemoteWaker<Spec::Error>>,
+        token: OpToken,
+    ) -> Self {
+        Self {
+            completion_table: Some(completion_table),
+            cancel_sender: Some(cancel_sender),
+            cancel_waker: Some(cancel_waker),
+            token: Some(token),
+            immediate: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// 操作从来没进内核：只有一项，就是提交失败本身。
+    pub(crate) fn settled(item: OpItem<T, Spec>) -> Self {
+        Self {
+            completion_table: None,
+            cancel_sender: None,
+            cancel_waker: None,
+            token: None,
+            immediate: Some(item),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// 取下一项。`Ready(None)` 表示这个操作已经终止，不会再有项了。
+    fn poll_item(&mut self, cx: &mut Context<'_>) -> Poll<Option<OpItem<T, Spec>>> {
+        if let Some(item) = self.immediate.take() {
+            return Poll::Ready(Some(item));
+        }
+
+        let (Some(table), Some(token)) = (self.completion_table.as_ref(), self.token) else {
+            return Poll::Ready(None);
+        };
+
+        let mut polled = poll_record_once::<T, Spec>(&**table, token);
+        if polled.is_pending() {
+            // 注册与发布竞速：注册之后再取一次，避免丢唤醒。
+            table.register_waker(token, cx.waker());
+            polled = poll_record_once::<T, Spec>(&**table, token);
+        }
+
+        match polled {
+            Poll::Ready((item, continuation)) => {
+                if continuation.is_final() {
+                    // 终态记录被取走的同时 slot 已经归还、generation 已经推进，token 从此
+                    // 失效——`Drop` 不能再拿它去 `mark_orphaned` / 请求取消。
+                    self.token = None;
+                }
+                Poll::Ready(Some(item))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// 这个操作是否还在内核里（诊断与测试用）。
+    pub fn is_armed(&self) -> bool {
+        self.token.is_some()
+    }
+}
+
+/// # Safety
+///
+/// 字段里唯一非平凡的是 `immediate`，它装的是 `T::Output` 与 `T::Completion`——两者都被
+/// [`IntoPlatformOp`] 约束为 `Send`。完成表与 waker 本身就是跨线程句柄。
 unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
@@ -306,44 +407,35 @@ where
     }
 }
 
+/// 单发操作才是 future：`await` 一个 multishot 操作等于「取第一条完成然后取消」，
+/// 那是陷阱不是特性，所以让它在编译期就不成立。见 [`SingleShotOp`]。
 impl<T, Spec> Future for DetachedOp<T, Spec>
+where
+    Spec: SlotSpec,
+    T: SingleShotOp<Spec>,
+{
+    type Output = OpItem<T, Spec>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.poll_item(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(None) => panic!("DetachedOp polled after completion"),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T, Spec> futures_core::Stream for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
     T: IntoPlatformOp<Spec>,
 {
-    type Output = OpResult<T::Output, Spec::Error, T::Completion>;
+    type Item = OpItem<T, Spec>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        if let Some((e, payload)) = this.immediate_failure.take() {
-            let completion = T::complete(payload, Err(e));
-            return Poll::Ready(OpResult::Completed(completion.result, completion.output));
-        }
-        if let Some(err) = this.immediate_resource_lost.take() {
-            return Poll::Ready(OpResult::ResourceLost(err));
-        }
-
-        let table = this
-            .completion_table
-            .as_ref()
-            .expect("DetachedOp missing completion_table but no immediate_failure");
-        let token = this
-            .token
-            .expect("DetachedOp missing completion token but no immediate_failure");
-        if let Poll::Ready(result) = Self::Output::poll_table_once::<T, Spec>(&**table, token) {
-            // 终态记录被取走的同时 slot 已经归还、generation 已经推进，token 从此失效。
-            // 丢掉它，`Drop` 才不会去动一个已经属于下一代操作的 cell（见 `Drop`）。
-            this.token = None;
-            return Poll::Ready(result);
-        }
-
-        table.register_waker(token, cx.waker());
-        let polled = Self::Output::poll_table_once::<T, Spec>(&**table, token);
-        if polled.is_ready() {
-            this.token = None;
-        }
-        polled
+        this.poll_item(cx)
     }
 }
 
@@ -354,7 +446,11 @@ pub enum LocalState {
     Completed,
 }
 
-/// A Future wrapper for asynchronous IO operations executed locally.
+/// 一个在当前线程上执行的操作句柄。
+///
+/// 与 [`DetachedOp`] 的分工是「借不借驱动」，不是「一条还是多条完成」：这里同样既是单发
+/// 操作的 [`Future`]，也是任意操作的完成流。thread-local 形态的 multishot 走这条路，不必
+/// 为了拿到流而退回 `Arc` 化的 detached 句柄。
 pub struct LocalOp<'a, T, P>
 where
     P: DriverProvider,
@@ -366,6 +462,12 @@ where
     pub(crate) token: Option<OpToken>,
     pub(crate) marker: std::marker::PhantomData<&'a ()>,
 }
+
+type LocalSubmitOutcome<P> = (
+    OpToken,
+    DriverSubmitResult<SlotError<<P as DriverProvider>::SlotSpec>>,
+    Option<SlotPayload<<P as DriverProvider>::SlotSpec>>,
+);
 
 impl<'a, T, P> LocalOp<'a, T, P>
 where
@@ -381,28 +483,19 @@ where
             marker: std::marker::PhantomData,
         }
     }
-}
 
-impl<'a, T, P> Future for LocalOp<'a, T, P>
-where
-    P: DriverProvider,
-    T: IntoPlatformOp<P::SlotSpec>,
-{
-    type Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>;
+    /// 提交。返回 `Some` 表示这次提交同步就定局了（操作一条完成都不会产生）。
+    fn submit(&mut self) -> Option<OpItem<T, P::SlotSpec>> {
+        trace!(
+            op = %std::any::type_name::<T>(),
+            "LocalOp: submit begin"
+        );
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let op = unsafe { self.get_unchecked_mut() };
+        let data = self.data.take().expect("Op started without data");
+        let (driver_op, payload) = data.into_kernel_and_payload();
 
-        if let LocalState::Defined = op.state {
-            trace!(
-                op = %std::any::type_name::<T>(),
-                "LocalOp::poll: submit begin"
-            );
-
-            let data = op.data.take().expect("Op started without data");
-            let (driver_op, payload) = data.into_kernel_and_payload();
-
-            let submit_res = op.provider.with_driver(|mut driver| {
+        let submit_res: Result<LocalSubmitOutcome<P>, _> =
+            self.provider.with_driver(|mut driver| {
                 let mut slot = match driver.reserve_op() {
                     Ok(v) => v,
                     Err(e) => return Err((e, driver_op, payload)),
@@ -413,7 +506,7 @@ where
                 let mut driver_op_opt = Some(driver_op);
                 let result = slot.submit(&mut driver_op_opt);
 
-                let mut fallback_payload = None;
+                let mut recovered = None;
                 match &result {
                     DriverSubmitResult::Submitted(_)
                     | DriverSubmitResult::Failed {
@@ -426,126 +519,117 @@ where
                         status: SubmitStatus::Void,
                         ..
                     } => {
-                        if let Some(val) = driver_op_opt.take() {
-                            drop(val);
-                        }
-                        fallback_payload = slot.recover_payload();
+                        drop(driver_op_opt.take());
+                        recovered = slot.recover_payload();
                     }
                 }
-                Ok((token, result, fallback_payload))
+                Ok((token, result, recovered))
             });
 
-            match submit_res {
-                Err((e, driver_op, payload)) => {
-                    drop(driver_op);
-                    let completion = T::complete(payload, Err(e));
-                    return Poll::Ready(OpResult::Completed(completion.result, completion.output));
-                }
-                Ok((token, result, fallback_payload)) => {
-                    op.token = Some(token);
-                    match result {
-                        DriverSubmitResult::Submitted(_) => {
-                            op.state = LocalState::Submitted;
-                            trace!(
-                                op = %std::any::type_name::<T>(),
-                                token = CompletionToken::user(token).raw(),
-                                "LocalOp::poll: submitted"
-                            );
-                        }
-                        DriverSubmitResult::Failed { report, status } => match status {
-                            SubmitStatus::Void => {
-                                let Some(payload_erased) = fallback_payload else {
-                                    return Poll::Ready(OpResult::ResourceLost(
-                                        OpError::payload_missing(),
-                                    ));
-                                };
-                                let payload = match T::try_payload_from_erased(payload_erased) {
-                                    Ok(payload) => payload,
-                                    Err(report) => {
-                                        return Poll::Ready(OpResult::ResourceLost(
-                                            OpError::payload_projection(report),
-                                        ));
-                                    }
-                                };
-                                trace!(
-                                    op = %std::any::type_name::<T>(),
-                                    status = ?status,
-                                    error = %report,
-                                    "LocalOp::poll: submit failed synchronously"
-                                );
-                                let completion = T::complete(payload, Err(report));
-                                return Poll::Ready(OpResult::Completed(
-                                    completion.result,
-                                    completion.output,
-                                ));
-                            }
-                            SubmitStatus::InFlight => {
-                                op.state = LocalState::Submitted;
-                                trace!(
-                                    op = %std::any::type_name::<T>(),
-                                    token = CompletionToken::user(token).raw(),
-                                    status = ?status,
-                                    "LocalOp::poll: submitted in flight"
-                                );
-                            }
-                        },
-                    }
-                }
+        let (token, result, recovered) = match submit_res {
+            Err((report, driver_op, payload)) => {
+                drop(driver_op);
+                self.state = LocalState::Completed;
+                return Some(T::submit_failed(T::payload_into_erased(payload), report));
+            }
+            Ok(outcome) => outcome,
+        };
+
+        self.token = Some(token);
+        match result {
+            DriverSubmitResult::Failed {
+                report,
+                status: SubmitStatus::Void,
+            } => {
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    error = %report,
+                    "LocalOp: submit failed synchronously"
+                );
+                self.state = LocalState::Completed;
+                let Some(erased) = recovered else {
+                    return Some(OpResult::ResourceLost(OpError::payload_missing()));
+                };
+                Some(T::submit_failed(erased, report))
+            }
+            DriverSubmitResult::Submitted(_) | DriverSubmitResult::Failed { .. } => {
+                self.state = LocalState::Submitted;
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    token = CompletionToken::user(token).raw(),
+                    "LocalOp: submitted"
+                );
+                None
             }
         }
+    }
 
-        if let LocalState::Submitted = op.state {
-            let token = op
+    /// 取下一项。`Ready(None)` 表示这个操作已经终止。
+    fn poll_item(&mut self, cx: &mut Context<'_>) -> Poll<Option<OpItem<T, P::SlotSpec>>> {
+        if let LocalState::Defined = self.state
+            && let Some(item) = self.submit()
+        {
+            return Poll::Ready(Some(item));
+        }
+
+        let token = match self.state {
+            LocalState::Submitted => self
                 .token
-                .expect("LocalOp submitted state missing completion token");
-            let res = op.provider.with_driver(|mut driver| {
-                let mut is_ready = false;
-                let mut ready_val = None;
+                .expect("LocalOp submitted state missing completion token"),
+            LocalState::Completed => return Poll::Ready(None),
+            LocalState::Defined => unreachable!("submit() always leaves the Defined state"),
+        };
 
-                match Self::Output::poll_table_once::<T, P::SlotSpec>(
-                    &*driver.completion_table(),
-                    token,
-                ) {
-                    Poll::Ready(result) => {
-                        is_ready = true;
-                        ready_val = Some(result);
-                    }
-                    Poll::Pending => {
-                        driver.register_completion_waker(token, cx.waker());
-                        match Self::Output::poll_table_once::<T, P::SlotSpec>(
-                            &*driver.completion_table(),
-                            token,
-                        ) {
-                            Poll::Ready(result) => {
-                                is_ready = true;
-                                ready_val = Some(result);
-                            }
-                            Poll::Pending => {}
-                        }
-                    }
-                }
-                (is_ready, ready_val)
-            });
-
-            if res.0 {
-                op.state = LocalState::Completed;
-                trace!(
-                    op = %std::any::type_name::<T>(),
-                    token = CompletionToken::user(token).raw(),
-                    "LocalOp::poll: completion ready"
-                );
-                Poll::Ready(res.1.unwrap())
-            } else {
-                trace!(
-                    op = %std::any::type_name::<T>(),
-                    token = CompletionToken::user(token).raw(),
-                    "LocalOp::poll: completion pending"
-                );
-                Poll::Pending
+        let taken = self.provider.with_driver(|mut driver| {
+            let polled = poll_record_once::<T, P::SlotSpec>(&*driver.completion_table(), token);
+            if polled.is_ready() {
+                return polled;
             }
-        } else {
-            panic!("Polled after completion");
+            driver.register_completion_waker(token, cx.waker());
+            poll_record_once::<T, P::SlotSpec>(&*driver.completion_table(), token)
+        });
+
+        match taken {
+            Poll::Ready((item, continuation)) => {
+                if continuation.is_final() {
+                    self.state = LocalState::Completed;
+                    self.token = None;
+                }
+                Poll::Ready(Some(item))
+            }
+            Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// 见 [`DetachedOp`] 上同名实现的说明：只有单发操作能 `await`。
+impl<'a, T, P> Future for LocalOp<'a, T, P>
+where
+    P: DriverProvider,
+    T: SingleShotOp<P::SlotSpec>,
+{
+    type Output = OpItem<T, P::SlotSpec>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let op = unsafe { self.get_unchecked_mut() };
+        match op.poll_item(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(None) => panic!("Polled after completion"),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'a, T, P> futures_core::Stream for LocalOp<'a, T, P>
+where
+    P: DriverProvider,
+    T: IntoPlatformOp<P::SlotSpec>,
+{
+    type Item = OpItem<T, P::SlotSpec>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let op = unsafe { self.get_unchecked_mut() };
+        op.poll_item(cx)
     }
 }
 
@@ -567,11 +651,21 @@ where
 }
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send>: Future<
-        Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>,
+    /// 单发提交的句柄：`await` 得到唯一的那条完成。
+    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send>: Future<
+        Output = OpItem<T, P::SlotSpec>,
     >;
 
+    /// 流式提交的句柄：一次提交、多条完成。单发操作在这里退化成只有一项的流。
+    ///
+    /// 与 `Future` 是**同一个具体类型**的两种看法，不是两条实现路径。
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send>: futures_core::Stream<Item = OpItem<T, P::SlotSpec>>;
+
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
+    where
+        T: SingleShotOp<P::SlotSpec> + std::marker::Send;
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
     where
         T: IntoPlatformOp<P::SlotSpec> + std::marker::Send;
 
@@ -599,13 +693,22 @@ impl<P> Default for LocalSubmitter<P> {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
+    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
+        T: SingleShotOp<P::SlotSpec> + std::marker::Send,
     {
         trace!("Submitting local op");
+        op.submit_local(provider)
+    }
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
+    where
+        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
+    {
+        trace!("Submitting local op stream");
         op.submit_local(provider)
     }
 
@@ -630,10 +733,19 @@ impl Default for DetachedSubmitter {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> =
+    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send> =
+        DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> =
         DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
+    where
+        T: SingleShotOp<P::SlotSpec> + std::marker::Send,
+    {
+        provider.with_driver(|mut driver| op.submit_detached(&mut driver))
+    }
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
     where
         T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
     {
@@ -642,202 +754,5 @@ impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
 
     fn from_current_context() -> Self {
         Self::new()
-    }
-}
-
-/// 一个 multishot 操作产出的完成流。
-///
-/// 与 [`DetachedOp`] 的差别只在「一条 vs 多条」：提交、取消、waker 注册、`Drop` 时的
-/// orphan 处理全部同构。流的终点由记录自己携带的
-/// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定——取到
-/// `Final` 的那一条之后，`poll_next` 返回 `None`。
-pub struct MultishotOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec>,
-{
-    pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
-    pub(crate) cancel_sender: Option<RemoteCancelSender>,
-    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
-    pub(crate) token: Option<OpToken>,
-    /// 提交就失败了：产出这一个错误项，然后流结束。
-    pub(crate) immediate_failure: Option<DriverReport<Spec::Error>>,
-    pub(crate) finished: bool,
-    pub(crate) _phantom: std::marker::PhantomData<fn() -> (T, Spec)>,
-}
-
-impl<T, Spec> MultishotOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec>,
-{
-    pub(crate) fn failed(report: DriverReport<Spec::Error>) -> Self {
-        Self {
-            completion_table: None,
-            cancel_sender: None,
-            cancel_waker: None,
-            token: None,
-            immediate_failure: Some(report),
-            finished: false,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn armed(
-        completion_table: SharedCompletionTable<Spec>,
-        cancel_sender: RemoteCancelSender,
-        cancel_waker: Arc<dyn RemoteWaker<Spec::Error>>,
-        token: OpToken,
-    ) -> Self {
-        Self {
-            completion_table: Some(completion_table),
-            cancel_sender: Some(cancel_sender),
-            cancel_waker: Some(cancel_waker),
-            token: Some(token),
-            immediate_failure: None,
-            finished: false,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// 该操作是否仍在内核里（用于诊断与测试）。
-    pub fn is_armed(&self) -> bool {
-        !self.finished && self.token.is_some()
-    }
-
-    fn take_one(&mut self) -> Poll<Option<MultishotItem<T, Spec>>> {
-        let (Some(table), Some(token)) = (self.completion_table.as_ref(), self.token) else {
-            self.finished = true;
-            return Poll::Ready(None);
-        };
-
-        match table.try_take_record(token) {
-            Ok(PollRecordResult::Ready(record)) => {
-                if record.continuation.is_final() {
-                    // 终态记录被取走的同时 slot 已经归还、generation 已经推进，token 从此
-                    // 失效——`Drop` 不能再拿它去 mark_orphaned/cancel。
-                    self.finished = true;
-                    self.token = None;
-                }
-                Poll::Ready(Some(item_from_record::<T, Spec>(record)))
-            }
-            Ok(PollRecordResult::Unavailable { kind, attach }) => {
-                self.finished = true;
-                self.token = None;
-                Poll::Ready(Some(OpResult::ResourceLost(
-                    OpError::from_completion_anomaly(kind, attach),
-                )))
-            }
-            Ok(PollRecordResult::Pending) => Poll::Pending,
-            Err(report) => {
-                self.finished = true;
-                self.token = None;
-                Poll::Ready(Some(OpResult::ResourceLost(OpError::new(
-                    LostReason::Other,
-                    report,
-                ))))
-            }
-        }
-    }
-}
-
-type MultishotItem<T, Spec> = OpResult<
-    <T as IntoMultishotOp<Spec>>::Item,
-    <Spec as SlotSpec>::Error,
-    <T as IntoPlatformOp<Spec>>::Completion,
->;
-
-#[inline]
-fn item_from_record<T, Spec>(record: CompletionRecord<Spec>) -> MultishotItem<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec>,
-{
-    let CompletionRecord {
-        event,
-        payload: payload_erased,
-        detail,
-        mut cleanup,
-        continuation: _,
-    } = record;
-    let item = match T::try_item_from_erased(payload_erased) {
-        Ok(item) => item,
-        Err(report) => {
-            let _ = cleanup.run();
-            return OpResult::ResourceLost(OpError::payload_projection(report));
-        }
-    };
-    cleanup.disarm();
-    let res =
-        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
-    let completion = T::complete_item(item, res);
-    OpResult::Completed(completion.result, completion.output)
-}
-
-impl<T, Spec> futures_core::Stream for MultishotOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec>,
-{
-    type Item = MultishotItem<T, Spec>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
-
-        if let Some(report) = this.immediate_failure.take() {
-            this.finished = true;
-            return Poll::Ready(Some(OpResult::ResourceLost(OpError::new(
-                LostReason::Other,
-                report,
-            ))));
-        }
-        if this.finished {
-            return Poll::Ready(None);
-        }
-
-        if let Poll::Ready(item) = this.take_one() {
-            return Poll::Ready(item);
-        }
-
-        // 注册与发布竞速：注册之后再取一次，避免丢唤醒（与 `DetachedOp::poll` 同构）。
-        if let (Some(table), Some(token)) = (this.completion_table.as_ref(), this.token) {
-            table.register_waker(token, cx.waker());
-        }
-        this.take_one()
-    }
-}
-
-unsafe impl<T, Spec> std::marker::Send for MultishotOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec> + std::marker::Send,
-    T::Item: std::marker::Send,
-{
-}
-
-impl<T, Spec> Drop for MultishotOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoMultishotOp<Spec>,
-{
-    fn drop(&mut self) {
-        // token 仍在说明操作还没终止：既要放弃信箱里剩下的记录（`mark_orphaned` 会逐条
-        // 跑它们的 cleanup），也要请求内核取消，否则 multishot 会一直投递下去。取到终态
-        // 完成的流已经把 token 清掉了，那种情况下什么都不该做——与 `DetachedOp` 同理。
-        let Some(token) = self.token else {
-            return;
-        };
-
-        if let Some(table) = self.completion_table.as_ref() {
-            table.mark_orphaned(token);
-        }
-        if let Some(cancel_sender) = self.cancel_sender.as_ref() {
-            let _ = cancel_sender.send(CancelRequest::abandon(token));
-        }
-        if let Some(cancel_waker) = self.cancel_waker.as_ref()
-            && let Err(e) = cancel_waker.wake()
-        {
-            trace!("MultishotOp cancel wake failed: {}", e);
-        }
     }
 }

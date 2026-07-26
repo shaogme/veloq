@@ -255,8 +255,9 @@ pub(crate) struct MailboxRecord<Spec: SlotSpec> {
     pub(crate) payload: SlotPayload<Spec>,
     pub(crate) detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
     pub(crate) cleanup: CompletionCleanupGuard,
-    /// 取走这条之后该操作是否还会再产出完成。消费方（`MultishotOp`）靠它判断流的
-    /// 终点；cell 上的 `streaming` 位负责的是状态机的收尾，两者来源相同但用途不同。
+    /// 取走这条之后该操作是否还会再产出完成。消费方（`LocalOp` / `DetachedOp` 的流）靠
+    /// 它判断流的终点；cell 上的 `streaming` 位负责的是状态机的收尾，两者来源相同但用途
+    /// 不同。
     pub(crate) continuation: CompletionContinuation,
 }
 

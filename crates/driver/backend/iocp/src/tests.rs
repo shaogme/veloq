@@ -60,7 +60,7 @@ where
         // IOCP 恒为 `Final`。
         continuation: _,
     } = record;
-    let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
+    let payload = T::try_record_from_erased(payload_erased).expect("completion payload type");
     let res = detail
         .take()
         .unwrap_or_else(|| usize::from_event_res::<IocpError>(event.res()));

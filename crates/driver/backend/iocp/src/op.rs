@@ -3,7 +3,7 @@
 //! This module defines:
 //! - `IocpKernelOp`: The Type-Erased kernel operation struct using Unions and VTables
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
-//! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
+//! - `IntoPlatformOp` implementations split into `(KernelOp, SubmitPayload)`
 
 mod file;
 mod net;
@@ -35,7 +35,7 @@ use crate::{
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, CompletionToken, OpToken, PlatformOp},
     op::{
-        IntoPlatformOp, OpCompletion,
+        IntoPlatformOp, OpCompletion, SingleShotOp,
         types::{
             Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase,
             Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
@@ -221,14 +221,17 @@ macro_rules! impl_iocp_op_erasure {
             }
         }
 
+        /// IOCP 后端一个 multishot 操作都没有（`capabilities()` 恒为全 `false`），所以
+        /// 这里每个 op 的提交 payload 与记录 payload 都是它自己。
         impl IntoPlatformOp<IocpSlotSpec> for $OpType {
-            type UserPayload = $OpType;
+            type SubmitPayload = $OpType;
+            type RecordPayload = $OpType;
             type Output = $OpType;
             type Completion = $completion;
 
             const PAYLOAD_KIND: OpKind = <$OpType as IocpOpSpec>::PAYLOAD_KIND;
 
-            fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
+            fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::SubmitPayload) {
                 let kernel_payload = <$OpType as IocpOpSpec>::new_kernel_payload(&self);
                 let op = IocpKernelOp {
                     vtable: <$OpType as IocpOpErasure>::vtable(),
@@ -241,22 +244,24 @@ macro_rules! impl_iocp_op_erasure {
                 (op, self)
             }
 
-            fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
+            fn payload_into_erased(payload: Self::SubmitPayload) -> IocpUserPayload {
                 <$OpType as IocpOpErasure>::erase_user_payload(payload)
             }
 
-            fn try_payload_from_erased(payload: IocpUserPayload) -> IocpResult<Self::UserPayload> {
+            fn try_record_from_erased(payload: IocpUserPayload) -> IocpResult<Self::RecordPayload> {
                 <$OpType as IocpOpErasure>::try_user_payload(payload)
             }
 
             fn complete(
-                payload: Self::UserPayload,
+                payload: Self::RecordPayload,
                 res: IocpResult<usize>,
             ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
                 let completion = <$OpType as IocpOpSpec>::map_completion(&payload, res);
                 OpCompletion::new(completion, payload)
             }
         }
+
+        impl SingleShotOp<IocpSlotSpec> for $OpType {}
     };
 }
 

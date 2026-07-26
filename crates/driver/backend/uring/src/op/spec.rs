@@ -13,13 +13,15 @@ use crate::{
         WriteRaw, payload, submit,
     },
 };
+use diagweave::prelude::*;
 use io_uring::squeue;
 use std::time::Duration;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, SubmitTokenContext},
     op::{
-        IntoMultishotOp, IntoPlatformOp, OpCompletion, OpKind, payload_projection_mismatch_report,
+        IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, SingleShotOp,
+        payload_projection_mismatch_report,
     },
 };
 
@@ -216,7 +218,16 @@ where
 }
 
 macro_rules! impl_uring_op_erasure {
+    // 只生成擦除层。multishot 操作用这一支：它的提交 payload 与记录 payload 不是同一个
+    // 类型，`IntoPlatformOp` 得手写。
+    (@erasure_only $OpType:ty, $user_variant:ident, $kernel_variant:ident) => {
+        impl_uring_op_erasure!(@erasure $OpType, $user_variant, $kernel_variant);
+    };
     ($OpType:ty, $user_variant:ident, $kernel_variant:ident, $completion:ty) => {
+        impl_uring_op_erasure!(@erasure $OpType, $user_variant, $kernel_variant);
+        impl_uring_single_shot_op!($OpType, $completion);
+    };
+    (@erasure $OpType:ty, $user_variant:ident, $kernel_variant:ident) => {
         impl UringOpErasure for $OpType {
             fn erase_kernel_payload(payload: Self::KernelPayload) -> UringOpPayload {
                 UringOpPayload::$kernel_variant(payload)
@@ -280,15 +291,21 @@ macro_rules! impl_uring_op_erasure {
                 &TABLE
             }
         }
+    };
+}
 
+/// 单发操作的 [`IntoPlatformOp`]：提交 payload 就是记录 payload，就是操作自己。
+macro_rules! impl_uring_single_shot_op {
+    ($OpType:ty, $completion:ty) => {
         impl IntoPlatformOp<UringSlotSpec> for $OpType {
-            type UserPayload = $OpType;
+            type SubmitPayload = $OpType;
+            type RecordPayload = $OpType;
             type Output = $OpType;
             type Completion = $completion;
 
             const PAYLOAD_KIND: OpKind = <$OpType as UringOpSpec>::PAYLOAD_KIND;
 
-            fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
+            fn into_kernel_and_payload(self) -> (UringKernelOp, Self::SubmitPayload) {
                 let kernel_payload = <$OpType as UringOpSpec>::new_kernel_payload(&self);
                 let op = UringKernelOp {
                     vtable: <$OpType as UringOpErasure>::vtable(),
@@ -297,24 +314,26 @@ macro_rules! impl_uring_op_erasure {
                 (op, self)
             }
 
-            fn payload_into_erased(payload: Self::UserPayload) -> UringUserPayload {
+            fn payload_into_erased(payload: Self::SubmitPayload) -> UringUserPayload {
                 <$OpType as UringOpErasure>::erase_user_payload(payload)
             }
 
-            fn try_payload_from_erased(
+            fn try_record_from_erased(
                 payload: UringUserPayload,
-            ) -> UringResult<Self::UserPayload> {
+            ) -> UringResult<Self::RecordPayload> {
                 <$OpType as UringOpErasure>::try_user_payload(payload)
             }
 
             fn complete(
-                payload: Self::UserPayload,
+                payload: Self::RecordPayload,
                 res: UringResult<usize>,
             ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
                 let completion = <$OpType as UringOpSpec>::map_completion(&payload, res);
                 OpCompletion::new(completion, payload)
             }
         }
+
+        impl SingleShotOp<UringSlotSpec> for $OpType {}
     };
 }
 
@@ -389,14 +408,35 @@ impl_uring_op_erasure!(SyncFileRangeRaw, SyncFileRangeRaw, SyncRangeRaw, usize);
 impl_uring_op_erasure!(Fallocate, Fallocate, Fallocate, usize);
 impl_uring_op_erasure!(FallocateRaw, FallocateRaw, FallocateRaw, usize);
 impl_uring_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
-impl_uring_op_erasure!(AcceptMulti, AcceptMulti, AcceptMulti, OwnedRawHandle);
+impl_uring_op_erasure!(@erasure_only AcceptMulti, AcceptMulti, AcceptMulti);
 
-/// multishot accept 的每条完成产出一个 [`AcceptedSocket`]（新连接的 fd 走
-/// `Completion`），而 slot 里始终是提交 payload `AcceptMulti { fd }`。
-impl IntoMultishotOp<UringSlotSpec> for AcceptMulti {
-    type Item = AcceptedSocket;
+/// 仓库里**唯一**提交 payload 与记录 payload 不同的操作。
+///
+/// slot 里始终是 `AcceptMulti { fd }`（监听 socket，内核还要拿它继续 accept），而每条完成
+/// 的记录里是一个 [`AcceptedSocket`]——新连接的 fd 走 `Completion`。因此它不实现
+/// [`SingleShotOp`]：`await` 一个 `AcceptMulti` 只会取到第一条完成然后把其余的取消掉。
+impl IntoPlatformOp<UringSlotSpec> for AcceptMulti {
+    type SubmitPayload = AcceptMulti;
+    type RecordPayload = AcceptedSocket;
+    type Output = AcceptedSocket;
+    type Completion = OwnedRawHandle;
 
-    fn try_item_from_erased(erased: UringUserPayload) -> UringResult<Self::Item> {
+    const PAYLOAD_KIND: OpKind = <AcceptMulti as UringOpSpec>::PAYLOAD_KIND;
+
+    fn into_kernel_and_payload(self) -> (UringKernelOp, Self::SubmitPayload) {
+        let kernel_payload = <AcceptMulti as UringOpSpec>::new_kernel_payload(&self);
+        let op = UringKernelOp {
+            vtable: <AcceptMulti as UringOpErasure>::vtable(),
+            payload: <AcceptMulti as UringOpErasure>::erase_kernel_payload(kernel_payload),
+        };
+        (op, self)
+    }
+
+    fn payload_into_erased(payload: Self::SubmitPayload) -> UringUserPayload {
+        <AcceptMulti as UringOpErasure>::erase_user_payload(payload)
+    }
+
+    fn try_record_from_erased(erased: UringUserPayload) -> UringResult<Self::RecordPayload> {
         match erased {
             UringUserPayload::AcceptedSocket(item) => Ok(item),
             _ => Err(payload_projection_mismatch_report::<UringError>(
@@ -406,11 +446,22 @@ impl IntoMultishotOp<UringSlotSpec> for AcceptMulti {
         }
     }
 
-    fn complete_item(
-        item: Self::Item,
+    fn complete(
+        payload: Self::RecordPayload,
         res: UringResult<usize>,
-    ) -> OpCompletion<Self::Item, UringError, Self::Completion> {
-        OpCompletion::new(submit::accepted_handle_from_res(res), item)
+    ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
+        OpCompletion::new(submit::accepted_handle_from_res(res), payload)
+    }
+
+    /// 提交失败时 slot 里躺着的是监听 socket，不是任何一条完成的产物——没有 item 可以交
+    /// 给用户，也没有用户交出来的资源要还。默认实现会把它当记录 payload 去投影，那必然
+    /// 失败并给出一个含义错误的 `PayloadTypeMismatch`。
+    fn submit_failed(
+        erased: UringUserPayload,
+        report: Report<UringError>,
+    ) -> OpResult<Self::Output, UringError, Self::Completion> {
+        drop(erased);
+        OpResult::ResourceLost(OpError::new(LostReason::Other, report))
     }
 }
 impl_uring_op_erasure!(SendTo, SendTo, SendTo, usize);

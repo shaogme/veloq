@@ -497,7 +497,7 @@ fn accept_stream_yields_every_connection() {
 
 /// 丢弃一条仍在途的 `AcceptStream` 之后，listener 上还能重新开一条并继续工作。
 ///
-/// 覆盖的是取消路径：`MultishotOp::drop` 要把 slot 从 `InFlightWaiting` 收进
+/// 覆盖的是取消路径：句柄的 `Drop` 要把 slot 从 `InFlightWaiting` 收进
 /// `InFlightOrphaned`（**不推进 generation**），内核随后的完成才找得到 slot 去跑
 /// `orphan_cleanup`。做错的话这里会挂住或泄漏 fd。
 #[test]
@@ -537,5 +537,45 @@ fn dropping_an_accept_stream_leaves_the_listener_usable() {
         })
         .await
         .unwrap();
+    });
+}
+
+/// 同一条流跑在 thread-local 形态的 listener 上。
+///
+/// `LocalTcpListener` 上的每个操作都走 `LocalOp`（借当前 worker 的驱动，零 `Arc`），
+/// 这条流也不例外——它证明 multishot 不再绑死在 `Arc` 化的 detached 句柄上。
+///
+/// 客户端用一条普通 OS 线程发起连接：`LocalTcpListener` 是 `!Send`，不能 spawn 到别的
+/// 任务里去；而 `connect(2)` 在 backlog 未满时不需要对端 `accept()` 就会完成，所以这里
+/// 不会互等。
+#[test]
+fn a_local_listener_streams_connections_without_a_detached_op() {
+    use veloq::net::tcp::LocalTcpListener;
+
+    const CONNECTIONS: usize = 4;
+
+    run_test(async |ctx| {
+        let listener = LocalTcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        let clients = std::thread::spawn(move || {
+            for _ in 0..CONNECTIONS {
+                let stream = std::net::TcpStream::connect(listen_addr).expect("Failed to connect");
+                drop(stream);
+            }
+        });
+
+        let mut accepted = listener.accept_multi();
+        for i in 0..CONNECTIONS {
+            let item = accepted
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("accept stream ended early at {i}"));
+            let (_stream, peer) = item.unwrap_or_else(|e| panic!("accept {i} failed: {e}"));
+            assert!(peer.ip().is_ipv4());
+            assert_ne!(peer.port(), 0, "peer address must be fully populated");
+        }
+
+        clients.join().expect("client thread panicked");
     });
 }

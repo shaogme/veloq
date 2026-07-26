@@ -1,5 +1,7 @@
 use std::{future::Future, marker::Send as StdSend};
 
+use futures_core::Stream;
+
 use crate::SockAddrStorage;
 
 use veloq_driver_core::{
@@ -17,8 +19,8 @@ use veloq_driver_core::{
 };
 pub use veloq_driver_core::{
     op::{
-        DetachedOp, DetachedSubmitter, DriverProvider, IntoMultishotOp, IntoPlatformOp, LocalOp,
-        LocalSubmitter, MultishotOp, Op, OpKind, OpResult, OpSubmitter as CoreOpSubmitter,
+        DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
+        OpItem, OpKind, OpResult, OpSubmitter as CoreOpSubmitter, SingleShotOp,
         types::{AcceptedSocket, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
     },
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
@@ -64,11 +66,17 @@ pub type Accept = CoreAccept<PlatformRawHandle, SockAddrStorage>;
 pub type AcceptMulti = CoreAcceptMulti<PlatformRawHandle>;
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + StdSend + Sync {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend>: Future<
-        Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>,
-    >;
+    /// 单发提交：`await` 得到唯一的那条完成。
+    type Future<T: SingleShotOp<P::SlotSpec> + StdSend>: Future<Output = OpItem<T, P::SlotSpec>>;
+
+    /// 流式提交：一次提交、多条完成。与 [`Self::Future`] 是同一个具体类型的两种看法。
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + StdSend>: Stream<Item = OpItem<T, P::SlotSpec>>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
+    where
+        T: SingleShotOp<P::SlotSpec> + StdSend;
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
     where
         T: IntoPlatformOp<P::SlotSpec> + StdSend;
 
@@ -76,13 +84,21 @@ pub trait OpSubmitter<'a, P: DriverProvider>: Clone + StdSend + Sync {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend> = LocalOp<'a, T, P>;
+    type Future<T: SingleShotOp<P::SlotSpec> + StdSend> = LocalOp<'a, T, P>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + StdSend> = LocalOp<'a, T, P>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<P::SlotSpec> + StdSend,
+        T: SingleShotOp<P::SlotSpec> + StdSend,
     {
         <LocalSubmitter<P> as CoreOpSubmitter<'a, P>>::submit(self, op, provider)
+    }
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
+    where
+        T: IntoPlatformOp<P::SlotSpec> + StdSend,
+    {
+        <LocalSubmitter<P> as CoreOpSubmitter<'a, P>>::submit_stream(self, op, provider)
     }
 
     fn from_current_context() -> Self {
@@ -91,13 +107,21 @@ impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend> = DetachedOp<T, P::SlotSpec>;
+    type Future<T: SingleShotOp<P::SlotSpec> + StdSend> = DetachedOp<T, P::SlotSpec>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + StdSend> = DetachedOp<T, P::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<P::SlotSpec> + StdSend,
+        T: SingleShotOp<P::SlotSpec> + StdSend,
     {
         <DetachedSubmitter as CoreOpSubmitter<'a, P>>::submit(self, op, provider)
+    }
+
+    fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
+    where
+        T: IntoPlatformOp<P::SlotSpec> + StdSend,
+    {
+        <DetachedSubmitter as CoreOpSubmitter<'a, P>>::submit_stream(self, op, provider)
     }
 
     fn from_current_context() -> Self {

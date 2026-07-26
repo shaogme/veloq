@@ -4,7 +4,7 @@ pub mod types;
 pub use future::*;
 pub use types::OpKind;
 
-use std::marker::{PhantomData, Send};
+use std::marker::Send;
 
 use tracing::trace;
 
@@ -25,54 +25,72 @@ pub trait DriverProvider: Clone + Unpin {
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
+///
+/// 一个操作提交一次，产出 **1..N** 条完成。两个 payload 关联类型对应这句话里的两侧：
+///
+/// - [`SubmitPayload`](Self::SubmitPayload) 在提交时进入 slot，并在整个操作期间留在
+///   那里（内核可能仍持有指向它的指针），取消与 orphan cleanup 都要用它；
+/// - [`RecordPayload`](Self::RecordPayload) 是**每条完成记录**里携带的东西。
+///
+/// **单发操作里两者是同一个类型**：记录被取走时把提交 payload 一并搬出来，所以后端只需
+/// 把两个关联类型都写成自己。只有 multishot 操作（`AcceptMulti` 之类）会让它们分开——
+/// 提交 payload 是监听 socket，每条完成的产物是一个新连接。
+///
+/// 早期设计只有一个 `UserPayload`，于是 multishot 要么塞一个「空壳 item」（此后每一处
+/// payload 访问都要处理一个永远不该出现的 `None`），要么另开一个平行的 trait。拆成这两个
+/// 名字之后，两条路径都没有空状态，也不需要第二个 trait。
 pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
-    type UserPayload: Send;
-    type Output;
-    type Completion;
+    /// 提交进 slot 的 payload。
+    type SubmitPayload: Send;
+    /// 每条完成记录里携带的 payload。单发操作里它就是 [`Self::SubmitPayload`]。
+    type RecordPayload;
+    type Output: Send;
+    type Completion: Send;
     const PAYLOAD_KIND: types::OpKind;
 
-    fn into_kernel_and_payload(self) -> (SlotOp<Spec>, Self::UserPayload);
+    fn into_kernel_and_payload(self) -> (SlotOp<Spec>, Self::SubmitPayload);
 
-    fn payload_into_erased(payload: Self::UserPayload) -> SlotPayload<Spec>;
+    fn payload_into_erased(payload: Self::SubmitPayload) -> SlotPayload<Spec>;
 
-    fn try_payload_from_erased(
+    fn try_record_from_erased(
         erased: SlotPayload<Spec>,
-    ) -> DriverResult<Self::UserPayload, SlotError<Spec>>;
+    ) -> DriverResult<Self::RecordPayload, SlotError<Spec>>;
 
     fn complete(
-        payload: Self::UserPayload,
+        payload: Self::RecordPayload,
         res: DriverResult<SlotCompletion<Spec>, SlotError<Spec>>,
     ) -> OpCompletion<Self::Output, SlotError<Spec>, Self::Completion>;
+
+    /// 提交同步失败，slot 里的 payload 被原样取回：这个操作一条完成都不会产生。
+    ///
+    /// 默认实现把 payload 还给用户——单发操作的提交 payload 就是它的记录 payload，而且
+    /// 通常还带着用户交出去的 buffer，必须还回去。multishot 覆盖它：那里的提交 payload
+    /// 不是任何一条完成的产物，没有 item 可交付。
+    fn submit_failed(
+        erased: SlotPayload<Spec>,
+        report: DriverReport<SlotError<Spec>>,
+    ) -> OpResult<Self::Output, SlotError<Spec>, Self::Completion> {
+        match Self::try_record_from_erased(erased) {
+            Ok(payload) => {
+                let completion = Self::complete(payload, Err(report));
+                OpResult::Completed(completion.result, completion.output)
+            }
+            // 投影都失败了说明 slot 里根本不是这个操作的 payload，那比「提交失败」严重得
+            // 多，报它而不是报 `report`。
+            Err(mismatch) => OpResult::ResourceLost(OpError::payload_projection(mismatch)),
+        }
+    }
 }
 
-/// 一个「一次提交、多条完成」的操作。
+/// 只产出一条完成的操作。
 ///
-/// 与 [`IntoPlatformOp`] 的关系是**并列的两个概念，不是同一个东西的两种用法**：
+/// 这是 [`LocalOp`] / [`DetachedOp`] 的 [`Future`](std::future::Future) 实现的边界：两者
+/// 对**任何**操作都是完成流（[`futures_core::Stream`]），但只有单发操作能被 `await`——
+/// `await` 一个 multishot 操作等于「取第一条完成然后取消」，那是个陷阱而不是特性，所以让
+/// 它在编译期就不成立。
 ///
-/// - `IntoPlatformOp::UserPayload` 是**提交 payload**——它在提交时进入 slot，multishot
-///   期间原样留在那里（内核可能仍持有指向它的指针），取消与 orphan cleanup 都要用它；
-/// - `Item` 是**每条完成的产物**——accept 是一个新 fd，recv 是一条收到的数据。
-///
-/// 早期设计想把两者合成一个 `UserPayload`，代价是提交时要塞一个「空壳 item」
-/// （`Option<FixedBuf>::None` 之类），此后每一处 payload 访问都要处理一个永远不该
-/// 出现的 `None`。拆开之后两者都没有空状态。
-///
-/// item 仍然擦除进同一个 [`SlotPayload`] 里（后端的 payload enum 加变体），所以信箱的
-/// 记录形状不变。
-pub trait IntoMultishotOp<Spec: SlotSpec>: IntoPlatformOp<Spec> {
-    /// 每条完成产出的东西。
-    type Item;
-
-    /// 把后端在完成路径上构造、擦除进 `SlotPayload` 的 item 还原回来。
-    fn try_item_from_erased(erased: SlotPayload<Spec>)
-    -> DriverResult<Self::Item, SlotError<Spec>>;
-
-    /// 把一条完成的结果投影成用户可见的产物。
-    fn complete_item(
-        item: Self::Item,
-        res: DriverResult<SlotCompletion<Spec>, SlotError<Spec>>,
-    ) -> OpCompletion<Self::Item, SlotError<Spec>, Self::Completion>;
-}
+/// 后端为每个单发 op 实现它（宏里一行）；multishot op 不实现。
+pub trait SingleShotOp<Spec: SlotSpec>: IntoPlatformOp<Spec> {}
 
 #[inline]
 pub fn payload_projection_mismatch_report<E>(
@@ -102,6 +120,12 @@ impl<T> Op<T> {
         Self { data }
     }
 
+    /// 提交一个操作，得到一个不借用驱动的句柄。
+    ///
+    /// 句柄既是单发操作的 [`Future`](std::future::Future)，也是任意操作的完成流
+    /// （[`futures_core::Stream`]）——「一条还是多条」由 slot 层的
+    /// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定，提交路径
+    /// 对两者完全相同。
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::SlotSpec>
     where
         T: IntoPlatformOp<D::SlotSpec> + Send,
@@ -110,146 +134,13 @@ impl<T> Op<T> {
         let data = self.data;
         trace!("Submitting detached op");
 
-        match driver.reserve_op() {
-            Ok(mut slot) => {
-                let (kernel_op, payload) = data.into_kernel_and_payload();
-                let mut op_platform = Some(kernel_op);
-                let completion_table = slot.completion_table();
-                let cancel_sender = slot.remote_cancel_sender();
-                let cancel_waker = slot.create_waker();
-                slot.set_payload(T::payload_into_erased(payload));
-
-                match slot.submit(&mut op_platform) {
-                    DriverSubmitResult::Submitted(_) => {
-                        let token = slot.persist().token();
-                        completion_table.mark_waiting(token);
-                        DetachedOp {
-                            completion_table: Some(completion_table),
-                            cancel_sender: Some(cancel_sender),
-                            cancel_waker: Some(cancel_waker),
-                            token: Some(token),
-                            immediate_failure: None,
-                            immediate_resource_lost: None,
-                            _phantom: PhantomData,
-                        }
-                    }
-                    DriverSubmitResult::Failed { report, status } => {
-                        trace!(
-                            "Submit failed synchronously: {} (status={:?})",
-                            report, status
-                        );
-                        match status {
-                            SubmitStatus::Void => {
-                                let Some(payload_erased) = slot.recover_payload() else {
-                                    if let Some(op) = op_platform.take() {
-                                        drop(op);
-                                    }
-                                    return DetachedOp {
-                                        completion_table: None,
-                                        cancel_sender: None,
-                                        cancel_waker: None,
-                                        token: None,
-                                        immediate_failure: None,
-                                        immediate_resource_lost: Some(OpError::payload_missing()),
-                                        _phantom: PhantomData,
-                                    };
-                                };
-
-                                let payload = match T::try_payload_from_erased(payload_erased) {
-                                    Ok(payload) => payload,
-                                    Err(report) => {
-                                        if let Some(op) = op_platform.take() {
-                                            drop(op);
-                                        }
-                                        return DetachedOp {
-                                            completion_table: None,
-                                            cancel_sender: None,
-                                            cancel_waker: None,
-                                            token: None,
-                                            immediate_failure: None,
-                                            immediate_resource_lost: Some(
-                                                OpError::payload_projection(report),
-                                            ),
-                                            _phantom: PhantomData,
-                                        };
-                                    }
-                                };
-                                if let Some(op) = op_platform.take() {
-                                    drop(op);
-                                }
-                                DetachedOp {
-                                    completion_table: None,
-                                    cancel_sender: None,
-                                    cancel_waker: None,
-                                    token: None,
-                                    immediate_failure: Some((report, payload)),
-                                    immediate_resource_lost: None,
-                                    _phantom: PhantomData,
-                                }
-                            }
-                            SubmitStatus::InFlight => {
-                                let token = slot.persist().token();
-                                completion_table.mark_waiting(token);
-                                DetachedOp {
-                                    completion_table: Some(completion_table),
-                                    cancel_sender: Some(cancel_sender),
-                                    cancel_waker: Some(cancel_waker),
-                                    token: Some(token),
-                                    immediate_failure: None,
-                                    immediate_resource_lost: None,
-                                    _phantom: PhantomData,
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                let (kernel_op, payload) = data.into_kernel_and_payload();
-                drop(kernel_op);
-                DetachedOp {
-                    completion_table: None,
-                    cancel_sender: None,
-                    cancel_waker: None,
-                    token: None,
-                    immediate_failure: Some((e, payload)),
-                    immediate_resource_lost: None,
-                    _phantom: PhantomData,
-                }
-            }
-        }
-    }
-
-    pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
-    where
-        T: IntoPlatformOp<P::SlotSpec>,
-    {
-        LocalOp::new(self.data, provider)
-    }
-
-    /// 提交一个 multishot 操作，得到它的完成流。
-    ///
-    /// 与 [`Self::submit_detached`] 的差别只在返回类型：提交路径本身完全相同，多条完成
-    /// 是 slot 层的性质（`CompletionContinuation`），不是提交层的。
-    ///
-    /// 提交失败时流会产出唯一一个错误项然后结束；提交 payload 由 `recover_payload` 取回
-    /// 后丢弃——multishot 的提交 payload 里没有用户交出的 buffer（那是 provided buffer
-    /// 或每条完成各自的 item），所以丢弃它不损失任何用户资源。
-    pub fn submit_multishot<D>(self, driver: &mut D) -> MultishotOp<T, D::SlotSpec>
-    where
-        T: IntoMultishotOp<D::SlotSpec> + Send,
-        D: Driver,
-    {
-        let data = self.data;
-        trace!("Submitting multishot op");
-
         let mut slot = match driver.reserve_op() {
             Ok(slot) => slot,
             Err(report) => {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
                 drop(kernel_op);
-                drop(payload);
-                return MultishotOp::failed(report);
+                let erased = T::payload_into_erased(payload);
+                return DetachedOp::settled(T::submit_failed(erased, report));
             }
         };
 
@@ -268,16 +159,26 @@ impl<T> Op<T> {
             } => {
                 let token = slot.persist().token();
                 completion_table.mark_waiting(token);
-                MultishotOp::armed(completion_table, cancel_sender, cancel_waker, token)
+                DetachedOp::armed(completion_table, cancel_sender, cancel_waker, token)
             }
             DriverSubmitResult::Failed {
                 report,
                 status: SubmitStatus::Void,
             } => {
+                trace!("Submit failed synchronously: {report}");
                 drop(op_platform.take());
-                drop(slot.recover_payload());
-                MultishotOp::failed(report)
+                let Some(erased) = slot.recover_payload() else {
+                    return DetachedOp::settled(OpResult::ResourceLost(OpError::payload_missing()));
+                };
+                DetachedOp::settled(T::submit_failed(erased, report))
             }
         }
+    }
+
+    pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
+    where
+        T: IntoPlatformOp<P::SlotSpec>,
+    {
+        LocalOp::new(self.data, provider)
     }
 }

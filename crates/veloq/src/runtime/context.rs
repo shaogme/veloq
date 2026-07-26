@@ -8,7 +8,7 @@ use veloq_buf::{
 use veloq_driver_native::{
     driver::{ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver},
     error::{DriverReport, Error as DriverError},
-    op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
+    op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter, SingleShotOp},
 };
 use veloq_runtime::{
     error::{Result as RuntimeResult, RuntimeError},
@@ -348,10 +348,23 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
         S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
-        T: IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send,
+        T: SingleShotOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send,
     {
         self.sync_registrar();
         submitter.submit(op, *self)
+    }
+
+    /// 提交一个操作并把它当完成流用。
+    ///
+    /// 单发操作在这里是只有一项的流；multishot 操作（`AcceptMulti`）只能走这条路。
+    /// 与 [`Self::submit`] 的区别只在「怎么看这个句柄」，提交路径完全相同。
+    pub fn submit_stream<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Stream<T>
+    where
+        S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
+        T: IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send,
+    {
+        self.sync_registrar();
+        submitter.submit_stream(op, *self)
     }
 
     pub async fn yield_now(&self) {
@@ -371,7 +384,7 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         T::Output,
     )>
     where
-        T: IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send + 'd + 'reg,
+        T: SingleShotOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send + 'd + 'reg,
     {
         if self.runtime_ctx.worker_id() == worker_id {
             let (res, op_back) = self

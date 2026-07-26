@@ -58,7 +58,7 @@ pub enum UringUserPayload {
     /// multishot accept 的**提交** payload：一直留在 slot 里直到操作终止。
     AcceptMulti(AcceptMulti),
     /// multishot accept **每条完成**的产物。与上一个变体的区别见
-    /// [`veloq_driver_core::op::IntoMultishotOp`]。
+    /// [`veloq_driver_core::op::IntoPlatformOp`] 的 `SubmitPayload` / `RecordPayload`。
     AcceptedSocket(AcceptedSocket),
     SendTo(SendTo),
     UdpRecvFrom(UdpRecvFrom),

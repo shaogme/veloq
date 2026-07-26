@@ -1,8 +1,11 @@
-//! `DetachedOp` 的生命周期收尾。
+//! `DetachedOp` 的生命周期收尾，以及「单发与 multishot 共用一个句柄」这件事本身。
 //!
-//! 这里的两条用例是一对：一个已经取到终态完成的 future 在 drop 时**什么都不该做**，而一个
-//! 仍在途的 future 在 drop 时**必须**放弃 slot 并请求取消。两者共用同一段 `Drop`，所以它们
-//! 只能一起断言。
+//! 用例成对出现，因为它们共用同一段 `poll_item` / `Drop`：
+//!
+//! - 取到终态完成的句柄 drop 时**什么都不该做**，仍在途的句柄 drop 时**必须**放弃 slot
+//!   并请求取消；
+//! - 单发操作当流用只有一项，multishot 则一直产出到 `Final` 为止——两者的差别全部来自
+//!   记录携带的 `CompletionContinuation`，没有第二个句柄类型。
 
 use super::*;
 
@@ -58,29 +61,32 @@ impl slot::SlotSpec for DummySlotSpec {
 struct DummyOp;
 
 impl IntoPlatformOp<DummySlotSpec> for DummyOp {
-    type UserPayload = ();
+    type SubmitPayload = ();
+    type RecordPayload = ();
     type Output = ();
     type Completion = usize;
 
     const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
 
-    fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::UserPayload) {
+    fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::SubmitPayload) {
         (DummyPlatformOp, ())
     }
 
-    fn payload_into_erased(_payload: Self::UserPayload) {}
+    fn payload_into_erased(_payload: Self::SubmitPayload) {}
 
-    fn try_payload_from_erased(_erased: ()) -> DriverResult<Self::UserPayload, DummyError> {
+    fn try_record_from_erased(_erased: ()) -> DriverResult<Self::RecordPayload, DummyError> {
         Ok(())
     }
 
     fn complete(
-        _payload: Self::UserPayload,
+        _payload: Self::RecordPayload,
         res: DriverResult<usize, DummyError>,
     ) -> OpCompletion<Self::Output, DummyError, Self::Completion> {
         OpCompletion::new(res, ())
     }
 }
+
+impl SingleShotOp<DummySlotSpec> for DummyOp {}
 
 /// 只回答 `try_take_record` 与 `mark_orphaned` 的最小完成表：前者按「还剩几条记录」回答
 /// 「已就绪 / 仍在途」，后者数一下自己被调用了几次。
@@ -91,6 +97,8 @@ impl IntoPlatformOp<DummySlotSpec> for DummyOp {
 struct MockTable {
     /// 还没被取走的完成条数；`0` 表示这个操作仍在途。
     ready: AtomicUsize,
+    /// 其中前几条带 `More`（模拟 multishot）；其余的是终态。
+    more: AtomicUsize,
     orphaned: AtomicUsize,
 }
 
@@ -98,12 +106,30 @@ impl MockTable {
     fn with_ready_record() -> Self {
         Self {
             ready: AtomicUsize::new(1),
+            more: AtomicUsize::new(0),
+            orphaned: AtomicUsize::new(0),
+        }
+    }
+
+    /// `more` 条中间完成之后跟一条终态完成。
+    fn streaming(more: usize) -> Self {
+        Self {
+            ready: AtomicUsize::new(more + 1),
+            more: AtomicUsize::new(more),
             orphaned: AtomicUsize::new(0),
         }
     }
 
     fn orphaned(&self) -> usize {
         self.orphaned.load(Ordering::Relaxed)
+    }
+
+    fn next_continuation(&self) -> CompletionContinuation {
+        if self.more.load(Ordering::Relaxed) == 0 {
+            return CompletionContinuation::Final;
+        }
+        self.more.fetch_sub(1, Ordering::Relaxed);
+        CompletionContinuation::More
     }
 }
 
@@ -129,7 +155,7 @@ impl CompletionAccess<DummySlotSpec> for MockTable {
             payload: (),
             detail: None,
             cleanup: CompletionCleanupGuard::none(),
-            continuation: CompletionContinuation::Final,
+            continuation: self.next_continuation(),
         }))
     }
 
@@ -177,27 +203,59 @@ impl RemoteWaker<DummyError> for CountingWaker {
     }
 }
 
-struct Harness {
-    op: Option<DetachedOp<DummyOp, DummySlotSpec>>,
+/// 一个 multishot 形态的操作：不实现 [`SingleShotOp`]，所以它**不能** `await`，只能当流用。
+struct DummyMultiOp;
+
+impl IntoPlatformOp<DummySlotSpec> for DummyMultiOp {
+    type SubmitPayload = ();
+    type RecordPayload = ();
+    type Output = ();
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::AcceptMulti;
+
+    fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::SubmitPayload) {
+        (DummyPlatformOp, ())
+    }
+
+    fn payload_into_erased(_payload: Self::SubmitPayload) {}
+
+    fn try_record_from_erased(_erased: ()) -> DriverResult<Self::RecordPayload, DummyError> {
+        Ok(())
+    }
+
+    fn complete(
+        _payload: Self::RecordPayload,
+        res: DriverResult<usize, DummyError>,
+    ) -> OpCompletion<Self::Output, DummyError, Self::Completion> {
+        OpCompletion::new(res, ())
+    }
+}
+
+struct Harness<T = DummyOp>
+where
+    T: IntoPlatformOp<DummySlotSpec, Output = (), Completion = usize> + Unpin,
+{
+    op: Option<DetachedOp<T, DummySlotSpec>>,
     table: Arc<MockTable>,
     waker: Arc<CountingWaker>,
     cancels: mpsc::Receiver<CancelRequest>,
 }
 
-impl Harness {
+impl<T> Harness<T>
+where
+    T: IntoPlatformOp<DummySlotSpec, Output = (), Completion = usize> + Unpin,
+{
     fn new(table: Arc<MockTable>) -> Self {
         let token = test_token();
         let waker = Arc::new(CountingWaker::default());
         let (tx, cancels) = mpsc::channel();
-        let op = DetachedOp {
-            completion_table: Some(table.clone() as SharedCompletionTable<DummySlotSpec>),
-            cancel_sender: Some(tx),
-            cancel_waker: Some(waker.clone() as Arc<dyn RemoteWaker<DummyError>>),
-            token: Some(token),
-            immediate_failure: None,
-            immediate_resource_lost: None,
-            _phantom: std::marker::PhantomData,
-        };
+        let op = DetachedOp::armed(
+            table.clone() as SharedCompletionTable<DummySlotSpec>,
+            tx,
+            waker.clone() as Arc<dyn RemoteWaker<DummyError>>,
+            token,
+        );
         Self {
             op: Some(op),
             table,
@@ -206,11 +264,27 @@ impl Harness {
         }
     }
 
-    fn poll_once(&mut self) -> Poll<OpResult<(), DummyError, usize>> {
+    fn poll_once(&mut self) -> Poll<OpResult<(), DummyError, usize>>
+    where
+        T: SingleShotOp<DummySlotSpec>,
+    {
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
         let op = self.op.as_mut().expect("op still alive");
         Pin::new(op).poll(&mut cx)
+    }
+
+    fn poll_next_once(&mut self) -> Poll<Option<OpResult<(), DummyError, usize>>> {
+        use futures_core::Stream;
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let op = self.op.as_mut().expect("op still alive");
+        Pin::new(op).poll_next(&mut cx)
+    }
+
+    fn is_armed(&self) -> bool {
+        self.op.as_ref().expect("op still alive").is_armed()
     }
 
     fn drop_op(&mut self) {
@@ -231,7 +305,7 @@ fn test_token() -> OpToken {
 /// `StaleGeneration`，并让驱动为一个结束了的操作白跑一次唤醒。
 #[test]
 fn a_completed_detached_op_leaves_its_slot_alone_on_drop() {
-    let mut harness = Harness::new(Arc::new(MockTable::with_ready_record()));
+    let mut harness: Harness = Harness::new(Arc::new(MockTable::with_ready_record()));
 
     assert!(matches!(harness.poll_once(), Poll::Ready(_)));
     harness.drop_op();
@@ -247,7 +321,7 @@ fn a_completed_detached_op_leaves_its_slot_alone_on_drop() {
 /// 回归锚点：上面那条不能顺手把真正需要的取消路径关掉。
 #[test]
 fn an_unfinished_detached_op_still_orphans_and_cancels_on_drop() {
-    let mut harness = Harness::new(Arc::new(MockTable::default()));
+    let mut harness: Harness = Harness::new(Arc::new(MockTable::default()));
 
     assert!(matches!(harness.poll_once(), Poll::Pending));
     harness.drop_op();
@@ -261,17 +335,71 @@ fn an_unfinished_detached_op_still_orphans_and_cancels_on_drop() {
     assert_eq!(cancel.target, test_token());
 }
 
-/// 提交就失败的 future 从来没有过 token，drop 时同样什么都不做。
+/// 提交就失败的句柄从来没有过 token，drop 时同样什么都不做。
 #[test]
 fn a_never_submitted_detached_op_has_nothing_to_release() {
-    let op: DetachedOp<DummyOp, DummySlotSpec> = DetachedOp {
-        completion_table: None,
-        cancel_sender: None,
-        cancel_waker: None,
-        token: None,
-        immediate_failure: None,
-        immediate_resource_lost: Some(OpError::payload_missing()),
-        _phantom: std::marker::PhantomData,
-    };
+    let op: DetachedOp<DummyOp, DummySlotSpec> =
+        DetachedOp::settled(OpResult::ResourceLost(OpError::payload_missing()));
     drop(op);
+}
+
+/// 同一个句柄当流用：单发操作的流只有一项，取完即结束。
+///
+/// 这条锚住的是收敛本身——`Future` 与 `Stream` 是同一段 `poll_item` 的两个出口，
+/// 不是两条实现。
+#[test]
+fn a_single_shot_op_is_a_one_item_stream() {
+    let mut harness: Harness = Harness::new(Arc::new(MockTable::with_ready_record()));
+
+    assert!(matches!(harness.poll_next_once(), Poll::Ready(Some(_))));
+    assert!(matches!(harness.poll_next_once(), Poll::Ready(None)));
+
+    harness.drop_op();
+    assert_eq!(harness.table.orphaned(), 0);
+    assert_eq!(harness.wakes(), 0);
+}
+
+/// 同一个句柄跑 multishot：`More` 的记录一条都不终止流，`Final` 才终止。
+///
+/// 这是收敛的另一半——multishot 不再需要自己的句柄类型，它和单发共用 `poll_item`，
+/// 区别全部来自记录携带的 `CompletionContinuation`。
+#[test]
+fn a_multishot_op_keeps_its_token_until_the_final_record() {
+    const MORE: usize = 2;
+
+    let mut harness: Harness<DummyMultiOp> = Harness::new(Arc::new(MockTable::streaming(MORE)));
+
+    for i in 0..MORE {
+        assert!(
+            matches!(harness.poll_next_once(), Poll::Ready(Some(_))),
+            "中间完成 {i} 应该产出一项"
+        );
+        assert!(harness.is_armed(), "`More` 之后操作仍在内核里");
+    }
+
+    assert!(matches!(harness.poll_next_once(), Poll::Ready(Some(_))));
+    assert!(!harness.is_armed(), "`Final` 之后 token 必须失效");
+    assert!(matches!(harness.poll_next_once(), Poll::Ready(None)));
+
+    harness.drop_op();
+    assert_eq!(harness.table.orphaned(), 0, "已终止的流不该再放弃 slot");
+    assert_eq!(harness.wakes(), 0);
+}
+
+/// 中途丢弃一条仍在途的 multishot：必须放弃 slot 并请求取消，否则内核会一直投递下去。
+#[test]
+fn dropping_a_streaming_op_orphans_and_cancels() {
+    let mut harness: Harness<DummyMultiOp> = Harness::new(Arc::new(MockTable::streaming(3)));
+
+    assert!(matches!(harness.poll_next_once(), Poll::Ready(Some(_))));
+    assert!(harness.is_armed());
+    harness.drop_op();
+
+    assert_eq!(harness.table.orphaned(), 1);
+    assert_eq!(harness.wakes(), 1);
+    let cancel = harness
+        .cancels
+        .try_recv()
+        .expect("在途的 multishot 必须投出取消请求");
+    assert_eq!(cancel.target, test_token());
 }
