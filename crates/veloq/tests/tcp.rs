@@ -8,6 +8,8 @@ use std::{
     },
 };
 
+use futures_util::StreamExt;
+
 use veloq::{
     io::{AsyncBufRead, AsyncBufWrite},
     net::{TcpListener, TcpStream},
@@ -442,6 +444,95 @@ fn tcp_cancel_recv() {
                         println!("TCP recv cancelled successfully");
                     }
                 };
+            });
+        })
+        .await
+        .unwrap();
+    });
+}
+
+/// 一条 `AcceptStream` 连续产出多个连接。
+///
+/// 在支持 multishot accept 的内核上这只对应**一次** SQE 提交；不支持时（Linux < 5.19、
+/// 或 IOCP）自动走每次重新提交单发 accept 的路径。两条路径的可观测行为必须一致，所以
+/// 这个测试对两者都跑得通——那正是它的价值。
+#[test]
+fn accept_stream_yields_every_connection() {
+    const CONNECTIONS: usize = 8;
+
+    run_test(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let mut accepted = listener.accept_multi();
+                for i in 0..CONNECTIONS {
+                    let item = accepted
+                        .next()
+                        .await
+                        .unwrap_or_else(|| panic!("accept stream ended early at {i}"));
+                    let (_stream, peer) = item.unwrap_or_else(|e| panic!("accept {i} failed: {e}"));
+                    assert!(
+                        peer.ip().is_ipv4(),
+                        "multishot accept must still report a usable peer address"
+                    );
+                    assert_ne!(peer.port(), 0, "peer address must be fully populated");
+                }
+            });
+
+            s.spawn_boxed(async move {
+                for _ in 0..CONNECTIONS {
+                    let stream = TcpStream::connect(ctx, listen_addr)
+                        .await
+                        .expect("Failed to connect");
+                    drop(stream);
+                }
+            });
+        })
+        .await
+        .unwrap();
+    });
+}
+
+/// 丢弃一条仍在途的 `AcceptStream` 之后，listener 上还能重新开一条并继续工作。
+///
+/// 覆盖的是取消路径：`MultishotOp::drop` 要把 slot 从 `InFlightWaiting` 收进
+/// `InFlightOrphaned`（**不推进 generation**），内核随后的完成才找得到 slot 去跑
+/// `orphan_cleanup`。做错的话这里会挂住或泄漏 fd。
+#[test]
+fn dropping_an_accept_stream_leaves_the_listener_usable() {
+    run_test(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        // 开一条流、不取任何东西就丢弃：multishot 已经提交给内核了。
+        drop(listener.accept_multi());
+        yield_now().await;
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let mut accepted = listener.accept_multi();
+                let item = accepted.next().await.expect("accept stream ended early");
+                let (_stream, peer) =
+                    item.expect("accept failed after an earlier stream was dropped");
+                assert!(peer.ip().is_ipv4());
+            });
+
+            s.spawn_boxed(async move {
+                // 取消是异步的：在它生效之前，那条已被放弃的 multishot 仍然会从同一个
+                // 内核 accept 队列里取走连接（取走之后走 orphan cleanup 直接关掉）。所以
+                // 这里连多次——断言的是「新流最终拿得到连接」，不是「第一个连接归新流」。
+                //
+                // 连接失败就停：说明服务端已经拿到它要的那一个并关掉了 listener，那正是
+                // 成功路径。真正的断言在服务端那一侧。
+                for _ in 0..8 {
+                    match TcpStream::connect(ctx, listen_addr).await {
+                        Ok(stream) => drop(stream),
+                        Err(_) => break,
+                    }
+                    yield_now().await;
+                }
             });
         })
         .await

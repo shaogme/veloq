@@ -9,6 +9,7 @@ use crate::{
     error::{Error, Result},
     io::{AsyncBufRead, AsyncBufWrite},
     net::{
+        accept_stream::AcceptStream,
         common::{InnerSocket, SocketToken, SocketTokenPtr},
         error::NetError,
     },
@@ -115,6 +116,18 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.inner.local_addr()
+    }
+
+    /// 把这个 listener 变成一条连接流。
+    ///
+    /// 与反复 `accept()` 语义相同，但在支持 multishot accept 的内核上只提交一次 SQE、
+    /// 只占一个 slot。不支持时自动退回「每次重新提交一次单发 accept」——两个平台共用
+    /// 那条路径，见 [`AcceptStream`]。
+    ///
+    /// 注意 `accept()` 与本方法**不要同时用在同一个 listener 上**：两者都会从同一个内核
+    /// accept 队列取连接，谁拿到哪一个不确定。
+    pub fn accept_multi(&self) -> AcceptStream<'rt, 'reg, S, P> {
+        AcceptStream::new(self.ctx, self.inner.clone(), self.submitter)
     }
 }
 

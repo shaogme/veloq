@@ -1,0 +1,219 @@
+//! multishot accept 的用户侧流。
+//!
+//! 两条实现路径，选哪条由后端能力决定：
+//!
+//! - `Native`：一次提交，内核持续投递完成（io_uring `AcceptMulti`）；
+//! - `Emulated`：每次 `poll_next` 提交一次单发 `Accept`。
+//!
+//! **`Emulated` 不是 Windows 兼容层**，它同时也是 Linux 5.6–5.18 的路径——multishot accept
+//! 要 5.19，而仓库声明的最低内核是 5.6。两个平台共用同一段代码，语义等价、性能不等价。
+//!
+//! 两条路径的对端地址来源**不同**，这一点不要「统一」掉：`AcceptMulti` 的 SQE 没有 addr
+//! 字段（多条完成共享一个地址缓冲会互相覆盖），所以 `Native` 必须在拿到 fd 之后调
+//! `getpeername`；`Emulated` 走单发 `Accept`，地址由内核直接填好。见
+//! `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2 / §7.3。
+
+use std::{
+    future::Future,
+    mem::size_of,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use diagweave::prelude::*;
+use futures_core::Stream;
+use veloq_driver_native::{
+    OwnedRawHandle, SockAddrStorage,
+    driver::{Driver, PlatformSlotSpec},
+    error::Error as DriverError,
+    op::{Accept, DetachedOp, Op, OpResult},
+};
+
+#[cfg(target_os = "linux")]
+use veloq_driver_native::{
+    op::{AcceptMulti, AcceptedSocket, MultishotOp},
+    peer_addr_of_handle,
+};
+
+use crate::{
+    error::Result,
+    net::{
+        common::{InnerSocket, SocketTokenPtr},
+        error::NetError,
+        tcp::GenericTcpStream,
+    },
+    runtime::context::Ctx,
+};
+
+#[cfg(target_os = "linux")]
+type NativeStream = MultishotOp<AcceptMulti, PlatformSlotSpec>;
+type EmulatedOp = DetachedOp<Accept, PlatformSlotSpec>;
+#[cfg(target_os = "linux")]
+type NativeItem = OpResult<AcceptedSocket, DriverError, OwnedRawHandle>;
+type EmulatedItem = OpResult<Accept, DriverError, OwnedRawHandle>;
+
+/// `Native` 只在有 multishot 后端的平台上存在。
+///
+/// 这处 `cfg` 分的是**实现**，不是用户可见的 API：[`AcceptStream`] 的类型与 `Stream` 项
+/// 在两个平台上完全一致，IOCP 只是恒走 `Emulated`（它的 `capabilities().accept_multi`
+/// 永远是 `false`）。把变体也一并 `cfg` 掉，是为了不要求 IOCP 后端去实现一套永远不会被
+/// 提交的 `AcceptMulti` op。
+enum AcceptMode {
+    /// 一次提交，多条完成。
+    #[cfg(target_os = "linux")]
+    Native(NativeStream),
+    /// 每取一条都重新提交一次单发 accept。`None` 表示当前没有在途的那一次。
+    Emulated { pending: Option<EmulatedOp> },
+}
+
+/// [`crate::net::TcpListener::accept_multi`] 产出的连接流。
+///
+/// 语义与反复调用 `accept()` 相同：每一项是一个新连接及其对端地址。差别只在提交次数——
+/// `Native` 路径下 N 个连接只对应一次 SQE 提交与一个 slot。
+///
+/// 流被丢弃时会取消在途的 multishot 操作（`MultishotOp::drop` → `mark_orphaned` +
+/// `CancelRequest::abandon`），内核随后投递的完成走 orphan cleanup，其中已经建立好的连接
+/// 会被关闭而不是泄漏。
+pub struct AcceptStream<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
+    mode: AcceptMode,
+    inner: InnerSocket<'rt, 'reg, P>,
+    submitter: S,
+    ctx: Ctx<'rt, 'reg>,
+}
+
+impl<'rt, 'reg, S: Copy, P: SocketTokenPtr<'rt, 'reg>> AcceptStream<'rt, 'reg, S, P> {
+    pub(crate) fn new(ctx: Ctx<'rt, 'reg>, inner: InnerSocket<'rt, 'reg, P>, submitter: S) -> Self {
+        // 能力由 driver 缓存：第一次被内核以 EINVAL 拒绝之后就不会再试（见
+        // `Driver::note_capability_rejected`），后续的 listener 不重复付探测代价。
+        let native = ctx.driver(|driver| driver.capabilities().accept_multi);
+        let mode = Self::arm(ctx, &inner, native);
+
+        Self {
+            mode,
+            inner,
+            submitter,
+            ctx,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm(ctx: Ctx<'rt, 'reg>, inner: &InnerSocket<'rt, 'reg, P>, native: bool) -> AcceptMode {
+        if !native {
+            return AcceptMode::Emulated { pending: None };
+        }
+        let fd = inner.fd();
+        AcceptMode::Native(
+            ctx.driver(|mut driver| Op::new(AcceptMulti { fd }).submit_multishot(&mut driver)),
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn arm(_ctx: Ctx<'rt, 'reg>, _inner: &InnerSocket<'rt, 'reg, P>, native: bool) -> AcceptMode {
+        debug_assert!(
+            !native,
+            "a backend without multishot accept must not report the capability"
+        );
+        AcceptMode::Emulated { pending: None }
+    }
+
+    /// 把一个刚被 accept 出来的描述符包装成流对外产出的那一项。
+    fn make_item(
+        &self,
+        accepted: OwnedRawHandle,
+        addr: SocketAddr,
+    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+        Ok((
+            GenericTcpStream {
+                inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
+                submitter: self.submitter,
+                ctx: self.ctx,
+            },
+            addr,
+        ))
+    }
+
+    /// `Native` 的一项：新连接的 fd 来自 CQE，对端地址要另外问内核。
+    #[cfg(target_os = "linux")]
+    fn native_item(
+        &self,
+        item: NativeItem,
+    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+        let (res, _) = item.into_inner();
+        let accepted = res.trans()?;
+        // multishot accept 不带对端地址——见模块文档。`getpeername` 失败只让**这一条**
+        // 降级为错误项，流本身继续。
+        let addr = peer_addr_of_handle(accepted.raw()).trans()?;
+        self.make_item(accepted, addr)
+    }
+
+    /// `Emulated` 的一项：走单发 `Accept`，地址由内核填在 payload 里。
+    fn emulated_item(
+        &self,
+        result: EmulatedItem,
+    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+        let (res, op) = result.into_inner();
+        let op = op.ok_or(NetError::AcceptOpLost)?;
+        let accepted = res.trans()?;
+        let addr = op.remote_addr.ok_or(NetError::AcceptMissingRemoteAddr)?;
+        self.make_item(accepted, addr)
+    }
+}
+
+impl<'rt, 'reg, S: Copy, P: SocketTokenPtr<'rt, 'reg>> Stream for AcceptStream<'rt, 'reg, S, P> {
+    type Item = Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // SAFETY: `AcceptStream` 的字段都不是自引用的，投影出 `&mut` 不违反 pin 契约。
+        let this = unsafe { self.get_unchecked_mut() };
+
+        // 先把这一轮的原始结果取出来，结束对 `this.mode` 的可变借用，之后才好调用
+        // `&self` 的投影方法。
+        let step = match &mut this.mode {
+            #[cfg(target_os = "linux")]
+            AcceptMode::Native(stream) => match Pin::new(stream).poll_next(cx) {
+                Poll::Ready(Some(item)) => Step::Native(item),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            },
+            AcceptMode::Emulated { pending } => {
+                if pending.is_none() {
+                    let fd = this.inner.fd();
+                    *pending = Some(this.ctx.driver(|mut driver| {
+                        Op::new(Accept {
+                            fd,
+                            addr: SockAddrStorage::default(),
+                            addr_len: size_of::<SockAddrStorage>() as u32,
+                            remote_addr: None,
+                        })
+                        .submit_detached(&mut driver)
+                    }));
+                }
+
+                let result = {
+                    let op = pending.as_mut().expect("just armed above");
+                    match Pin::new(op).poll(cx) {
+                        Poll::Ready(result) => result,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                };
+                // 这一次已经结束，下一轮 `poll_next` 会重新提交。
+                *pending = None;
+                Step::Emulated(result)
+            }
+        };
+
+        Poll::Ready(Some(match step {
+            #[cfg(target_os = "linux")]
+            Step::Native(item) => this.native_item(item),
+            Step::Emulated(result) => this.emulated_item(result),
+        }))
+    }
+}
+
+/// 一轮 `poll_next` 从后端拿到的原始结果。
+enum Step {
+    #[cfg(target_os = "linux")]
+    Native(NativeItem),
+    Emulated(EmulatedItem),
+}

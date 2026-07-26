@@ -25,6 +25,7 @@ veloq-local.workspace = true
 veloq-waker.workspace = true
 veloq-tls.workspace = true
 veloq-std.workspace = true
+futures-core.workspace = true
 tracing.workspace = true
 diagweave.workspace = true
 
@@ -36,6 +37,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+futures-core.workspace = true
 futures-util.workspace = true
 
 [lints]
