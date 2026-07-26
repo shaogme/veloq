@@ -441,6 +441,11 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
     worker_id: usize,
     fd: IoFd,
 ) {
+    /// `repr(C)` is load-bearing: the vtable's `poll` casts the header pointer straight to
+    /// `*const Self`, which is only sound while `header` sits at offset 0. Under `repr(Rust)`
+    /// the compiler is free to reorder the fields — and does, depending on the size and
+    /// alignment of `fd`. Same reason `GenericTaskNode` and `RouteJobTask` carry it.
+    #[repr(C)]
     struct UnregisterFileTask<'reg> {
         header: TaskHeader,
         fd: IoFd,
