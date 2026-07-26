@@ -381,11 +381,10 @@ impl<'a> UringDriver<'a> {
         }
 
         drop(sq);
-        let _ = unsafe {
-            self.ring
-                .submitter()
-                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
-        };
+        // push 失败意味着用户态 SQ 环被已填充、内核尚未消费的条目占满。要腾出空间只能
+        // 让内核消费它们，即带 `to_submit > 0` 进 `io_uring_enter`——单纯 GETEVENTS 只
+        // 收割 CQ，一条 SQE 都不会被消费，重试必然再次失败并白付一次系统调用。
+        let _ = self.ring.submit();
 
         let mut sq = self.ring.submission();
         if unsafe { sq.push(&entry) }.is_ok() {
