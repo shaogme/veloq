@@ -6,11 +6,12 @@ mod net;
 mod op;
 
 pub use config::{
-    BorrowedRawHandle, BufferRegistrationMode, FileTableExhaustion, IoFd, IoMode, OwnedRawHandle,
-    RawHandle, RawHandleKind, SockAddrStorage, UringConfig, UringRawHandle,
+    BorrowedRawHandle, BufferRegistrationMode, FileTableExhaustion, IoFd, IoMode,
+    MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,
+    SockAddrStorage, UringConfig, UringRawHandle,
 };
 pub use diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot};
-pub use driver::{UringDriver, UringOpState};
+pub use driver::{ProvidedBufStats, UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
 pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};
 pub use op::{UringOp, UringSlotSpec, UringUserPayload};

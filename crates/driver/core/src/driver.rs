@@ -9,7 +9,7 @@ use std::{
     task::{Poll, Waker},
     time::Duration,
 };
-use veloq_buf::heap::ChunkId;
+use veloq_buf::{AnyBufPool, heap::ChunkId};
 
 mod completion;
 pub mod registry;
@@ -223,6 +223,21 @@ pub trait Driver {
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>>;
 
+    /// 把本 worker 的缓冲池交给 driver，供它自己需要 buffer 的机制使用。
+    ///
+    /// **必须在池建好之后单独调一次，而不能作为构造参数**：池是**从** driver 建起来的
+    /// （`BufferRegistrar` 要拿 driver 去注册 chunk），所以 driver 构造时它还不存在。
+    ///
+    /// 默认什么都不做——目前只有 io_uring 的 provided buffer ring 需要自己持有一批 buffer
+    /// （见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.1）；没有这类机制的后端不必实现，
+    /// 也不必在意这个调用有没有发生。
+    fn attach_buffer_pool(
+        &mut self,
+        _pool: AnyBufPool,
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
+        Ok(())
+    }
+
     /// 本 driver 当前可用的可选能力。默认全否——后端不实现就等于没有。
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities::default()
@@ -356,6 +371,14 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>> {
         self.provider.with_driver_ref(|d| d.create_waker())
+    }
+
+    fn attach_buffer_pool(
+        &mut self,
+        pool: AnyBufPool,
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
+        self.provider
+            .with_driver_mut(|d| d.attach_buffer_pool(pool))
     }
 
     fn capabilities(&self) -> DriverCapabilities {

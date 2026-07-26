@@ -25,6 +25,9 @@ use veloq_driver_native::{
     socket_addr_to_storage,
 };
 
+#[cfg(target_os = "linux")]
+use veloq_driver_native::{driver::Driver, op::RecvProvided};
+
 #[derive(Clone)]
 pub struct GenericTcpListener<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
     pub(crate) inner: InnerSocket<'rt, 'reg, P>,
@@ -180,6 +183,57 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
         Ok((res.trans()?, buf))
     }
 
+    /// 这个运行时是否真的注册上了 provided buffer 环。
+    ///
+    /// 查的是**当前 worker** 的驱动。所有 worker 用同一份配置构造，所以答案一致；真正会
+    /// 让它变成 `false` 的是内核不支持（`IORING_REGISTER_PBUF_RING` 要 5.19），而那对整个
+    /// 进程是一样的。
+    #[cfg(target_os = "linux")]
+    fn ensure_provided_buffers(&self) -> Result<()> {
+        if self
+            .ctx
+            .driver(|driver| driver.capabilities().provided_buffers)
+        {
+            return Ok(());
+        }
+        Err(NetError::ProvidedBuffersUnavailable)?
+    }
+
+    /// IOCP 没有 provided buffer，这条路径永远不可用。
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_provided_buffers(&self) -> Result<()> {
+        Err(NetError::ProvidedBuffersUnavailable)?
+    }
+
+    /// 接收一段数据，buffer 由内核在数据到达时才从 provided buffer 环里挑。
+    ///
+    /// 与 [`Self::recv_subset_direct`] 的差别在**谁提供 buffer**：这里调用方不必先交出一
+    /// 个，于是一个空闲连接不占任何接收缓冲。代价是必须先开这项能力（
+    /// [`crate::config::Config::uring_provided_buffers`]），否则返回
+    /// [`NetError::ProvidedBuffersUnavailable`]。
+    ///
+    /// 返回的 `FixedBuf` 的长度已经是内核实际写入的字节数；读到 0 字节表示对端关闭。
+    #[cfg(target_os = "linux")]
+    async fn recv_provided_direct(&self) -> Result<FixedBuf> {
+        self.ensure_provided_buffers()?;
+
+        let op = RecvProvided {
+            fd: self.inner.fd(),
+        };
+        let (res, op_back) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
+        // 先取结果：出错的完成通常一个 buffer 都没消费，此时 `buf` 本就是 `None`。
+        res.trans()?;
+        // 长度由驱动在取出 buffer 时按 CQE 的结果设好，这里不重复设一次。
+        op_back
+            .and_then(|provided| provided.buf)
+            .ok_or(NetError::ProvidedBufferMissing)
+            .trans()
+    }
+
     async fn send_subset_direct(
         &self,
         buf: FixedBuf,
@@ -267,6 +321,21 @@ impl<'rt, 'reg> LocalTcpStream<'rt, 'reg> {
     pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
         self.send_subset_direct(buf, buf_offset).await
     }
+
+    /// 接收一段数据，buffer 由内核从 provided buffer 环里挑（见
+    /// [`crate::config::Config::uring_provided_buffers`]）。
+    #[cfg(target_os = "linux")]
+    pub async fn recv_provided(&self) -> Result<FixedBuf> {
+        self.recv_provided_direct().await
+    }
+
+    /// IOCP 没有 provided buffer，恒返回
+    /// [`NetError::ProvidedBuffersUnavailable`]。签名与 Linux 一致，调用方不必写 `cfg`。
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_provided(&self) -> Result<FixedBuf> {
+        self.ensure_provided_buffers()?;
+        unreachable!("ensure_provided_buffers always fails off io_uring")
+    }
 }
 
 impl<'rt, 'reg> TcpStream<'rt, 'reg> {
@@ -311,6 +380,33 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         Ok((res.trans()?, op.buf))
+    }
+
+    /// 接收一段数据，buffer 由内核从 provided buffer 环里挑（见
+    /// [`crate::config::Config::uring_provided_buffers`]）。
+    ///
+    /// 环是 per-worker 的，所以操作照例路由到持有这个 socket 的 worker 上——用户拿到的
+    /// `FixedBuf` 属于**那个** worker 的池，跨 worker drop 走池自己的归还路径，与其它任何
+    /// `FixedBuf` 没有区别。
+    #[cfg(target_os = "linux")]
+    pub async fn recv_provided(&self) -> Result<FixedBuf> {
+        self.ensure_provided_buffers()?;
+
+        let owner = self.inner.owner_worker_id();
+        let op = RecvProvided {
+            fd: self.inner.fd(),
+        };
+        let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        res.trans()?;
+        provided.buf.ok_or(NetError::ProvidedBufferMissing).trans()
+    }
+
+    /// IOCP 没有 provided buffer，恒返回
+    /// [`NetError::ProvidedBuffersUnavailable`]。签名与 Linux 一致，调用方不必写 `cfg`。
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_provided(&self) -> Result<FixedBuf> {
+        self.ensure_provided_buffers()?;
+        unreachable!("ensure_provided_buffers always fails off io_uring")
     }
 }
 

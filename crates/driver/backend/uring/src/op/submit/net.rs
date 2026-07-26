@@ -5,13 +5,13 @@ use crate::{
     error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
     op::{
-        Accept, AcceptMulti, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom,
-        UdpSend,
+        Accept, AcceptMulti, Connect, OpSend, Recv, RecvProvided, SendTo, UdpConnect, UdpRecv,
+        UdpRecvFrom, UdpSend,
         payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvFromPayload},
     },
 };
 use io_uring::{opcode, squeue, types};
-use std::{mem::size_of, slice::from_raw_parts};
+use std::{mem::size_of, ptr, slice::from_raw_parts};
 use veloq_driver_core::driver::SubmitTokenContext;
 
 use super::{invalid_buf_io_range, resolve_socket_fd, sqe_with_fd};
@@ -28,6 +28,31 @@ pub(crate) unsafe fn make_sqe_recv(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_recv")?;
     Ok(sqe_with_fd!(fd, |f| opcode::Recv::new(f, ptr, len).build()))
+}
+
+/// A recv whose buffer the kernel picks out of the provided-buffer ring.
+///
+/// `len` is the buffer size rather than `0`: the "0 means use the whole buffer" shortcut only
+/// arrived after 5.19, and on a kernel without it a zero-length recv is exactly what you get.
+/// Every buffer in the ring has the same capacity, so naming it costs nothing and behaves the
+/// same everywhere.
+pub(crate) unsafe fn make_sqe_recv_provided(
+    _kernel: &mut KernelRef<RecvProvided>,
+    val: &mut RecvProvided,
+    env: &SqeEnv<'_>,
+    _token: SubmitTokenContext,
+) -> UringResult<squeue::Entry> {
+    const SCOPE: &str = "uring.op.submit.make_sqe_recv_provided";
+    let (bgid, len) = env.provided_buf_info(SCOPE)?;
+    let fd = resolve_socket_fd(env.file_table, val.fd, SCOPE)?;
+    Ok(sqe_with_fd!(fd, |f| opcode::Recv::new(
+        f,
+        ptr::null_mut(),
+        len
+    )
+    .buf_group(bgid)
+    .build()
+    .flags(squeue::Flags::BUFFER_SELECT)))
 }
 
 pub(crate) unsafe fn make_sqe_send(

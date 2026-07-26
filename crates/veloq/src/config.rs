@@ -4,7 +4,7 @@ use veloq_std::nz;
 
 pub use veloq_blocking::BlockingPoolConfig;
 pub use veloq_driver_native::config::{
-    BufferRegistrationMode, FileTableExhaustion, IocpConfig, UringConfig,
+    BufferRegistrationMode, FileTableExhaustion, IocpConfig, ProvidedBufConfig, UringConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -121,6 +121,23 @@ impl Config {
 
     #[cfg(windows)]
     pub fn uring_registration_mode(self, _mode: BufferRegistrationMode) -> Self {
+        self
+    }
+
+    /// 为每个 worker 注册一组 provided buffer（io_uring 5.19+），`None` 表示不开。
+    ///
+    /// 开启之后 [`crate::net::TcpStream::recv_provided`] 才可用：那条路径不需要调用方先交
+    /// 出 buffer，内核在数据到达时才从环里挑一个。内核不支持时注册失败，驱动会静默降级，
+    /// `recv_provided` 随之返回 [`crate::net::error::NetError::ProvidedBuffersUnavailable`]。
+    #[cfg(not(windows))]
+    pub fn uring_provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+        self.uring.provided_buffers = provided_buffers;
+        self
+    }
+
+    /// IOCP 没有 provided buffer，这里恒为空操作。
+    #[cfg(windows)]
+    pub fn uring_provided_buffers(self, _provided_buffers: Option<ProvidedBufConfig>) -> Self {
         self
     }
 

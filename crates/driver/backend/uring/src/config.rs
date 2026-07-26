@@ -1,4 +1,7 @@
-use std::{mem, num::NonZeroU32};
+use std::{
+    mem,
+    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
+};
 pub use veloq_driver_core::RawHandleKind;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
@@ -110,11 +113,50 @@ impl FileTableExhaustion {
     }
 }
 
+/// Shape of the kernel's provided-buffer ring (`IORING_REGISTER_PBUF_RING`, Linux 5.19+).
+///
+/// The driver keeps `entries` buffers of `buf_size` bytes published to the kernel; an operation
+/// submitted with `IOSQE_BUFFER_SELECT` gets one of them assigned only once data actually
+/// arrives. That late binding is the point: idle connections stop pinning receive buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvidedBufConfig {
+    /// Number of ring entries. Must be a power of two and at most [`MAX_PROVIDED_BUF_ENTRIES`]
+    /// — the kernel enforces both, so a bad value simply leaves provided buffers disabled.
+    pub entries: NonZeroU16,
+    /// Capacity of each buffer.
+    pub buf_size: NonZeroUsize,
+}
+
+/// The kernel's hard cap on `ring_entries` for `IORING_REGISTER_PBUF_RING`.
+pub const MAX_PROVIDED_BUF_ENTRIES: u16 = 1 << 15;
+
+impl Default for ProvidedBufConfig {
+    fn default() -> Self {
+        Self {
+            entries: NonZeroU16::new(256).expect("256 is non-zero"),
+            // One `veloq-buf` slot: the pool serves this size out of its order-0 fast path.
+            buf_size: NonZeroUsize::new(4096).expect("4096 is non-zero"),
+        }
+    }
+}
+
+impl ProvidedBufConfig {
+    pub fn new(entries: NonZeroU16, buf_size: NonZeroUsize) -> Self {
+        Self { entries, buf_size }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UringConfig {
     pub mode: IoMode,
     pub entries: NonZeroU32,
     pub registration_mode: BufferRegistrationMode,
+    /// Provided-buffer ring to register, or `None` to run without one.
+    ///
+    /// Off by default: the ring costs `entries * buf_size` of pool memory per worker whether or
+    /// not anything ever selects a buffer from it, and only operations that explicitly ask for
+    /// buffer selection can use it.
+    pub provided_buffers: Option<ProvidedBufConfig>,
     /// Size of the kernel's registered (fixed) file table.
     ///
     /// Independent of [`Self::entries`]: submission queue depth bounds how many operations are
@@ -139,6 +181,7 @@ impl Default for UringConfig {
             // SAFETY: 1024 is non-zero.
             entries: unsafe { NonZeroU32::new_unchecked(1024) },
             registration_mode: BufferRegistrationMode::Strict,
+            provided_buffers: None,
             file_table_capacity: DEFAULT_FILE_TABLE_CAPACITY,
             file_table_exhaustion: FileTableExhaustion::Fallback,
         }
@@ -151,6 +194,11 @@ const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 impl UringConfig {
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
+        self
+    }
+
+    pub fn provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+        self.provided_buffers = provided_buffers;
         self
     }
 

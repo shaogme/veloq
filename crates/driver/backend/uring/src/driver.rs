@@ -11,14 +11,14 @@ use std::{
     time::Instant,
 };
 use tracing::{debug, trace};
-use veloq_buf::{BufferRegistrar, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
 use veloq_std::collections::BitSet;
 use veloq_wheel::{Wheel, WheelConfig};
 
 use crate::{
     config::{
-        BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig,
-        UringRawHandle,
+        BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, ProvidedBufConfig, RawHandle,
+        UringConfig, UringRawHandle,
     },
     diagnostics::UringCompletionDiagnostics,
     error::{UringError, UringResult},
@@ -38,11 +38,14 @@ use veloq_driver_core::{
 mod completion;
 mod env;
 mod lifecycle;
+mod provided_buf;
 mod registration;
 mod submission;
 
-pub(crate) use env::SqeEnv;
+pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
+pub(crate) use provided_buf::ProvidedBufGroup;
+pub use provided_buf::ProvidedBufStats;
 pub(crate) use registration::{
     FileTable, MAX_CHUNKS, RegisteredFileEntry, SqeFd, UringRegistrationStats,
 };
@@ -50,8 +53,9 @@ pub(crate) use registration::{
 /// 从 opcode 探测结果得出乐观的能力集合。
 ///
 /// 「乐观」是关键：opcode 在场只说明**可能**支持 multishot 变体，真正的判定推迟到第一次
-/// 提交（见 [`Driver::note_capability_rejected`]）。`provided_buffers` 是唯一能在这里确定
-/// 的一项——`register_buf_ring` 成功与否就是答案，但它属于阶段 2，本阶段恒为 `false`。
+/// 提交（见 [`Driver::note_capability_rejected`]）。`provided_buffers` 不在此列——它不靠
+/// 猜：`register_buf_ring` 成功与否就是答案，而那要等池到位（见
+/// [`Driver::attach_buffer_pool`]），所以这里先记 `false`。
 fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
     DriverCapabilities {
         accept_multi: probe.is_supported(opcode::Accept::CODE),
@@ -174,6 +178,14 @@ pub struct UringDriver<'a> {
     pub(crate) chunk_register_failure_at: Box<[Option<Instant>]>,
     pub(crate) file_table: FileTable,
     pub(crate) capabilities: DriverCapabilities,
+    pub(crate) provided_buf_config: Option<ProvidedBufConfig>,
+    /// 注册好的 provided buffer 环，`None` 表示没开或注册失败。
+    ///
+    /// **必须声明在 `ring` 之后**：内核在 `unregister_buf_ring` 之前仍可能读写这段环内存，
+    /// 而 [`Drop`] 里的反注册要拿 `ring` 的 submitter。这里不靠字段顺序碰运气——反注册是
+    /// [`Drop::drop`] 里显式做的，它在任何字段被析构之前跑完（见
+    /// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.4）。
+    pub(crate) provided_buffers: Option<ProvidedBufGroup>,
 }
 
 impl<'a> UringDriver<'a> {
@@ -253,6 +265,8 @@ impl<'a> UringDriver<'a> {
             chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
             capabilities: probe_capabilities(&ring_probe),
+            provided_buf_config: config.provided_buffers,
+            provided_buffers: None,
         };
 
         driver.submit_waker()?;
@@ -297,6 +311,11 @@ impl<'a> UringDriver<'a> {
         }))
     }
 
+    /// provided buffer 环的运行期统计，`None` 表示这个 driver 没有环。
+    pub fn provided_buf_stats(&self) -> Option<ProvidedBufStats> {
+        self.provided_buffers.as_ref().map(ProvidedBufGroup::stats)
+    }
+
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
         let new_fd = Self::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
         let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
@@ -315,7 +334,14 @@ impl<'a> UringDriver<'a> {
 }
 
 impl<'a> Drop for UringDriver<'a> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // 顺序不能反：先反注册，内核才不会再碰那段环内存和里面的 buffer；然后 `group`
+        // 落地析构，`FixedBuf` 各自回池、映射还给内核。`Drop::drop` 在任何字段析构之前
+        // 跑完，所以这里不依赖字段声明顺序。
+        if let Some(group) = self.provided_buffers.take() {
+            group.release(&self.ring.submitter());
+        }
+    }
 }
 
 impl<'a> Driver for UringDriver<'a> {
@@ -466,6 +492,31 @@ impl<'a> Driver for UringDriver<'a> {
             state: self.waker_state.clone(),
             is_waked: self.is_waked.clone(),
         })
+    }
+
+    /// 用刚建好的 worker 池注册 provided buffer 环。
+    ///
+    /// 注册失败**不是**驱动初始化失败：`IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的
+    /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
+    /// 照旧（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §8）。
+    fn attach_buffer_pool(&mut self, pool: AnyBufPool) -> UringResult<()> {
+        let Some(config) = self.provided_buf_config else {
+            return Ok(());
+        };
+        if self.provided_buffers.is_some() {
+            return Ok(());
+        }
+
+        match ProvidedBufGroup::new(&self.ring.submitter(), config, pool) {
+            Ok(group) => {
+                self.provided_buffers = Some(group);
+                self.capabilities.provided_buffers = true;
+            }
+            Err(report) => {
+                debug!(report = ?report, "provided buffer ring unavailable; continuing without it");
+            }
+        }
+        Ok(())
     }
 
     fn capabilities(&self) -> DriverCapabilities {

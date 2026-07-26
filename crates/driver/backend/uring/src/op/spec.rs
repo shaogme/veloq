@@ -3,14 +3,14 @@ mod net;
 
 use crate::{
     OwnedRawHandle,
-    driver::SqeEnv,
+    driver::{CqeEnv, SqeEnv},
     error::{UringError, UringResult},
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync,
-        FsyncRaw, OpSend, OpVTable, Open, ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy,
-        SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
-        UringKernelOp, UringOpPayload, UringSlotSpec, UringUserPayload, Wakeup, WriteFixed,
-        WriteRaw, payload, submit,
+        FsyncRaw, OpSend, OpVTable, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvProvided,
+        SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
+        UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload, UringSlotSpec, UringUserPayload,
+        Wakeup, WriteFixed, WriteRaw, payload, submit,
     },
 };
 use diagweave::prelude::*;
@@ -81,14 +81,17 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         0
     }
 
-    /// 为一条完成造出它自己的产物。默认 `None` —— 单发操作的产物就是提交 payload 本身。
+    /// 为一条完成造出它自己的记录 payload。默认 `None`——绝大多数操作的记录 payload 就是
+    /// 提交 payload 本身。
     ///
-    /// multishot 操作必须覆盖它：提交 payload 要留在 slot 里给内核后续的完成用。
-    fn multishot_item(
+    /// 需要覆盖它的是两类操作：提交 payload 必须留在 slot 里的（multishot），以及产物在
+    /// 提交时还不存在的（provided buffer）。见 [`RecordItemFn`]。
+    fn record_item(
         _kernel: &mut Self::KernelPayload,
         _payload: &mut Self,
         _result: i32,
         _flags: u32,
+        _env: &mut CqeEnv<'_>,
     ) -> UringResult<Option<UringUserPayload>> {
         Ok(None)
     }
@@ -199,11 +202,12 @@ where
     S::resolve_chunks(kernel, user, chunks)
 }
 
-pub(crate) unsafe fn multishot_item_shim<S>(
+pub(crate) unsafe fn record_item_shim<S>(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
     result: i32,
     flags: u32,
+    env: &mut CqeEnv<'_>,
 ) -> UringResult<Option<UringUserPayload>>
 where
     S: UringOpErasure,
@@ -214,12 +218,12 @@ where
     let Some(user) = S::user_payload_mut(payload) else {
         return Ok(None);
     };
-    S::multishot_item(kernel, user, result, flags)
+    S::record_item(kernel, user, result, flags, env)
 }
 
 macro_rules! impl_uring_op_erasure {
-    // 只生成擦除层。multishot 操作用这一支：它的提交 payload 与记录 payload 不是同一个
-    // 类型，`IntoPlatformOp` 得手写。
+    // 只生成擦除层。提交 payload 与记录 payload 不是同一个类型的操作用这一支，
+    // `IntoPlatformOp` 得手写。
     (@erasure_only $OpType:ty, $user_variant:ident, $kernel_variant:ident) => {
         impl_uring_op_erasure!(@erasure $OpType, $user_variant, $kernel_variant);
     };
@@ -286,7 +290,7 @@ macro_rules! impl_uring_op_erasure {
                     strategy: <$OpType as UringOpSpec>::STRATEGY,
                     get_timeout: get_timeout_shim::<$OpType>,
                     resolve_chunks: resolve_chunks_shim::<$OpType>,
-                    multishot_item: multishot_item_shim::<$OpType>,
+                    record_item: record_item_shim::<$OpType>,
                 };
                 &TABLE
             }
@@ -395,6 +399,7 @@ impl_uring_op_erasure!(ReadRaw, ReadRaw, ReadRaw, usize);
 impl_uring_op_erasure!(WriteFixed, WriteFixed, Write, usize);
 impl_uring_op_erasure!(WriteRaw, WriteRaw, WriteRaw, usize);
 impl_uring_op_erasure!(Recv, Recv, Recv, usize);
+impl_uring_op_erasure!(@erasure_only RecvProvided, RecvProvided, RecvProvided);
 impl_uring_op_erasure!(OpSend, OpSend, Send, usize);
 impl_uring_op_erasure!(UdpRecv, UdpRecv, UdpRecv, usize);
 impl_uring_op_erasure!(UdpSend, UdpSend, UdpSend, usize);
@@ -410,7 +415,7 @@ impl_uring_op_erasure!(FallocateRaw, FallocateRaw, FallocateRaw, usize);
 impl_uring_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
 impl_uring_op_erasure!(@erasure_only AcceptMulti, AcceptMulti, AcceptMulti);
 
-/// 仓库里**唯一**提交 payload 与记录 payload 不同的操作。
+/// 提交 payload 与记录 payload 不同的操作之一（另一个是 [`RecvProvided`]）。
 ///
 /// slot 里始终是 `AcceptMulti { fd }`（监听 socket，内核还要拿它继续 accept），而每条完成
 /// 的记录里是一个 [`AcceptedSocket`]——新连接的 fd 走 `Completion`。因此它不实现
@@ -464,6 +469,65 @@ impl IntoPlatformOp<UringSlotSpec> for AcceptMulti {
         OpResult::ResourceLost(OpError::new(LostReason::Other, report))
     }
 }
+
+/// 单发，但提交 payload 与记录 payload 仍然不同——**因为产物在提交时还不存在**。
+///
+/// slot 里是 `RecvProvided { fd }`，记录里是内核在数据到达时才从环里挑出来的那个
+/// [`ProvidedBuf`]。这正是 `SubmitPayload` / `RecordPayload` 拆开之后多出来的表达力：
+/// 「多条完成」与「产物不是提交物」原本被 multishot 这一个词捆在一起，其实是两件事。
+///
+/// 它**是** [`SingleShotOp`]：一次提交一条完成，`await` 得到的就是那一条。
+impl IntoPlatformOp<UringSlotSpec> for RecvProvided {
+    type SubmitPayload = RecvProvided;
+    type RecordPayload = ProvidedBuf;
+    type Output = ProvidedBuf;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = <RecvProvided as UringOpSpec>::PAYLOAD_KIND;
+
+    fn into_kernel_and_payload(self) -> (UringKernelOp, Self::SubmitPayload) {
+        let kernel_payload = <RecvProvided as UringOpSpec>::new_kernel_payload(&self);
+        let op = UringKernelOp {
+            vtable: <RecvProvided as UringOpErasure>::vtable(),
+            payload: <RecvProvided as UringOpErasure>::erase_kernel_payload(kernel_payload),
+        };
+        (op, self)
+    }
+
+    fn payload_into_erased(payload: Self::SubmitPayload) -> UringUserPayload {
+        <RecvProvided as UringOpErasure>::erase_user_payload(payload)
+    }
+
+    fn try_record_from_erased(erased: UringUserPayload) -> UringResult<Self::RecordPayload> {
+        match erased {
+            UringUserPayload::ProvidedBuf(item) => Ok(item),
+            _ => Err(payload_projection_mismatch_report::<UringError>(
+                "ProvidedBuf",
+                "UringUserPayload",
+            )),
+        }
+    }
+
+    fn complete(
+        payload: Self::RecordPayload,
+        res: UringResult<usize>,
+    ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
+        OpCompletion::new(res, payload)
+    }
+
+    /// 提交同步失败：slot 里躺着的是 `RecvProvided { fd }`，不是任何 buffer——用户没交出
+    /// 过东西，也没有产物可还。默认实现会把它当记录 payload 去投影，那必然失败。
+    fn submit_failed(
+        erased: UringUserPayload,
+        report: Report<UringError>,
+    ) -> OpResult<Self::Output, UringError, Self::Completion> {
+        drop(erased);
+        OpResult::ResourceLost(OpError::new(LostReason::Other, report))
+    }
+}
+
+impl SingleShotOp<UringSlotSpec> for RecvProvided {}
+
 impl_uring_op_erasure!(SendTo, SendTo, SendTo, usize);
 impl_uring_op_erasure!(UdpRecvFrom, UdpRecvFrom, UdpRecvFrom, usize);
 impl_uring_op_erasure!(Open, Open, Open, OwnedRawHandle);

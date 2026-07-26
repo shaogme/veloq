@@ -1,12 +1,12 @@
 pub(crate) use veloq_driver_core::op::types::{
     Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, AcceptedSocket, Close as CoreClose,
     Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
-    Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open, ReadFixed as CoreReadFixed,
-    ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend, SendTo as CoreSendTo,
-    SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw, Timeout,
-    UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
-    UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
-    WriteRaw as CoreWriteRaw,
+    Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open, ProvidedBuf, ReadFixed as CoreReadFixed,
+    ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvProvided as CoreRecvProvided, Send as CoreSend,
+    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
+    SyncFileRangeRaw as CoreSyncFileRangeRaw, Timeout, UdpConnect as CoreUdpConnect,
+    UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend,
+    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
 };
 
 use crate::config::{SockAddrStorage, UringRawHandle};
@@ -18,6 +18,7 @@ pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
 pub(crate) type WriteFixed = CoreWriteFixed<UringRawHandle>;
 pub(crate) type WriteRaw = CoreWriteRaw<UringRawHandle>;
 pub(crate) type Recv = CoreRecv<UringRawHandle>;
+pub(crate) type RecvProvided = CoreRecvProvided<UringRawHandle>;
 pub(crate) type OpSend = CoreSend<UringRawHandle>;
 pub(crate) type UdpRecv = CoreUdpRecv<UringRawHandle>;
 pub(crate) type UdpSend = CoreUdpSend<UringRawHandle>;
@@ -42,6 +43,11 @@ pub enum UringUserPayload {
     WriteFixed(WriteFixed),
     WriteRaw(WriteRaw),
     Recv(Recv),
+    /// provided-buffer recv 的**提交** payload：提交时还没有 buffer 可言。
+    RecvProvided(RecvProvided),
+    /// provided-buffer recv **每条完成**的产物：内核在数据到达时才从环里挑出来的那个
+    /// buffer（`None` 表示这条完成一个 buffer 都没消费，例如 `-ENOBUFS`）。
+    ProvidedBuf(ProvidedBuf),
     OpSend(OpSend),
     UdpRecv(UdpRecv),
     UdpSend(UdpSend),
@@ -180,6 +186,7 @@ pub(crate) enum UringOpPayload {
     Write(KernelRef<WriteFixed>),
     WriteRaw(KernelRef<WriteRaw>),
     Recv(KernelRef<Recv>),
+    RecvProvided(KernelRef<RecvProvided>),
     Send(KernelRef<OpSend>),
     UdpRecv(KernelRef<UdpRecv>),
     UdpSend(KernelRef<UdpSend>),

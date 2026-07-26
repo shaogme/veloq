@@ -1,11 +1,16 @@
 use std::num::NonZeroU32;
 
 #[cfg(windows)]
+use std::num::{NonZeroU16, NonZeroUsize};
+
+#[cfg(windows)]
 pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
 use veloq_std::nz;
 
 #[cfg(not(windows))]
-pub use veloq_driver_uring::{BufferRegistrationMode, FileTableExhaustion, IoMode, UringConfig};
+pub use veloq_driver_uring::{
+    BufferRegistrationMode, FileTableExhaustion, IoMode, ProvidedBufConfig, UringConfig,
+};
 
 /// I/O submission mode.
 #[cfg(windows)]
@@ -58,6 +63,33 @@ pub enum FileTableExhaustion {
     Fail,
 }
 
+/// Shape of the provided-buffer ring (Shim for Windows platform).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvidedBufConfig {
+    /// Number of ring entries.
+    pub entries: NonZeroU16,
+    /// Capacity of each buffer.
+    pub buf_size: NonZeroUsize,
+}
+
+#[cfg(windows)]
+impl ProvidedBufConfig {
+    pub fn new(entries: NonZeroU16, buf_size: NonZeroUsize) -> Self {
+        Self { entries, buf_size }
+    }
+}
+
+#[cfg(windows)]
+impl Default for ProvidedBufConfig {
+    fn default() -> Self {
+        Self {
+            entries: nz!(256u16),
+            buf_size: nz!(4096),
+        }
+    }
+}
+
 /// Configuration for the io_uring driver (Shim for Windows platform).
 #[cfg(windows)]
 #[derive(Debug, Clone)]
@@ -68,6 +100,8 @@ pub struct UringConfig {
     pub entries: NonZeroU32,
     /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
+    /// Provided-buffer ring to register, or `None` to run without one.
+    pub provided_buffers: Option<ProvidedBufConfig>,
     /// Size of the kernel's registered file table, independent of `entries`.
     pub file_table_capacity: u32,
     /// Behaviour once `file_table_capacity` entries are in use.
@@ -79,6 +113,12 @@ impl UringConfig {
     /// Sets the registration mode.
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
+        self
+    }
+
+    /// Sets the provided-buffer ring.
+    pub fn provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+        self.provided_buffers = provided_buffers;
         self
     }
 
@@ -102,6 +142,7 @@ impl Default for UringConfig {
             mode: IoMode::Interrupt,
             entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
+            provided_buffers: None,
             file_table_capacity: 1024,
             file_table_exhaustion: FileTableExhaustion::Fallback,
         }

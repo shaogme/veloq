@@ -24,6 +24,8 @@ pub enum OpKind {
     UdpConnect = 18,
     AcceptMulti = 19,
     AcceptedSocket = 20,
+    RecvProvided = 21,
+    ProvidedBuf = 22,
 }
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
@@ -172,6 +174,26 @@ pub struct AcceptMulti<H: Handle> {
 /// (from the CQE's result), and the peer address has to be recovered with `getpeername`
 /// afterwards — see `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2.
 pub struct AcceptedSocket;
+
+/// Receive from a socket into a buffer the kernel picks out of the driver's provided-buffer
+/// ring.
+///
+/// Deliberately carries no buffer: with `IOSQE_BUFFER_SELECT` the buffer is bound to the
+/// connection only once data actually arrives, which is the entire point of provided buffers —
+/// ten thousand idle connections no longer pin ten thousand receive buffers. See
+/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.1.
+pub struct RecvProvided<H: Handle> {
+    pub fd: IoFd<H>,
+}
+
+/// The buffer one provided-buffer completion hands over.
+///
+/// `None` means the kernel consumed no buffer for this completion — either the ring was empty
+/// (`-ENOBUFS`) or the operation failed before a buffer was selected. That is a real state of
+/// a real completion, not a placeholder waiting to be filled in.
+pub struct ProvidedBuf {
+    pub buf: Option<FixedBuf>,
+}
 
 /// Send data to a specific address (UDP).
 pub struct SendTo<H: Handle> {

@@ -7,6 +7,12 @@ set! {
 
         #[display("Accept completed without remote address")]
         AcceptMissingRemoteAddr,
+
+        #[display("provided buffers are not available on this runtime")]
+        ProvidedBuffersUnavailable,
+
+        #[display("a provided-buffer recv completed without a buffer")]
+        ProvidedBufferMissing,
     }
 
     pub UdpError = {

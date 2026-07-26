@@ -579,3 +579,116 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
         clients.join().expect("client thread panicked");
     });
 }
+
+/// 用一个开了 provided buffer 的运行时跑 `f`。
+///
+/// 默认是关的：环按 worker 占住 `entries * buf_size` 的池内存，不该让没用到它的程序白付。
+#[cfg(target_os = "linux")]
+fn run_test_with_provided_buffers<F, R>(f: F) -> R
+where
+    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+{
+    use veloq::config::ProvidedBufConfig;
+
+    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+        .worker_count(Some(nz!(1)))
+        .with_config(|config| config.uring_provided_buffers(Some(ProvidedBufConfig::default())))
+        .scope(f)
+        .expect("failed to run scope")
+}
+
+/// `recv_provided` 收到的是内核挑的 buffer，调用方一个字节都不用先交出去。
+///
+/// 这正是 provided buffer 的收益所在：连接空闲时不占接收缓冲，数据到了才绑一个。所以这条
+/// 用例特意在**连接建立之后、数据发出之前**就把 recv 挂上去。
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
+    const ROUNDS: usize = 8;
+
+    run_test_with_provided_buffers(async |ctx| {
+        use veloq_driver_native::driver::Driver;
+
+        // `IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的最低内核是 5.6。
+        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
+            eprintln!("skipping: kernel has no provided buffer ring");
+            return;
+        }
+
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let (stream, _peer) = listener.accept().await.expect("Accept failed");
+                for round in 0..ROUNDS {
+                    let buf = stream
+                        .recv_provided()
+                        .await
+                        .unwrap_or_else(|e| panic!("recv_provided round {round} failed: {e}"));
+                    assert_eq!(
+                        buf.as_slice(),
+                        format!("round-{round}").as_bytes(),
+                        "round {round} content"
+                    );
+                }
+            });
+
+            s.spawn_boxed(async move {
+                let stream = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+                for round in 0..ROUNDS {
+                    let payload = format!("round-{round}");
+                    let mut buf = ctx.alloc(nz!(64));
+                    buf.as_slice_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
+                    buf.set_len(payload.len());
+                    let (written, _buf) = stream.send(buf).await.expect("send failed");
+                    assert_eq!(written, payload.len());
+                    // 一次一条，别让内核把两轮的数据合成一个 buffer 交上来。
+                    yield_now().await;
+                }
+            });
+        })
+        .await
+        .unwrap();
+    });
+}
+
+/// 没开这项能力时 `recv_provided` 明确报错，而不是悄悄退回普通 recv。
+///
+/// 退回去是错的：调用方没有交出 buffer，「悄悄换一条路」意味着运行时得凭空造一个，那就把
+/// 这个 API 唯一的卖点丢掉了，还让配置项看起来无所谓。这条用例在两个平台上都跑——IOCP
+/// 恒无此能力，走的是同一个出口。
+#[test]
+fn recv_provided_reports_a_runtime_without_provided_buffers() {
+    run_test(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let (stream, _peer) = listener.accept().await.expect("Accept failed");
+                let err = stream
+                    .recv_provided()
+                    .await
+                    .expect_err("a runtime without provided buffers must refuse");
+                assert!(
+                    format!("{err}").contains("provided buffers are not available"),
+                    "unexpected error: {err}"
+                );
+            });
+
+            s.spawn_boxed(async move {
+                let stream = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+                // 撑到服务端问完为止，否则连接先断、错误就变成别的了。
+                yield_now().await;
+                drop(stream);
+            });
+        })
+        .await
+        .unwrap();
+    });
+}

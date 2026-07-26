@@ -9,33 +9,57 @@
 use crate::{
     config::BufferRegistrationMode,
     driver::{
-        FileTable, MAX_CHUNKS, UringDriver, UringRegistrationStats,
+        FileTable, MAX_CHUNKS, UringDriver, UringRegistrationStats, provided_buf::ProvidedBufGroup,
         registration::REGISTER_FAILURE_RETRY_COOLDOWN,
     },
     error::{UringError, UringResult},
     op::UringOpRegistry,
 };
 use diagweave::prelude::*;
-use io_uring::{IoUring, squeue};
+use io_uring::{IoUring, cqueue, squeue};
 use std::time::Instant;
 use tracing::{debug, trace};
-use veloq_buf::{BufferRegistrar, heap::ChunkId};
+use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
 use veloq_driver_core::driver::OpToken;
 use veloq_std::collections::BitSet;
 use veloq_wheel::Wheel;
 
+/// What a `IOSQE_BUFFER_SELECT` submission needs to know about the provided-buffer ring.
+///
+/// A `Copy` snapshot rather than a borrow of the group: `make_sqe` only reads these two
+/// numbers, and copying them leaves the group itself free for the completion path to mutate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProvidedBufSqeInfo {
+    bgid: u16,
+    buf_size: u32,
+}
+
 /// The driver state a `make_sqe` implementation is allowed to consult.
 ///
 /// `make_sqe` runs with the slot's op and payload borrowed mutably out of
-/// [`UringDriver::ops`], so it must not be able to reach `ops` itself. These two fields are
-/// disjoint from it and are handed out immutably: lazy chunk registration happens *after*
-/// `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
+/// [`UringDriver::ops`], so it must not be able to reach `ops` itself. These fields are
+/// disjoint from it and are handed out by value or immutably: lazy chunk registration happens
+/// *after* `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
 pub(crate) struct SqeEnv<'d> {
     pub(crate) file_table: &'d FileTable,
     registered_chunks: &'d BitSet,
+    provided: Option<ProvidedBufSqeInfo>,
 }
 
 impl SqeEnv<'_> {
+    /// The buffer group an `IOSQE_BUFFER_SELECT` submission should draw from, together with the
+    /// size every buffer in it has.
+    #[inline]
+    pub(crate) fn provided_buf_info(&self, scope: &'static str) -> UringResult<(u16, u32)> {
+        let info = self.provided.ok_or_else(|| {
+            UringError::Unsupported
+                .to_report()
+                .push_ctx("scope", scope)
+                .attach_note("driver has no provided buffer ring registered")
+        })?;
+        Ok((info.bgid, info.buf_size))
+    }
+
     /// Whether `chunk` is already in the kernel's fixed-buffer table.
     ///
     /// An out-of-range id answers `false`, which simply selects the non-fixed opcode — the
@@ -45,6 +69,63 @@ impl SqeEnv<'_> {
         self.registered_chunks
             .get(chunk.as_usize())
             .unwrap_or(false)
+    }
+}
+
+/// The driver state a completion is allowed to reach.
+///
+/// Mirrors [`SqeEnv`] on the other end of an operation. The completion path holds a slot
+/// borrowed out of [`UringDriver::ops`] while it builds the record, so it cannot be handed the
+/// whole driver either — but unlike submission it does need to *mutate* something: a CQE that
+/// carries a buffer id has consumed a ring entry, and that entry has to be settled before the
+/// record leaves this function. See `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.
+pub(crate) struct CqeEnv<'d> {
+    provided: Option<&'d mut ProvidedBufGroup>,
+}
+
+impl<'d> CqeEnv<'d> {
+    #[inline]
+    pub(crate) fn new(provided: Option<&'d mut ProvidedBufGroup>) -> Self {
+        Self { provided }
+    }
+
+    /// Takes the buffer this CQE selected and refills its slot in the ring.
+    ///
+    /// `Ok(None)` means the completion selected no buffer at all — `-ENOBUFS`, or an operation
+    /// that never asked for one. A CQE that *does* carry a buffer id while this driver has no
+    /// ring registered is an error rather than a `None`: the kernel cannot have picked from a
+    /// group that does not exist, so silently dropping it would hide a real bug.
+    pub(crate) fn take_provided_buf(
+        &mut self,
+        flags: u32,
+        res: i32,
+    ) -> UringResult<Option<FixedBuf>> {
+        match self.provided.as_deref_mut() {
+            Some(group) => Ok(group.take_selected(flags, res)),
+            None if cqueue::buffer_select(flags).is_some() => UringError::InvalidState
+                .push_ctx("scope", "uring.driver.cqe_env.take_provided_buf")
+                .with_ctx("cqe_flags", flags)
+                .attach_note("completion selected a provided buffer but no ring is registered"),
+            None => Ok(None),
+        }
+    }
+
+    /// Hands the buffer this CQE selected straight back to the ring.
+    ///
+    /// For completions that are being discarded (cancelled, orphaned, stale token). Skipping it
+    /// leaks one buffer id per discarded completion — "cancellation is not termination" in its
+    /// provided-buffer form.
+    pub(crate) fn return_provided_buf(&mut self, flags: u32) {
+        if let Some(group) = self.provided.as_deref_mut() {
+            group.return_selected(flags);
+        }
+    }
+
+    /// Records that the kernel found the ring empty.
+    pub(crate) fn note_exhausted(&mut self) {
+        if let Some(group) = self.provided.as_deref_mut() {
+            group.note_exhausted();
+        }
     }
 }
 
@@ -62,6 +143,7 @@ pub(crate) struct SubmitEnv<'d, 'r> {
     registration_stats: &'d mut UringRegistrationStats,
     registration_mode: BufferRegistrationMode,
     chunk_register_failure_at: &'d mut [Option<Instant>],
+    provided: Option<ProvidedBufSqeInfo>,
 }
 
 impl SubmitEnv<'_, '_> {
@@ -71,6 +153,7 @@ impl SubmitEnv<'_, '_> {
         SqeEnv {
             file_table: self.file_table,
             registered_chunks: self.registered_chunks,
+            provided: self.provided,
         }
     }
 
@@ -236,6 +319,13 @@ impl<'a> UringDriver<'a> {
                 registration_stats: &mut self.registration_stats,
                 registration_mode: self.registration_mode,
                 chunk_register_failure_at: &mut self.chunk_register_failure_at,
+                provided: self.provided_buffers.as_ref().map(|group| {
+                    ProvidedBufSqeInfo {
+                        bgid: group.bgid(),
+                        // 环里的 buffer 尺寸统一，且远小于 u32::MAX。
+                        buf_size: group.buf_size().get() as u32,
+                    }
+                }),
             },
         )
     }

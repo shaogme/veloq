@@ -12,7 +12,7 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     config::IoFd,
     diagnostics::UringCompletionDiagnostics,
-    driver::{PendingCancel, UringDriver},
+    driver::{CqeEnv, PendingCancel, ProvidedBufGroup, UringDriver},
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{Slot, UringSlotSpec, UringUserPayload},
 };
@@ -95,6 +95,7 @@ struct UringCompletionHooks<'a> {
     waker_buf_len: usize,
     waker_armed: &'a mut bool,
     is_waked: &'a AtomicBool,
+    provided_buffers: Option<&'a mut ProvidedBufGroup>,
     synthetic: UringSyntheticCompletion,
     post: UringPostCompletionEffects,
 }
@@ -106,6 +107,7 @@ impl<'a> UringCompletionHooks<'a> {
         waker_buf_len: usize,
         waker_armed: &'a mut bool,
         is_waked: &'a AtomicBool,
+        provided_buffers: Option<&'a mut ProvidedBufGroup>,
         synthetic: UringSyntheticCompletion,
     ) -> Self {
         Self {
@@ -114,6 +116,7 @@ impl<'a> UringCompletionHooks<'a> {
             waker_buf_len,
             waker_armed,
             is_waked,
+            provided_buffers,
             synthetic,
             post: UringPostCompletionEffects::default(),
         }
@@ -121,6 +124,11 @@ impl<'a> UringCompletionHooks<'a> {
 
     fn into_post_effects(self) -> UringPostCompletionEffects {
         self.post
+    }
+
+    #[inline]
+    fn cqe_env(&mut self) -> CqeEnv<'_> {
+        CqeEnv::new(self.provided_buffers.as_deref_mut())
     }
 
     fn handle_waker_control(&mut self, raw: RawCompletion) -> UringBackendEffect {
@@ -249,9 +257,32 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                 )
             }
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
-                complete_kernel_waiting_slot(slot, event.token(), event.raw())
+                let raw = event.raw();
+                if raw.res == -libc::ENOBUFS {
+                    self.cqe_env().note_exhausted();
+                }
+                complete_kernel_waiting_slot(slot, event.token(), raw, &mut self.cqe_env())
             }
         }
+    }
+
+    /// 一条完成落到了不存在 / 已陈旧的 slot 上。
+    ///
+    /// 记录本身没什么可救的，但它可能带着一个 provided buffer——那个 bid 已经被内核从环里
+    /// 取走，不还就是永久少一个。core 的默认实现只记异常，所以这里必须覆盖。
+    fn complete_corrupt(
+        &mut self,
+        event: UserCompletionEvent,
+        kind: CompletionAnomalyKind,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
+        let flags = event.raw().flags;
+        self.cqe_env().return_provided_buf(flags);
+        Ok(CompletionHookOutcome::Anomaly {
+            kind,
+            attach: AnomalyAttach::from_raw_completion(event.raw()),
+            effect: UringBackendEffect::None,
+        })
     }
 
     fn complete_orphaned(
@@ -268,6 +299,9 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
             | CompletionSource::User
             | CompletionSource::Backend(_) => event.raw().res,
         };
+        // 这条完成要被丢弃，但内核已经从环里取走了它选中的 buffer——不还回去就是每次取消
+        // 泄漏一个 bid。「取消不等于结束」在 provided buffer 上的具体形态。
+        self.cqe_env().return_provided_buf(event.raw().flags);
         // 一个已放弃的 multishot 会继续投递完成，每一条都要跑 cleanup（accept 的话就是
         // 关掉那个内核已经建好的连接），但只有终态那条才能归还 slot。
         let continuation = if io_uring::cqueue::more(event.raw().flags) {
@@ -495,6 +529,7 @@ impl<'a> UringDriver<'a> {
             self.waker_buf.len(),
             &mut self.waker_armed,
             &self.is_waked,
+            self.provided_buffers.as_mut(),
             synthetic,
         );
         let outcome = self.ops.accept_completion(
@@ -589,6 +624,7 @@ fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
     raw: RawCompletion,
+    cqe_env: &mut CqeEnv<'_>,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
     // core 只见 `CompletionContinuation`（见 `DRIVER_REVIEW.md` §4.2(a)）。
@@ -601,7 +637,7 @@ fn complete_kernel_waiting_slot(
     let (final_res, cleanup, item) = match slot.with_op_and_payload_mut(|op, payload| {
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
         let cleanup = op.completion_cleanup(raw.res);
-        let item = unsafe { (op.vtable.multishot_item)(op, payload, raw.res, raw.flags) };
+        let item = unsafe { (op.vtable.record_item)(op, payload, raw.res, raw.flags, cqe_env) };
         (final_res, cleanup, item)
     }) {
         Ok(result) => result,
@@ -843,6 +879,7 @@ mod tests {
             8,
             waker_armed,
             is_waked,
+            None,
             UringSyntheticCompletion::None,
         )
     }

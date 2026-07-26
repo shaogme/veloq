@@ -10,18 +10,18 @@ use veloq_driver_core::{
         Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, Close as CoreClose,
         Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
         Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, ReadFixed as CoreReadFixed,
-        ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend, SendTo as CoreSendTo,
-        SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
-        UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
-        UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
-        WriteRaw as CoreWriteRaw,
+        ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvProvided as CoreRecvProvided,
+        Send as CoreSend, SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
+        SyncFileRangeRaw as CoreSyncFileRangeRaw, UdpConnect as CoreUdpConnect,
+        UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend,
+        Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
     },
 };
 pub use veloq_driver_core::{
     op::{
         DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
         OpItem, OpKind, OpResult, OpSubmitter as CoreOpSubmitter, SingleShotOp,
-        types::{AcceptedSocket, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
+        types::{AcceptedSocket, Open, ProvidedBuf, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
     },
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
 };
@@ -45,6 +45,9 @@ pub type ReadRaw = CoreReadRaw<PlatformRawHandle>;
 pub type WriteFixed = CoreWriteFixed<PlatformRawHandle>;
 pub type WriteRaw = CoreWriteRaw<PlatformRawHandle>;
 pub type Recv = CoreRecv<PlatformRawHandle>;
+/// Only the io_uring backend implements this operation — IOCP has no provided buffers, so its
+/// `capabilities().provided_buffers` is always `false` and nothing ever submits one.
+pub type RecvProvided = CoreRecvProvided<PlatformRawHandle>;
 pub type Send = CoreSend<PlatformRawHandle>;
 pub type UdpRecv = CoreUdpRecv<PlatformRawHandle>;
 pub type UdpSend = CoreUdpSend<PlatformRawHandle>;

@@ -210,6 +210,14 @@ impl<T: PoolTopology> Runtime<T> {
                         .expect("failed to build worker buffer pool")
                 };
 
+                // 池只能在这里交给驱动，不能作为构造参数：池是**从**驱动建起来的（上面那个
+                // registrar 要拿驱动去注册 chunk）。目前唯一用得上它的是 io_uring 的
+                // provided buffer 环，它得自己持有一批 `FixedBuf`。
+                driver_cell
+                    .borrow_mut()
+                    .attach_buffer_pool(buf_pool.clone())
+                    .expect("failed to attach the worker buffer pool to the driver");
+
                 WorkerState {
                     driver: driver_cell,
                     buf_pool,

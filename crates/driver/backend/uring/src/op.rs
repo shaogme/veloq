@@ -2,7 +2,7 @@
 
 use crate::{
     diagnostics::UringCompletionDiagnostics,
-    driver::{SqeEnv, UringOpState},
+    driver::{CqeEnv, SqeEnv, UringOpState},
     error::{UringError, UringResult},
 };
 use io_uring::squeue;
@@ -24,8 +24,9 @@ pub(crate) use payload::UringOpPayload;
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
     Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
-    OpSend, Open, ReadFixed, ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout,
-    UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
+    OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvProvided, SendTo, SyncFileRange,
+    SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed,
+    WriteRaw,
 };
 pub(crate) use submit::sqe_with_fd;
 
@@ -58,16 +59,23 @@ pub(crate) type GetTimeoutFn =
 pub(crate) type ResolveChunksFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [ChunkId]) -> usize;
 
-/// 为一条完成构造它自己的产物（item）。
+/// 为一条完成构造它自己的记录 payload。
 ///
-/// 返回 `None` 表示这个操作是单发的——完成的产物就是 slot 里那个提交 payload，完成路径
-/// 照旧把它取走。返回 `Some` 表示这是 multishot：提交 payload 必须留在 slot 里（内核还
-/// 会用），记录里携带的是这里新造的东西。
-pub(crate) type MultishotItemFn = unsafe fn(
+/// 返回 `None` 表示这个操作的记录 payload **就是**提交 payload——绝大多数操作如此，完成
+/// 路径照旧把 slot 里那个取走。返回 `Some` 表示两者不是一回事：
+///
+/// - multishot（`AcceptMulti`）：提交 payload 是监听 socket，必须留在 slot 里给内核后续
+///   的完成用，每条完成的产物是一个新连接；
+/// - provided buffer（`RecvProvided`）：提交时根本没有 buffer，它由内核在数据到达时才从
+///   环里挑一个，所以产物只能在这里构造。
+///
+/// `env` 就是为后一种情形存在的：从环里取 buffer 要改 driver 的状态。
+pub(crate) type RecordItemFn = unsafe fn(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
     result: i32,
     flags: u32,
+    env: &mut CqeEnv<'_>,
 ) -> UringResult<Option<UringUserPayload>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +94,7 @@ pub(crate) struct OpVTable {
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,
     pub(crate) resolve_chunks: ResolveChunksFn,
-    pub(crate) multishot_item: MultishotItemFn,
+    pub(crate) record_item: RecordItemFn,
 }
 
 // ============================================================================
