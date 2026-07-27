@@ -264,6 +264,17 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         unsafe { header.register_completion(node, cx.waker()) };
         Ok(())
     }
+
+    fn remove_waker_on<St: Storage>(
+        waker_node: &mut Option<GenericWakerNode<St>>,
+        header: &GenericTaskHeader<St>,
+    ) {
+        if let Some(node) = waker_node.as_mut() {
+            let node_ptr = NonNull::from(&mut *node);
+            unsafe { header.remove_waker(node_ptr) };
+        }
+        *waker_node = None;
+    }
 }
 
 impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
@@ -285,10 +296,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
             JoinSource::Direct { task, gate, .. } => {
                 let header = task.header();
                 if header.is_completed() {
-                    if let Some(mut node) = this.waker_node.take() {
-                        let node_ptr = NonNull::from(&mut node);
-                        unsafe { header.remove_waker(node_ptr) };
-                    }
+                    Self::remove_waker_on(&mut this.waker_node, header);
                     let Some(res) = gate.take_result_erased() else {
                         // 任务在入队失败后被 `abandon_before_enqueue` 终结：没有结果，
                         // 但状态是可判别的取消（RUNTIME_REVIEW §4.4）。
@@ -322,10 +330,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 if let Some(res) = resolved {
                     let header = res.task.header();
                     if header.is_completed() {
-                        if let Some(mut node) = this.waker_node.take() {
-                            let node_ptr = NonNull::from(&mut node);
-                            unsafe { header.remove_waker(node_ptr) };
-                        }
+                        Self::remove_waker_on(&mut this.waker_node, header);
                         let Some(access) = res.access.take() else {
                             return Poll::Ready(JoinOutcome::RuntimeErr(
                                 RuntimeError::InvariantViolation {
