@@ -12,8 +12,8 @@ use crate::{
     driver::{
         AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomalyKind,
         CompletionAnomalyReason, CompletionContinuation, CompletionRecord, CompletionToken,
-        CompletionValue, Driver, DriverSubmitResult, OpToken, PollRecordResult, RemoteCancelSender,
-        RemoteWaker, SharedCompletionTable, SubmitStatus,
+        CompletionValue, Driver, DriverRaw, DriverSubmitResult, OpToken, PollRecordResult,
+        RemoteCancelSender, RemoteWaker, SharedCompletionTable, SubmitStatus,
     },
     op::{DriverProvider, IntoPlatformOp, Op, SingleShotOp},
     slot::{SlotError, SlotPayload, SlotSpec},
@@ -734,9 +734,9 @@ impl Default for DetachedSubmitter {
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
     type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send> =
-        DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
+        DetachedOp<T, <P::Driver<'a> as DriverRaw>::SlotSpec>;
     type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> =
-        DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
+        DetachedOp<T, <P::Driver<'a> as DriverRaw>::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where

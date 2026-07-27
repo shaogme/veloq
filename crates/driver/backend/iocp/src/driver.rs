@@ -32,9 +32,10 @@ use crate::{
 
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::{
-    CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
-    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus, registry::OpEntry,
+    CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome,
+    DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
+    registry::OpEntry, sealed,
 };
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -133,7 +134,9 @@ impl<'a> IocpDriver<'a> {
     }
 }
 
-impl<'a> Driver for IocpDriver<'a> {
+impl<'a> sealed::Sealed for IocpDriver<'a> {}
+
+impl<'a> DriverRaw for IocpDriver<'a> {
     type SlotSpec = IocpSlotSpec;
     type Raw = IocpHandle;
 
@@ -155,11 +158,11 @@ impl<'a> Driver for IocpDriver<'a> {
         })
     }
 
-    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
+    fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
         self.ops.shared.clone()
     }
 
-    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+    fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
         self.remote_cancel_sender.clone()
     }
 
@@ -242,7 +245,7 @@ impl<'a> Driver for IocpDriver<'a> {
         )
     }
 
-    fn drive(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {
+    fn drive_raw(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {
         self.drain_deferred_socket_cleanup();
 
         match mode {
@@ -278,32 +281,32 @@ impl<'a> Driver for IocpDriver<'a> {
         })
     }
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
+    fn completion_table_raw(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.completion.completion_table()
     }
 
-    fn cancel_op(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
+    fn cancel_op_raw(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpResult<()> {
+    fn register_chunk_raw(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len)
             .push_ctx("scope", "iocp/driver")
             .attach_note("register chunk failed")
     }
 
-    fn register_files<'f>(
+    fn register_files_raw<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, IocpHandle>>,
     ) -> IocpResult<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
+    fn unregister_files_raw(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
         IocpDriver::unregister_files(self, files)
     }
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
+    fn create_waker_raw(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         IocpDriver::create_waker(self)
     }
 }

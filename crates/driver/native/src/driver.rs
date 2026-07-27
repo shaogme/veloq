@@ -4,7 +4,7 @@ pub mod slot {
 
 pub use veloq_driver_core::driver::{
     ContextDriverProvider, DriveMode, DriveOutcome, Driver, DriverCapabilities, DriverCapability,
-    RegisterFd, RemoteWaker, RuntimeContextDriver,
+    DriverRaw, RegisterFd, RemoteWaker, RuntimeContextDriver,
 };
 
 #[cfg(target_os = "linux")]

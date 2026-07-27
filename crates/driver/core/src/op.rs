@@ -10,14 +10,14 @@ use tracing::trace;
 
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
-    driver::{Driver, DriverSubmitResult, SubmitStatus},
+    driver::{Driver, DriverRaw, DriverSubmitResult, SubmitStatus},
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload, SlotSpec},
 };
 use diagweave::prelude::*;
 
 pub trait DriverProvider: Clone + Unpin {
     type SlotSpec: SlotSpec;
-    type Driver<'a>: Driver<SlotSpec = Self::SlotSpec>
+    type Driver<'a>: Driver + DriverRaw<SlotSpec = Self::SlotSpec>
     where
         Self: 'a;
 
@@ -126,9 +126,9 @@ impl<T> Op<T> {
     /// （[`futures_core::Stream`]）——「一条还是多条」由 slot 层的
     /// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定，提交路径
     /// 对两者完全相同。
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::SlotSpec>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, <D as DriverRaw>::SlotSpec>
     where
-        T: IntoPlatformOp<D::SlotSpec> + Send,
+        T: IntoPlatformOp<<D as DriverRaw>::SlotSpec> + Send,
         D: Driver,
     {
         let data = self.data;

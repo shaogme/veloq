@@ -6,11 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 use veloq_driver_native::{
-    driver::{Driver, PlatformDriver},
+    driver::{DriverRaw, PlatformDriver},
     op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout},
 };
 
-type SleepDetachedOp<'reg> = DetachedOp<OpTimeout, <PlatformDriver<'reg> as Driver>::SlotSpec>;
+type SleepDetachedOp<'reg> = DetachedOp<OpTimeout, <PlatformDriver<'reg> as DriverRaw>::SlotSpec>;
 
 // ============================================================================
 // Sync/Send Sleep (uses DetachedOp)

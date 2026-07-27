@@ -27,10 +27,11 @@ use crate::{
 use veloq_driver_core::{
     driver::{
         CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
-        DriveOutcome, Driver, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+        DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics, DriverRaw,
         DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-        SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+        SharedCompletionTable, SharedSlotTable, SubmitStatus,
         registry::{OpEntry, OpHandle},
+        sealed,
     },
     slot::Generation,
 };
@@ -344,7 +345,9 @@ impl<'a> Drop for UringDriver<'a> {
     }
 }
 
-impl<'a> Driver for UringDriver<'a> {
+impl<'a> sealed::Sealed for UringDriver<'a> {}
+
+impl<'a> DriverRaw for UringDriver<'a> {
     type SlotSpec = UringSlotSpec;
     type Raw = UringRawHandle;
 
@@ -371,11 +374,11 @@ impl<'a> Driver for UringDriver<'a> {
         }
     }
 
-    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
+    fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
         self.ops.shared.clone()
     }
 
-    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+    fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
         self.remote_cancel_sender.clone()
     }
 
@@ -424,7 +427,7 @@ impl<'a> Driver for UringDriver<'a> {
         }
     }
 
-    fn drive(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
+    fn drive_raw(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
                 self.poll_nonblocking_internal()
@@ -454,22 +457,22 @@ impl<'a> Driver for UringDriver<'a> {
         })
     }
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
+    fn completion_table_raw(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.completion_table.clone()
     }
 
-    fn cancel_op(&mut self, request: CancelRequest) -> UringResult<CancelSubmitOutcome> {
+    fn cancel_op_raw(&mut self, request: CancelRequest) -> UringResult<CancelSubmitOutcome> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> UringResult<()> {
+    fn register_chunk_raw(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> UringResult<()> {
         self.register_chunk_internal(id, ptr, len)
             .push_ctx("scope", "uring.driver.register_chunk")
             .with_ctx("driver_error_kind", UringError::Registration.to_string())
             .attach_note("register chunk")
     }
 
-    fn register_files<'f>(
+    fn register_files_raw<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
@@ -478,7 +481,7 @@ impl<'a> Driver for UringDriver<'a> {
             .attach_note("register files")
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> UringResult<()> {
+    fn unregister_files_raw(&mut self, files: Vec<IoFd>) -> UringResult<()> {
         for fd in files {
             self.unregister_fixed_fd(fd)
                 .push_ctx("scope", "uring.driver.unregister_files")
@@ -487,7 +490,7 @@ impl<'a> Driver for UringDriver<'a> {
         Ok(())
     }
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker<UringError>> {
+    fn create_waker_raw(&self) -> Arc<dyn RemoteWaker<UringError>> {
         Arc::new(UringWaker {
             state: self.waker_state.clone(),
             is_waked: self.is_waked.clone(),
@@ -499,7 +502,7 @@ impl<'a> Driver for UringDriver<'a> {
     /// 注册失败**不是**驱动初始化失败：`IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的
     /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
     /// 照旧（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §8）。
-    fn attach_buffer_pool(&mut self, pool: AnyBufPool) -> UringResult<()> {
+    fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
         let Some(config) = self.provided_buf_config else {
             return Ok(());
         };
@@ -519,11 +522,11 @@ impl<'a> Driver for UringDriver<'a> {
         Ok(())
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
+    fn capabilities_raw(&self) -> DriverCapabilities {
         self.capabilities
     }
 
-    fn note_capability_rejected(&mut self, capability: DriverCapability) {
+    fn note_capability_rejected_raw(&mut self, capability: DriverCapability) {
         let slot = match capability {
             DriverCapability::AcceptMulti => &mut self.capabilities.accept_multi,
             DriverCapability::RecvMulti => &mut self.capabilities.recv_multi,
