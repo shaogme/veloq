@@ -274,7 +274,7 @@ where
     }
 }
 
-type DetachedOpMarker<T, Spec> = (T, Spec);
+type DetachedOpMarker<T, Spec> = fn() -> (T, Spec);
 
 /// 一个已提交操作的句柄，不借用驱动。
 ///
@@ -365,17 +365,6 @@ where
     pub fn is_armed(&self) -> bool {
         self.token.is_some()
     }
-}
-
-/// # Safety
-///
-/// 字段里唯一非平凡的是 `immediate`，它装的是 `T::Output` 与 `T::Completion`——两者都被
-/// [`IntoPlatformOp`] 约束为 `Send`。完成表与 waker 本身就是跨线程句柄。
-unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
-where
-    Spec: SlotSpec,
-    T: IntoPlatformOp<Spec> + std::marker::Send,
-{
 }
 
 impl<T, Spec> Drop for DetachedOp<T, Spec>

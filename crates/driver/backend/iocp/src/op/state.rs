@@ -134,7 +134,18 @@ impl Default for OverlappedEntry {
     }
 }
 
-// SAFETY: OverlappedEntry is safe to send between threads.
+/// # Safety
+///
+/// `OverlappedEntry` contains raw pointers inside Windows OS native `OVERLAPPED` structure (`inner`)
+/// and `AtomicOptionPtr` (`blocking_completion`), preventing compiler auto-derivation of `Send`:
+///
+/// 1. `inner`: Raw pointer fields (`Internal`, `Pointer`) are internal OS control block state.
+///    When `OverlappedEntry` is moved between threads, exclusive ownership is transferred, so no
+///    data races occur.
+/// 2. `blocking_completion`: Worker threads in the blocking pool write results via `Box::into_raw` + `Release`,
+///    and the driver thread consumes results via `Acquire`, forming a safe release-acquire synchronization.
+/// 3. `Drop for BlockingCompletion`: If unconsumed when dropped, `Box::from_raw` reclaims the allocation,
+///    and `cleanup_success` safely frees the handle, preventing resource leaks.
 unsafe impl Send for OverlappedEntry {}
 
 /// State associated with an IOCP operation.

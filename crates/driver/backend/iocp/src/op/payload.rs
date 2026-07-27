@@ -48,8 +48,6 @@ pub enum IocpUserPayload {
     RecvMulti(RecvMulti),
 }
 
-unsafe impl Send for IocpUserPayload {}
-
 pub(crate) enum IocpOpPayload {
     Read(KernelRef<ReadFixed>),
     ReadRaw(KernelRef<ReadRaw>),

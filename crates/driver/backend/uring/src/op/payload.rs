@@ -12,7 +12,10 @@ pub(crate) use veloq_driver_core::op::types::{
 
 use crate::config::{SockAddrStorage, UringRawHandle};
 use io_uring::types::Timespec;
-use std::{marker::PhantomData, mem, ptr};
+use std::{
+    marker::{PhantomData, PhantomPinned},
+    mem, ptr,
+};
 
 pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
 pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
@@ -80,9 +83,6 @@ pub enum UringUserPayload {
     Timeout(Timeout),
 }
 
-// SAFETY: all payload variants are moved between driver-owned slots and completion queues.
-unsafe impl Send for UringUserPayload {}
-
 pub(crate) struct KernelRef<T> {
     pub(crate) marker: PhantomData<T>,
 }
@@ -95,17 +95,35 @@ pub(crate) fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
 
 pub(crate) struct AcceptPayload {}
 
+/// Kernel payload for [`SendTo`].
+///
+/// # Safety / Self-Referential Layout
+///
+/// `msghdr.msg_name` and `msghdr.msg_iov` contain self-referential pointers to `msg_name`
+/// and `iovec` within this structure, which are populated during `make_sqe_send_to`.
+/// Once populated, this payload MUST NOT be moved in memory until the operation completes
+/// or fails in the kernel. `PhantomPinned` enforces !Unpin in the type system.
 pub(crate) struct SendToPayload {
     pub(crate) msg_name: libc::sockaddr_storage,
     pub(crate) msg_namelen: libc::socklen_t,
     pub(crate) iovec: [libc::iovec; 1],
     pub(crate) msghdr: libc::msghdr,
+    pub(crate) _pin: PhantomPinned,
 }
 
+/// Kernel payload for [`UdpRecvFrom`].
+///
+/// # Safety / Self-Referential Layout
+///
+/// `msghdr.msg_name` and `msghdr.msg_iov` contain self-referential pointers to `msg_name`
+/// and `iovec` within this structure, which are populated during `make_sqe_udp_recv_from`.
+/// Once populated, this payload MUST NOT be moved in memory until the operation completes
+/// or fails in the kernel. `PhantomPinned` enforces !Unpin in the type system.
 pub(crate) struct UdpRecvFromPayload {
     pub(crate) msg_name: libc::sockaddr_storage,
     pub(crate) iovec: [libc::iovec; 1],
     pub(crate) msghdr: libc::msghdr,
+    pub(crate) _pin: PhantomPinned,
 }
 
 pub(crate) struct OpenPayload {}
@@ -146,6 +164,7 @@ impl SendToPayload {
                 iov_len: 0,
             }],
             msghdr: zeroed_msghdr(),
+            _pin: PhantomPinned,
         }
     }
 }
@@ -160,6 +179,7 @@ impl UdpRecvFromPayload {
                 iov_len: 0,
             }],
             msghdr: zeroed_msghdr(),
+            _pin: PhantomPinned,
         }
     }
 }
