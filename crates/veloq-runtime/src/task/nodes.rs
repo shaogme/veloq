@@ -148,7 +148,7 @@ where
 
     fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
         let waker = self.header.create_waker(S::WAKER_VTABLE);
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         Ok(self.poll_task(&mut cx))
     }
 

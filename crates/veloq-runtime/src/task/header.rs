@@ -1,13 +1,13 @@
 use crate::{
     error::{Result, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::sys},
-    task::{ScopeCancelWaiter, ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
+    task::{RawScope, ScopeCancelWaiter, ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
 };
 use diagweave::prelude::*;
 use std::{
     cell::UnsafeCell,
     hint::spin_loop,
-    marker::PhantomData,
+    marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
     pin::Pin,
     ptr::{self, NonNull},
@@ -168,6 +168,7 @@ pub(crate) struct GenericWakerNode<S: Storage> {
     pub(crate) waker: Waker,
     pub(crate) link: Link,
     pub(crate) marker: PhantomData<S>,
+    pub(crate) _pin: PhantomPinned,
 }
 
 intrusive_adapter!(pub(crate) WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
@@ -177,6 +178,7 @@ pub struct GenericTaskHeader<S: Storage> {
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     wake_token: Arc<TaskWakeToken<S>>,
+    cached_waker: UnsafeCell<Option<Waker>>,
     scope: UnsafeCell<ScopeRef<S>>,
     /// 本任务在所属 scope 取消队列中的等待节点；由 scope 的取消令牌锁保护。
     cancel_waiter: ScopeCancelWaiter,
@@ -208,6 +210,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             wake_token: Arc::new(TaskWakeToken::new()),
+            cached_waker: UnsafeCell::new(None),
             scope: UnsafeCell::new(ScopeRef::dummy()),
             cancel_waiter: ScopeCancelWaiter::new(),
             runtime: UnsafeCell::new(None),
@@ -252,7 +255,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
             return true;
         }
-        self.scope_completion_ref().is_cancelled()
+        self.with_scope(|scope| scope.is_cancelled())
     }
 
     /// 仅置位取消标记，**不唤醒**任务。
@@ -579,10 +582,16 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.load(Ordering::Acquire) & STATE_READY != 0
     }
 
-    pub(crate) fn create_waker(&self, vtable: &'static RawWakerVTable) -> Waker {
-        self.wake_token.bind_header(NonNull::from(self));
-        let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
-        unsafe { Waker::from_raw(RawWaker::new(data, vtable)) }
+    pub(crate) fn create_waker(&self, vtable: &'static RawWakerVTable) -> &Waker {
+        let cached_waker = unsafe { &mut *self.cached_waker.get() };
+        if cached_waker.is_none() {
+            self.wake_token.bind_header(NonNull::from(self));
+            let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
+            *cached_waker = Some(unsafe { Waker::from_raw(RawWaker::new(data, vtable)) });
+        }
+        cached_waker
+            .as_ref()
+            .expect("task waker must be initialized before use")
     }
 
     /// # Safety
@@ -605,6 +614,12 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub(crate) fn decrement_ref_count(&self) -> bool {
         self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    #[inline]
+    pub(crate) fn with_scope<R>(&self, callback: impl FnOnce(&dyn RawScope) -> R) -> R {
+        let scope = unsafe { &*self.scope.get() };
+        unsafe { callback(scope.as_ref()) }
     }
 
     #[inline]
@@ -810,6 +825,7 @@ mod tests {
             waker: waker.clone(),
             link: Link::new(),
             marker: PhantomData,
+            _pin: PhantomPinned,
         }
     }
 
@@ -838,6 +854,16 @@ mod tests {
         assert_eq!(first.count.load(Ordering::Acquire), 0);
         assert_eq!(second.count.load(Ordering::Acquire), 1);
         assert!(!node.link.is_linked());
+    }
+
+    #[test]
+    fn create_waker_reuses_cached_waker() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+
+        let first = header.create_waker(&INTRUSIVE_WAKER_VTABLE).clone();
+        let second = header.create_waker(&INTRUSIVE_WAKER_VTABLE).clone();
+
+        assert!(first.will_wake(&second));
     }
 
     /// `remove_waker` 在任务已完成时也必须真正摘链，不能提前返回

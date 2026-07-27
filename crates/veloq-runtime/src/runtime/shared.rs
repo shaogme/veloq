@@ -200,8 +200,8 @@ impl<T> RuntimeShared<T> {
 }
 
 impl RuntimeSharedBase {
-    pub fn unparkers(&self) -> Box<[Unparker]> {
-        self.registry.unparkers.clone()
+    pub fn unparkers(&self) -> &[Unparker] {
+        &self.registry.unparkers
     }
 
     #[inline]
@@ -503,7 +503,7 @@ impl<T> RuntimeShared<T> {
             .unwrap_or(usize::MAX)
     }
 
-    pub fn unparkers(&self) -> Box<[Unparker]> {
+    pub fn unparkers(&self) -> &[Unparker] {
         self.base.unparkers()
     }
 

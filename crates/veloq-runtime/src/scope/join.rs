@@ -6,17 +6,16 @@ use crate::{
     error::{Result as RuntimeResult, RuntimeError},
     runtime::{GenericCancellationToken, primitives::CancelledFuture},
     task::{
-        Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
-        TaskHandleRef, TaskJoinGate,
+        GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError, TaskHandleRef,
+        TaskJoinGate,
     },
 };
 use diagweave::{Report, prelude::*};
 use std::{
-    alloc::Layout,
     future::Future,
-    marker::PhantomData,
+    marker::{PhantomData, PhantomPinned},
     pin::Pin,
-    ptr::{NonNull, drop_in_place, write},
+    ptr::NonNull,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -79,9 +78,10 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>,
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
-    pub(crate) waker_node: Option<Pin<&'scope_ref mut GenericWakerNode<R::Storage>>>,
+    pub(crate) waker_node: Option<GenericWakerNode<R::Storage>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
     pub(crate) marker: PhantomData<TExtra>,
+    pub(crate) _pin: PhantomPinned,
 }
 
 unsafe impl<'rt, 'scope, 'env, 'scope_ref, T, TExtra> Send
@@ -214,6 +214,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             waker_node: None,
             reclaim,
             marker: PhantomData,
+            _pin: PhantomPinned,
         }
     }
 
@@ -231,42 +232,22 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             waker_node: None,
             reclaim: None,
             marker: PhantomData,
+            _pin: PhantomPinned,
         }
     }
 
     fn register_waker_on<St: Storage>(
-        waker_node: &mut Option<Pin<&'scope_ref mut GenericWakerNode<St>>>,
-        arena: &dyn Arena,
+        waker_node: &mut Option<GenericWakerNode<St>>,
         header: &GenericTaskHeader<St>,
         cx: &mut Context<'_>,
     ) -> RuntimeResult<()> {
         if waker_node.is_none() {
-            let node_ptr = unsafe {
-                arena.alloc_raw(
-                    Layout::new::<GenericWakerNode<St>>(),
-                    Some(|ptr| drop_in_place(ptr as *mut GenericWakerNode<St>)),
-                )
-            };
-            let Some(node_ptr) = node_ptr else {
-                return Err(RuntimeError::ArenaAllocationNull {
-                    op: "JoinHandle::register_waker_on",
-                }
-                .to_report());
-            };
-            unsafe {
-                write(
-                    node_ptr.as_ptr() as *mut GenericWakerNode<St>,
-                    GenericWakerNode {
-                        waker: cx.waker().clone(),
-                        link: Link::new(),
-                        marker: PhantomData,
-                    },
-                );
-            }
-            let node_ref = unsafe {
-                Pin::new_unchecked(&mut *(node_ptr.as_ptr() as *mut GenericWakerNode<St>))
-            };
-            *waker_node = Some(node_ref);
+            *waker_node = Some(GenericWakerNode {
+                waker: cx.waker().clone(),
+                link: Link::new(),
+                marker: PhantomData,
+                _pin: PhantomPinned,
+            });
         }
 
         let Some(node) = waker_node.as_mut() else {
@@ -279,7 +260,8 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
 
         // 「刷新 waker + 入链」统一由 `register_completion` 完成：它自带 `is_linked()`
         // 保护，重复注册不会破坏侵入式链表（RUNTIME_REVIEW §1.2）。
-        unsafe { header.register_completion(node.as_mut(), cx.waker()) };
+        let node = unsafe { Pin::new_unchecked(node) };
+        unsafe { header.register_completion(node, cx.waker()) };
         Ok(())
     }
 }
@@ -297,13 +279,16 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         let arena = this.scope.arena();
-        let waker_node = &mut this.waker_node;
         let reclaim = this.reclaim;
 
         match &mut this.source {
             JoinSource::Direct { task, gate, .. } => {
                 let header = task.header();
                 if header.is_completed() {
+                    if let Some(mut node) = this.waker_node.take() {
+                        let node_ptr = NonNull::from(&mut node);
+                        unsafe { header.remove_waker(node_ptr) };
+                    }
                     let Some(res) = gate.take_result_erased() else {
                         // 任务在入队失败后被 `abandon_before_enqueue` 终结：没有结果，
                         // 但状态是可判别的取消（RUNTIME_REVIEW §4.4）。
@@ -327,7 +312,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 }
 
                 if let Err(err) =
-                    Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx)
+                    Self::register_waker_on::<R::Storage>(&mut this.waker_node, header, cx)
                 {
                     return Poll::Ready(JoinOutcome::RuntimeErr(err));
                 }
@@ -337,6 +322,10 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 if let Some(res) = resolved {
                     let header = res.task.header();
                     if header.is_completed() {
+                        if let Some(mut node) = this.waker_node.take() {
+                            let node_ptr = NonNull::from(&mut node);
+                            unsafe { header.remove_waker(node_ptr) };
+                        }
                         let Some(access) = res.access.take() else {
                             return Poll::Ready(JoinOutcome::RuntimeErr(
                                 RuntimeError::InvariantViolation {
@@ -356,7 +345,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                     }
 
                     if let Err(err) =
-                        Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx)
+                        Self::register_waker_on::<R::Storage>(&mut this.waker_node, header, cx)
                     {
                         return Poll::Ready(JoinOutcome::RuntimeErr(err));
                     }
@@ -416,7 +405,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> Drop
 {
     fn drop(&mut self) {
         if let Some(node) = self.waker_node.as_mut() {
-            let node_ptr = unsafe { NonNull::from(node.as_mut().get_unchecked_mut()) };
+            let node_ptr = NonNull::from(&mut *node);
             let task = match &self.source {
                 JoinSource::Direct { task, .. } => Some(*task),
                 JoinSource::Routed { resolved, .. } => resolved.as_ref().map(|r| r.task),
