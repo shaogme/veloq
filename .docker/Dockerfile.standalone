@@ -1,0 +1,20 @@
+FROM ghcr.io/shaogme/nixos-dockers/vscode-rust:latest AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /root/workspace
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS runner
+COPY --from=planner /root/workspace/recipe.json recipe.json
+# 预先下载并编译所有第三方依赖
+RUN cargo chef cook --recipe-path recipe.json
+
+# 复制 workspace 完整源码
+COPY . .
+
+# 预构建工作区 crate 与测试二进制，缓存 target 编译产物
+RUN cargo check --workspace --exclude veloq-driver-iocp && \
+    cargo test --workspace --exclude veloq-driver-iocp --no-run && \
+    cargo clippy --workspace --exclude veloq-driver-iocp --all-targets

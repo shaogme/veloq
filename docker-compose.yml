@@ -23,9 +23,7 @@ services:
   standalone:
     build:
       context: .
-      dockerfile_inline: |
-        FROM ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
-        COPY . /root/workspace
+      dockerfile: .docker/Dockerfile.standalone
     image: veloq-workspace-standalone:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here

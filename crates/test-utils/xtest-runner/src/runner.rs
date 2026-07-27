@@ -89,19 +89,6 @@ impl Runner {
             let status = command_status(&command, &self.workspace_root)
                 .with_ctx("command", command.display());
 
-            // 无论执行成功与否，如果使用的是 LinuxOnWindows 模式（即使用了 standalone 容器），则删除镜像
-            if let RunMode::LinuxOnWindows(_) = self.mode {
-                let clean_cmd = CommandSpec::new(
-                    "docker",
-                    vec![
-                        "rmi".into(),
-                        "-f".into(),
-                        "veloq-workspace-standalone:latest".into(),
-                    ],
-                );
-                let _ = command_status(&clean_cmd, &self.workspace_root);
-            }
-
             let status = status?;
             if status.success() {
                 return Ok(());
@@ -299,6 +286,7 @@ impl Runner {
                 };
                 args.extend(vec![
                     "run".into(),
+                    "--build".into(),
                     "--rm".into(),
                     "standalone".into(),
                     "cargo".into(),
