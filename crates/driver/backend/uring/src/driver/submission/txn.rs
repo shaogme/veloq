@@ -1,5 +1,5 @@
-use super::{env::SubmitEnv, lifecycle::UringSubmissionState};
 use crate::{
+    driver::{env::SubmitEnv, lifecycle::UringSubmissionState},
     error::{UringError, UringResult},
     op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
 };

@@ -1,4 +1,6 @@
-use super::submission_txn::{UringSubmitTxn, slot_access_report};
+pub(crate) mod txn;
+
+use self::txn::{UringSubmitTxn, slot_access_report};
 use crate::{
     config::{RawHandle, UringRawHandle},
     driver::{SqeFd, UringDriver, env::SubmitEnv, lifecycle::UringSubmissionState},

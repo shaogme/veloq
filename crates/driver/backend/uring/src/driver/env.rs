@@ -9,7 +9,7 @@
 use crate::{
     config::BufferRegistrationMode,
     driver::{
-        FileTable, MAX_CHUNKS, UringDriver, UringRegistrationStats, provided_buf::ProvidedBufGroup,
+        FileTable, MAX_CHUNKS, ProvidedBufGroup, UringDriver, UringRegistrationStats,
         registration::REGISTER_FAILURE_RETRY_COOLDOWN,
     },
     error::{UringError, UringResult},

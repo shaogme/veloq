@@ -8,9 +8,14 @@ use std::{mem::ManuallyDrop, time::Duration};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::RegisterFd;
 
-mod file_table;
+pub(crate) mod buffer;
+pub(crate) mod file_table;
+pub(crate) mod provided_buf;
 
+pub(crate) use buffer::UringBufferRegistry;
 pub(crate) use file_table::{FileTable, RegisteredFileEntry, SqeFd};
+pub(crate) use provided_buf::ProvidedBufGroup;
+pub use provided_buf::ProvidedBufStats;
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);

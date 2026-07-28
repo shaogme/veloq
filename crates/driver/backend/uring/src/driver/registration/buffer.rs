@@ -1,10 +1,10 @@
+use super::{
+    MAX_CHUNKS, UringRegistrationStats,
+    provided_buf::{ProvidedBufGroup, ProvidedBufStats},
+};
 use crate::{
     config::{BufferRegistrationMode, ProvidedBufConfig},
-    driver::{
-        env::ProvidedBufSqeInfo,
-        provided_buf::{ProvidedBufGroup, ProvidedBufStats},
-        registration::{MAX_CHUNKS, UringRegistrationStats},
-    },
+    driver::env::ProvidedBufSqeInfo,
     error::UringResult,
 };
 use std::time::Instant;

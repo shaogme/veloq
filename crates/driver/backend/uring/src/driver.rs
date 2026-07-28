@@ -19,29 +19,21 @@ use veloq_driver_core::driver::{
     sealed,
 };
 
-mod buffer_registry;
-mod cancellation;
 mod completion;
+mod control;
 mod env;
 mod lifecycle;
-mod provided_buf;
 mod registration;
 mod submission;
-mod submission_txn;
-mod timer;
-mod waker;
 
-pub(crate) use buffer_registry::UringBufferRegistry;
-pub(crate) use cancellation::{PendingCancel, UringCancelManager};
+pub(crate) use control::{PendingCancel, UringCancelManager, UringTimerWheel, UringWakerManager};
 pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
-pub(crate) use provided_buf::ProvidedBufGroup;
-pub use provided_buf::ProvidedBufStats;
+pub use registration::ProvidedBufStats;
 pub(crate) use registration::{
-    FileTable, MAX_CHUNKS, RegisteredFileEntry, SqeFd, UringRegistrationStats,
+    FileTable, MAX_CHUNKS, ProvidedBufGroup, RegisteredFileEntry, SqeFd,
+    UringBufferRegistry, UringRegistrationStats,
 };
-pub(crate) use timer::UringTimerWheel;
-pub(crate) use waker::UringWakerManager;
 
 /// 从 opcode 探测结果得出乐观的能力集合。
 ///

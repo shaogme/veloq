@@ -13,8 +13,6 @@
 //!
 //! 收益不在「省掉分配」，而在「**buffer 只在数据到达时才与连接绑定**」：一万个空闲连接不
 //! 再各自压着一个 recv buffer。移交 + 补充完整保留了这一点。
-//!
-//! 见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5。
 
 use std::{
     io, mem,
