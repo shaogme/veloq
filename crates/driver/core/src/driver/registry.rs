@@ -280,13 +280,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         Some(self.remove_at_index(user_data))
     }
 
-    pub fn finalize_checked(
-        &mut self,
-        token: OpToken,
-    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.remove(token)
-    }
-
     fn recycle_at_index(&mut self, user_data: usize, generation: Generation) {
         let local = &mut self.local[user_data];
         local.active = false;
@@ -327,25 +320,20 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         true
     }
 
-    fn finalize_in_flight_completion(
+    /// 最终化一个处于等待状态的 Operation 完成，将其从注册表中移除。
+    pub fn finalize_waiting_completion(
         &mut self,
         token: OpToken,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
         self.remove(token)
     }
 
-    pub fn finalize_waiting_completion(
-        &mut self,
-        token: OpToken,
-    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.finalize_in_flight_completion(token)
-    }
-
+    /// 最终化一个处于孤立（Orphaned）状态的 Operation 完成，将其从注册表中移除。
     pub fn finalize_orphaned_completion(
         &mut self,
         token: OpToken,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.finalize_in_flight_completion(token)
+        self.remove(token)
     }
 
     pub fn finalize_corrupt_slot(
@@ -353,16 +341,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         snapshot: SlotSnapshot,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
         self.remove(OpToken::from_registry_parts(snapshot.index, snapshot.generation).ok()?)
-    }
-
-    pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
-        if page_idx == 0 {
-            let ptr = self.local.as_ptr() as *const u8;
-            let len = mem::size_of_val(&*self.local);
-            Some((ptr, len))
-        } else {
-            None
-        }
     }
 
     pub fn has_active_ops(&self) -> bool {

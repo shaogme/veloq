@@ -150,6 +150,11 @@ impl RemoteWaker<UringError> for UringWaker {
 }
 
 pub struct UringDriver<'a> {
+    // Rust 按声明顺序从上到下析构字段。
+    // `ring` 必须在 `ops`（以及其它持有 buffer/slot 的字段）之前声明：
+    // 当 `UringDriver` 被 drop 时，`ring` (IoUring) 最先被析构并关闭 ring file descriptor，
+    // 内核随之取消所有在途 Operation 并释放对用户 Buffer 的引用；
+    // 之后 `ops` 才会析构并释放底层 `LocalSlot` 内存，避免内存提前释放导致的 Use-After-Free。
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<OpToken>,
@@ -337,6 +342,9 @@ impl<'a> UringDriver<'a> {
 
 impl<'a> Drop for UringDriver<'a> {
     fn drop(&mut self) {
+        if self.ops.has_active_ops() {
+            tracing::warn!("UringDriver dropped with active in-flight operations");
+        }
         // 顺序不能反：先反注册，内核才不会再碰那段环内存和里面的 buffer；然后 `group`
         // 落地析构，`FixedBuf` 各自回池、映射还给内核。`Drop::drop` 在任何字段析构之前
         // 跑完，所以这里不依赖字段声明顺序。
