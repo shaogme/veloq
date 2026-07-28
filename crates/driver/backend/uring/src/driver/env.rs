@@ -301,6 +301,18 @@ impl SubmitEnv<'_, '_> {
             Err(e) => Err(e),
         }
     }
+
+    #[inline]
+    pub(crate) fn is_chunk_registered(&self, chunk_id: ChunkId) -> bool {
+        self.registered_chunks
+            .get(chunk_id.as_usize())
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub(crate) fn unmark_registered_chunk(&mut self, chunk_id: ChunkId) {
+        let _ = self.registered_chunks.clear(chunk_id.as_usize());
+    }
 }
 
 impl<'a> UringDriver<'a> {

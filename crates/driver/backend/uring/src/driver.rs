@@ -42,6 +42,7 @@ mod lifecycle;
 mod provided_buf;
 mod registration;
 mod submission;
+mod submission_txn;
 
 pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
