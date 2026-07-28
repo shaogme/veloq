@@ -30,6 +30,7 @@ use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 
 use crate::{
     config::{MAX_PROVIDED_BUF_ENTRIES, ProvidedBufConfig},
+    driver::env::ProvidedBufSqeInfo,
     error::{UringError, UringResult},
 };
 
@@ -197,13 +198,8 @@ impl ProvidedBufGroup {
     }
 
     #[inline]
-    pub(crate) const fn bgid(&self) -> u16 {
-        self.bgid
-    }
-
-    #[inline]
-    pub(crate) const fn buf_size(&self) -> NonZeroUsize {
-        self.buf_size
+    pub(crate) fn sqe_info(&self) -> ProvidedBufSqeInfo {
+        ProvidedBufSqeInfo::new(self.bgid, self.buf_size.get() as u32)
     }
 
     #[inline]

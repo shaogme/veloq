@@ -3,7 +3,7 @@ use std::{
     mem,
     num::NonZeroU8,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use diagweave::prelude::*;
@@ -359,7 +359,7 @@ impl<'a> UringDriver<'a> {
         }
 
         if self.ring.completion().is_empty() {
-            let next_timeout = self.wheel.next_timeout();
+            let next_timeout = self.timers.next_timeout();
 
             if let Some(duration) = next_timeout {
                 let ts = io_uring::types::Timespec::new()
@@ -392,46 +392,18 @@ impl<'a> UringDriver<'a> {
     }
 
     /// Advances the timer wheel by however many whole ticks elapsed since the last poll.
-    ///
-    /// `Wheel::new` already normalises the tick to at least 1ms, but the divisor is clamped
-    /// here as well so this arithmetic does not silently depend on a `veloq-wheel` internal.
     fn advance_timer_clock(&mut self) -> UringResult<()> {
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        let tick_ms = (self.wheel.tick_duration().as_millis() as u64).max(1);
-        let ticks = elapsed.as_millis() as u64 / tick_ms;
-        if ticks > 0 {
-            self.advance_timers(elapsed)?;
-            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn advance_timers(&mut self, elapsed: Duration) -> UringResult<()> {
-        // The buffer is owned by the driver purely to keep its allocation across polls; it is
-        // moved out for the duration of the drain so completions may take `&mut self`.
-        let mut timer_buffer = mem::take(&mut self.timer_buffer);
-        timer_buffer.clear();
-        self.wheel.advance(elapsed, &mut timer_buffer);
-
-        let mut first_error = None;
-        for &token in &timer_buffer {
+        let expired = self.timers.advance_timer_wheel(now).to_vec();
+        for &token in &expired {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
-            let outcome = self.accept_synthetic_completion(
+            let _ = self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
                 UringSyntheticCompletion::None,
             );
-            if let Err(report) = outcome
-                && first_error.is_none()
-            {
-                first_error = Some(report);
-            }
         }
-
-        timer_buffer.clear();
-        self.timer_buffer = timer_buffer;
-        first_error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
@@ -523,13 +495,14 @@ impl<'a> UringDriver<'a> {
         ingress: CompletionIngress<()>,
         synthetic: UringSyntheticCompletion,
     ) -> UringResult<CompletionFlowOutcome> {
+        let waker_view = self.waker.hooks_view();
         let mut hooks = UringCompletionHooks::new(
             &self.completion_diagnostics,
-            &mut self.pending_cancel_cqes,
-            self.waker_buf.len(),
-            &mut self.waker_armed,
-            &self.is_waked,
-            self.provided_buffers.as_mut(),
+            self.cancellations.in_flight_mut(),
+            waker_view.buf_len,
+            waker_view.armed,
+            waker_view.is_waked,
+            self.buffer_registry.provided_buffers_mut(),
             synthetic,
         );
         let outcome = self.ops.accept_completion(

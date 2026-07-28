@@ -111,14 +111,14 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn submit_waker(&mut self) -> UringResult<()> {
-        if self.waker_armed {
+        if self.waker.is_armed() {
             return Ok(());
         }
 
-        let waker_fd = match self.waker_registered_fd {
+        let waker_fd = match self.waker.registered_fd() {
             Some(fd) => fd,
             None => {
-                let event_fd = self.waker_state.current();
+                let event_fd = self.waker.state().current();
                 let fd = event_fd.fd.raw().as_fd();
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
                 let mut fds =
@@ -127,7 +127,7 @@ impl<'a> UringDriver<'a> {
                     UringError::InvalidState
                         .report("driver.submit_waker", "register_files returned empty")
                 })?;
-                self.waker_registered_fd = Some(waker_fd);
+                self.waker.set_registered_fd(Some(waker_fd));
                 waker_fd
             }
         };
@@ -136,13 +136,13 @@ impl<'a> UringDriver<'a> {
         let sqe_fd = self
             .file_table
             .resolve(waker_fd, None, "driver.submit_waker.resolve")?;
-        let buf = self.waker_buf.as_mut_ptr();
-        let len = self.waker_buf.len() as u32;
+        let buf = self.waker.buf_mut_ptr();
+        let len = self.waker.buf_len() as u32;
         let sqe = sqe_with_fd!(sqe_fd, |f| opcode::Read::new(f, buf, len).build())
             .user_data(CompletionToken::waker(0).raw());
 
         if self.push_entry(sqe) {
-            self.waker_armed = true;
+            self.waker.set_armed(true);
             Ok(())
         } else {
             Err(UringError::Submission.report("driver.submit_waker", "failed to enqueue waker SQE"))

@@ -39,31 +39,16 @@ impl UringOpState {
 }
 
 impl<'a> UringDriver<'a> {
-    fn next_cancel_completion_id(&mut self) -> Option<CancelCompletionId> {
-        for _ in 0..u16::MAX {
-            let id = self.next_cancel_id;
-            self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
-            if self.next_cancel_id == 0 {
-                self.next_cancel_id = 1;
-            }
-            let id = CancelCompletionId::new(id);
-            if !self.pending_cancel_cqes.contains_key(&id) {
-                return Some(id);
-            }
-        }
-        None
-    }
-
     fn try_submit_cancel_request(&mut self, request: PendingCancel) -> Option<CancelCompletionId> {
         let (user_data, generation) = request.user_parts();
 
-        let cancel_id = self.next_cancel_completion_id()?;
+        let cancel_id = self.cancellations.allocate_cancel_id();
         let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
             .user_data(CompletionToken::cancel(cancel_id).raw());
 
         if self.push_entry(cancel_sqe) {
-            self.pending_cancel_cqes.insert(cancel_id, request);
+            self.cancellations.insert_in_flight(cancel_id, request);
             self.completion_diagnostics.backend().inc_cancel_submitted();
             trace!(
                 user_data,
@@ -82,7 +67,7 @@ impl<'a> UringDriver<'a> {
         if self.try_submit_cancel_request(request).is_some() {
             CancelSubmitOutcome::Submitted
         } else {
-            self.pending_cancellations.push_back(request);
+            self.cancellations.push_pending(request);
             self.completion_diagnostics.backend().inc_cancel_queued();
             CancelSubmitOutcome::Queued
         }
@@ -145,7 +130,7 @@ impl<'a> UringDriver<'a> {
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
-                    self.wheel.cancel(tid);
+                    self.timers.cancel(tid);
                     self.complete_local_cancel(token, request.mode)?;
                     return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
@@ -163,7 +148,7 @@ impl<'a> UringDriver<'a> {
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
-                    self.wheel.cancel(tid);
+                    self.timers.cancel(tid);
                     self.complete_local_cancel(token, CancelMode::Abandon)?;
                     return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
@@ -191,17 +176,17 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn flush_cancellations(&mut self) -> UringResult<()> {
         let mut submitted_count = 0;
-        let limit = self.pending_cancellations.len();
+        let limit = self.cancellations.pending_len();
 
         while submitted_count < limit {
-            if let Some(request) = self.pending_cancellations.front().copied() {
+            if let Some(request) = self.cancellations.front_pending().copied() {
                 let view = self.ops.checked_slot_view(request.target)?;
                 match view {
                     CheckedSlotView::Valid(_) => {}
                     CheckedSlotView::Missing { .. }
                     | CheckedSlotView::Empty(_)
                     | CheckedSlotView::Stale(_) => {
-                        self.pending_cancellations.pop_front();
+                        self.cancellations.pop_pending();
                         let (reason, kind) = cancel_target_kind(request.target, view);
                         self.record_cancel_target_gone(reason);
                         let attach = AnomalyAttach::from_op_token(request.target);
@@ -211,7 +196,7 @@ impl<'a> UringDriver<'a> {
                 }
 
                 if self.try_submit_cancel_request(request).is_some() {
-                    self.pending_cancellations.pop_front();
+                    self.cancellations.pop_pending();
                     submitted_count += 1;
                 } else {
                     break;

@@ -34,6 +34,13 @@ pub(crate) struct ProvidedBufSqeInfo {
     buf_size: u32,
 }
 
+impl ProvidedBufSqeInfo {
+    #[inline]
+    pub(crate) fn new(bgid: u16, buf_size: u32) -> Self {
+        Self { bgid, buf_size }
+    }
+}
+
 /// The driver state a `make_sqe` implementation is allowed to consult.
 ///
 /// `make_sqe` runs with the slot's op and payload borrowed mutably out of
@@ -320,24 +327,20 @@ impl<'a> UringDriver<'a> {
     /// can be held at the same time. Both halves are plain field projections, so the compiler
     /// — not a raw pointer — is what guarantees they do not alias.
     pub(crate) fn split_for_submit(&mut self) -> (&mut UringOpRegistry, SubmitEnv<'_, 'a>) {
+        let view = self.buffer_registry.split_for_submit();
+
         (
             &mut self.ops,
             SubmitEnv {
                 ring: &mut self.ring,
-                wheel: &mut self.wheel,
+                wheel: self.timers.wheel_mut(),
                 file_table: &self.file_table,
-                registered_chunks: &mut self.registered_chunks,
-                registrar: self.registrar,
-                registration_stats: &mut self.registration_stats,
-                registration_mode: self.registration_mode,
-                chunk_register_failure_at: &mut self.chunk_register_failure_at,
-                provided: self.provided_buffers.as_ref().map(|group| {
-                    ProvidedBufSqeInfo {
-                        bgid: group.bgid(),
-                        // 环里的 buffer 尺寸统一，且远小于 u32::MAX。
-                        buf_size: group.buf_size().get() as u32,
-                    }
-                }),
+                registered_chunks: view.registered_chunks,
+                registrar: view.registrar,
+                registration_stats: view.registration_stats,
+                registration_mode: view.registration_mode,
+                chunk_register_failure_at: view.chunk_register_failure_at,
+                provided: view.provided,
             },
         )
     }

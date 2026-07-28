@@ -272,8 +272,8 @@ impl<'a> UringDriver<'a> {
             .claim(files.len())
             .push_ctx("scope", "driver.register_files_internal")?;
         let fallback = files.len() - claimed.len();
-        self.registration_stats.file_table_fallback_registrations = self
-            .registration_stats
+        let stats = self.buffer_registry.stats_mut();
+        stats.file_table_fallback_registrations = stats
             .file_table_fallback_registrations
             .saturating_add(fallback as u64);
 

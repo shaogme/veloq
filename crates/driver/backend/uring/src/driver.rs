@@ -1,41 +1,26 @@
 use diagweave::prelude::*;
 use io_uring::{IoUring, opcode};
-use std::{
-    collections::{HashMap, VecDeque},
-    io, mem, ptr,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Instant,
-};
+use std::{collections::VecDeque, ptr, sync::Arc};
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_std::collections::BitSet;
-use veloq_wheel::{Wheel, WheelConfig};
 
 use crate::{
-    config::{
-        BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, ProvidedBufConfig, RawHandle,
-        UringConfig, UringRawHandle,
-    },
+    config::{IoFd, IoMode, RawHandle, UringConfig, UringRawHandle},
     diagnostics::UringCompletionDiagnostics,
     error::{UringError, UringResult},
     op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
 };
-use veloq_driver_core::{
-    driver::{
-        CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
-        DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics, DriverRaw,
-        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-        SharedCompletionTable, SharedSlotTable, SubmitStatus,
-        registry::{OpEntry, OpHandle},
-        sealed,
-    },
-    slot::Generation,
+use veloq_driver_core::driver::{
+    CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, DriverCapabilities,
+    DriverCapability, DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken,
+    RegisterFd, RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable,
+    SubmitStatus,
+    registry::{OpEntry, OpHandle},
+    sealed,
 };
 
+mod buffer_registry;
+mod cancellation;
 mod completion;
 mod env;
 mod lifecycle;
@@ -43,7 +28,11 @@ mod provided_buf;
 mod registration;
 mod submission;
 mod submission_txn;
+mod timer;
+mod waker;
 
+pub(crate) use buffer_registry::UringBufferRegistry;
+pub(crate) use cancellation::{PendingCancel, UringCancelManager};
 pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub(crate) use provided_buf::ProvidedBufGroup;
@@ -51,6 +40,8 @@ pub use provided_buf::ProvidedBufStats;
 pub(crate) use registration::{
     FileTable, MAX_CHUNKS, RegisteredFileEntry, SqeFd, UringRegistrationStats,
 };
+pub(crate) use timer::UringTimerWheel;
+pub(crate) use waker::UringWakerManager;
 
 /// 从 opcode 探测结果得出乐观的能力集合。
 ///
@@ -66,89 +57,6 @@ fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
     }
 }
 
-pub(crate) struct EventFd {
-    pub(crate) fd: OwnedRawHandle,
-}
-
-pub(crate) struct WakerFdState {
-    fd: Mutex<Arc<EventFd>>,
-}
-
-impl WakerFdState {
-    #[inline]
-    pub(crate) fn new(fd: Arc<EventFd>) -> Self {
-        Self { fd: Mutex::new(fd) }
-    }
-
-    #[inline]
-    fn lock_fd(&self) -> MutexGuard<'_, Arc<EventFd>> {
-        self.fd
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[inline]
-    pub(crate) fn current(&self) -> Arc<EventFd> {
-        self.lock_fd().clone()
-    }
-
-    #[inline]
-    pub(crate) fn replace(&self, fd: Arc<EventFd>) -> Arc<EventFd> {
-        mem::replace(&mut *self.lock_fd(), fd)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PendingCancel {
-    pub(crate) target: OpToken,
-    pub(crate) mode: CancelMode,
-}
-
-impl PendingCancel {
-    #[inline]
-    pub(crate) const fn new(request: CancelRequest) -> Self {
-        Self {
-            target: request.target,
-            mode: request.mode,
-        }
-    }
-
-    #[inline]
-    pub(crate) const fn user_parts(self) -> (usize, Generation) {
-        self.target.parts()
-    }
-}
-
-pub(crate) struct UringWaker {
-    pub(crate) state: Arc<WakerFdState>,
-    pub(crate) is_waked: Arc<AtomicBool>,
-}
-
-impl RemoteWaker<UringError> for UringWaker {
-    fn wake(&self) -> UringResult<()> {
-        if self.is_waked.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if !self.is_waked.swap(true, Ordering::AcqRel) {
-            let buf = 1u64.to_ne_bytes();
-            let fd = self.state.current();
-            let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EAGAIN) {
-                    return Ok(());
-                }
-                return Err(UringError::Internal
-                    .to_report()
-                    .push_ctx("scope", "uring.driver.waker.wake")
-                    .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
-                    .attach_note(err.to_string()));
-            }
-        }
-        Ok(())
-    }
-}
-
 pub struct UringDriver<'a> {
     // Rust 按声明顺序从上到下析构字段。
     // `ring` 必须在 `ops`（以及其它持有 buffer/slot 的字段）之前声明：
@@ -158,41 +66,18 @@ pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<OpToken>,
-    pub(crate) pending_cancellations: VecDeque<PendingCancel>,
-    pub(crate) pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
-    pub(crate) next_cancel_id: u16,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
     pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
-    pub(crate) remote_cancel_sender: RemoteCancelSender,
-    pub(crate) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
 
-    pub(crate) waker_state: Arc<WakerFdState>,
-    pub(crate) waker_registered_fd: Option<IoFd>,
-    pub(crate) waker_armed: bool,
-    pub(crate) waker_buf: Box<[u8; 8]>,
-    pub(crate) registered_chunks: BitSet,
-    pub(crate) is_waked: Arc<AtomicBool>,
+    pub(crate) cancellations: UringCancelManager,
+    pub(crate) waker: UringWakerManager,
+    pub(crate) timers: UringTimerWheel,
+    pub(crate) buffer_registry: UringBufferRegistry<'a>,
 
-    pub(crate) wheel: Wheel<OpToken>,
-    pub(crate) timer_buffer: Vec<OpToken>,
     /// Reused across `process_completions_internal` calls so draining the CQ never allocates.
     pub(crate) cqe_buffer: Vec<(u64, i32, u32)>,
-    pub(crate) last_timer_poll: Instant,
-    pub(crate) registrar: &'a (dyn BufferRegistrar + 'a),
-    pub(crate) registration_stats: UringRegistrationStats,
-    pub(crate) registration_mode: BufferRegistrationMode,
-    /// Last failed registration attempt per chunk, indexed by [`ChunkId`]; `MAX_CHUNKS` long.
-    pub(crate) chunk_register_failure_at: Box<[Option<Instant>]>,
     pub(crate) file_table: FileTable,
     pub(crate) capabilities: DriverCapabilities,
-    pub(crate) provided_buf_config: Option<ProvidedBufConfig>,
-    /// 注册好的 provided buffer 环，`None` 表示没开或注册失败。
-    ///
-    /// **必须声明在 `ring` 之后**：内核在 `unregister_buf_ring` 之前仍可能读写这段环内存，
-    /// 而 [`Drop`] 里的反注册要拿 `ring` 的 submitter。这里不靠字段顺序碰运气——反注册是
-    /// [`Drop::drop`] 里显式做的，它在任何字段被析构之前跑完（见
-    /// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.4）。
-    pub(crate) provided_buffers: Option<ProvidedBufGroup>,
 }
 
 impl<'a> UringDriver<'a> {
@@ -228,7 +113,7 @@ impl<'a> UringDriver<'a> {
         let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
         let completion_diagnostics = ops.shared.completion_diagnostics();
 
-        let waker_fd = Self::create_event_fd("driver.new.eventfd")?;
+        let waker = UringWakerManager::new()?;
 
         // opcode 探测只能回答「这个 opcode 存在吗」，回答不了「它的 multishot 变体存在
         // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
@@ -241,39 +126,23 @@ impl<'a> UringDriver<'a> {
 
         debug!("Initalized UringDriver with {} entries", entries);
 
-        let is_waked = Arc::new(AtomicBool::new(false));
-        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
-
         let mut driver = Self {
             ring,
             ops,
             backlog: VecDeque::new(),
-            pending_cancellations: VecDeque::new(),
-            pending_cancel_cqes: HashMap::new(),
-            next_cancel_id: 1,
             completion_diagnostics,
             completion_table,
-            remote_cancel_sender,
-            remote_cancel_receiver,
-            waker_state: Arc::new(WakerFdState::new(waker_fd)),
-            waker_registered_fd: None,
-            waker_armed: false,
-            waker_buf: Box::new([0; 8]),
-            registered_chunks: BitSet::new(MAX_CHUNKS),
-            is_waked,
-
-            wheel: Wheel::new(WheelConfig::default()),
-            timer_buffer: Vec::new(),
+            cancellations: UringCancelManager::new(),
+            waker,
+            timers: UringTimerWheel::new(),
+            buffer_registry: UringBufferRegistry::new(
+                config.registration_mode,
+                config.provided_buffers,
+                registrar,
+            ),
             cqe_buffer: Vec::with_capacity(entries as usize),
-            last_timer_poll: Instant::now(),
-            registrar,
-            registration_stats: UringRegistrationStats::default(),
-            registration_mode: config.registration_mode,
-            chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
             capabilities: probe_capabilities(&ring_probe),
-            provided_buf_config: config.provided_buffers,
-            provided_buffers: None,
         };
 
         driver.submit_waker()?;
@@ -305,37 +174,24 @@ impl<'a> UringDriver<'a> {
         self.ops.has_active_ops()
     }
 
-    pub(crate) fn create_event_fd(scope: &'static str) -> UringResult<Arc<EventFd>> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(UringError::DriverInit.io_report(scope, io::Error::last_os_error()));
-        }
-        Ok(Arc::new(EventFd {
-            // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
-            fd: unsafe {
-                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd)))
-            },
-        }))
-    }
-
     /// provided buffer 环的运行期统计，`None` 表示这个 driver 没有环。
     pub fn provided_buf_stats(&self) -> Option<ProvidedBufStats> {
-        self.provided_buffers.as_ref().map(ProvidedBufGroup::stats)
+        self.buffer_registry.provided_buf_stats()
     }
 
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
-        let new_fd = Self::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
+        let new_fd = UringWakerManager::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
         let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
-        match self.waker_registered_fd {
+        match self.waker.registered_fd() {
             // A registered waker keeps its slot: only the kernel table entry changes, so the
             // descriptor stays valid across the rebuild.
             Some(fd @ IoFd::Registered { .. }) => self.replace_registered_fixed_fd(fd, raw)?,
             // A direct descriptor *is* the fd, so a rebuilt eventfd needs a new one. Only the
             // driver holds this descriptor, so replacing it invalidates nothing.
-            Some(IoFd::Direct(_)) => self.waker_registered_fd = Some(IoFd::direct(raw.raw())),
+            Some(IoFd::Direct(_)) => self.waker.set_registered_fd(Some(IoFd::direct(raw.raw()))),
             None => {}
         }
-        let _old_fd = self.waker_state.replace(new_fd);
+        let _old_fd = self.waker.replace_state_fd(new_fd);
         Ok(())
     }
 }
@@ -348,9 +204,8 @@ impl<'a> Drop for UringDriver<'a> {
         // 顺序不能反：先反注册，内核才不会再碰那段环内存和里面的 buffer；然后 `group`
         // 落地析构，`FixedBuf` 各自回池、映射还给内核。`Drop::drop` 在任何字段析构之前
         // 跑完，所以这里不依赖字段声明顺序。
-        if let Some(group) = self.provided_buffers.take() {
-            group.release(&self.ring.submitter());
-        }
+        self.buffer_registry
+            .release_provided_buffers(&self.ring.submitter());
     }
 }
 
@@ -388,11 +243,11 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
-        self.remote_cancel_sender.clone()
+        self.cancellations.remote_sender()
     }
 
     fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
-        self.remote_cancel_receiver.try_recv().ok()
+        self.cancellations.try_recv_remote()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {
@@ -448,7 +303,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
                     self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
                 if !pending_progress {
                     return Ok(DriveOutcome {
-                        next_timeout_hint: self.wheel.next_timeout(),
+                        next_timeout_hint: self.timers.next_timeout(),
                         pending_progress,
                     });
                 }
@@ -461,7 +316,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
         let pending_progress =
             self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
-            next_timeout_hint: self.wheel.next_timeout(),
+            next_timeout_hint: self.timers.next_timeout(),
             pending_progress,
         })
     }
@@ -500,10 +355,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn create_waker_raw(&self) -> Arc<dyn RemoteWaker<UringError>> {
-        Arc::new(UringWaker {
-            state: self.waker_state.clone(),
-            is_waked: self.is_waked.clone(),
-        })
+        self.waker.create_waker()
     }
 
     /// 用刚建好的 worker 池注册 provided buffer 环。
@@ -512,21 +364,11 @@ impl<'a> DriverRaw for UringDriver<'a> {
     /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
     /// 照旧（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §8）。
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
-        let Some(config) = self.provided_buf_config else {
-            return Ok(());
-        };
-        if self.provided_buffers.is_some() {
-            return Ok(());
-        }
-
-        match ProvidedBufGroup::new(&self.ring.submitter(), config, pool) {
-            Ok(group) => {
-                self.provided_buffers = Some(group);
-                self.capabilities.provided_buffers = true;
-            }
-            Err(report) => {
-                debug!(report = ?report, "provided buffer ring unavailable; continuing without it");
-            }
+        if self
+            .buffer_registry
+            .attach_buffer_pool(&self.ring.submitter(), pool)?
+        {
+            self.capabilities.provided_buffers = true;
         }
         Ok(())
     }
@@ -557,6 +399,6 @@ use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
-        self.registration_stats.chunk_register_attempts
+        self.buffer_registry.stats().chunk_register_attempts
     }
 }
