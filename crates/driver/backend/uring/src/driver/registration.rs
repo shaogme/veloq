@@ -266,11 +266,11 @@ impl<'a> UringDriver<'a> {
         &mut self,
         files: Vec<RegisterFd<'h, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
-        self.ensure_file_table_initialized()?;
-
         if files.is_empty() {
             return Ok(Vec::new());
         }
+
+        self.ensure_file_table_initialized()?;
 
         let claimed = self
             .file_table

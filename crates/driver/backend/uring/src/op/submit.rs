@@ -46,6 +46,15 @@ fn resolve_socket_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringR
 }
 
 #[inline]
+pub(super) fn resolve_socket_fd_direct(
+    table: &FileTable,
+    fd: IoFd,
+    scope: &'static str,
+) -> UringResult<SqeFd> {
+    table.resolve_direct(fd, Some(RawHandleKind::Socket), scope)
+}
+
+#[inline]
 fn resolve_any_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
     table.resolve(fd, None, scope)
 }

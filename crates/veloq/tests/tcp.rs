@@ -657,10 +657,8 @@ fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
 /// 「对端关闭 → 流结束」是这里最容易写错的一条：`recv` 读到 0 字节在流的语义里只有一种意
 /// 思，所以它是 `None` 而不是一个空 buffer。
 ///
-/// 客户端**特意用一条普通 OS socket**，不是 [`TcpStream`]：一条 armed 的 multishot 会钉住
-/// 本 ring 的固定文件表资源节点，于是在它在途期间被反注册的 socket 并不会真的关掉，对端也
-/// 就收不到 FIN（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §9.6）。那是驱动层的既有问题，
-/// 不该由这条用例来承担。
+/// 客户端使用库自带的 [`TcpStream`]：驱动在反注册/关闭套接字时会确保发出 TCP FIN 报文，
+/// 即使同一 ring 的固定文件表上有在途 multishot，对端也能立即收到 FIN 并正常优雅关闭。
 #[cfg(target_os = "linux")]
 #[test]
 fn recv_multi_streams_every_chunk_until_the_peer_closes() {
@@ -677,44 +675,48 @@ fn recv_multi_streams_every_chunk_until_the_peer_closes() {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        let client = std::thread::spawn(move || {
-            use std::io::Write;
+        scope!(ctx, async |s| {
+            s.spawn_boxed(async move {
+                let client = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+                for round in 0..ROUNDS {
+                    let text = format!("round-{round}");
+                    let mut buf = ctx.alloc(nz!(256), text.len());
+                    buf.as_slice_mut()[..text.len()].copy_from_slice(text.as_bytes());
+                    client.write_all(buf).await.expect("write failed");
+                    yield_now().await;
+                }
+                drop(client);
+            });
 
-            let mut client = std::net::TcpStream::connect(listen_addr).expect("Failed to connect");
-            for round in 0..ROUNDS {
-                client
-                    .write_all(format!("round-{round}").as_bytes())
-                    .expect("write failed");
-                // 一次一条，别让内核把两轮的数据合成一个 buffer 交上来。
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            drop(client);
-        });
+            s.spawn_boxed(async move {
+                let (stream, _peer) = listener.accept().await.expect("Accept failed");
+                let mut chunks = stream.recv_multi().expect("recv_multi must be available");
 
-        let (stream, _peer) = listener.accept().await.expect("Accept failed");
-        let mut chunks = stream.recv_multi().expect("recv_multi must be available");
+                for round in 0..ROUNDS {
+                    let buf = chunks
+                        .next()
+                        .await
+                        .unwrap_or_else(|| panic!("recv stream ended early at {round}"))
+                        .unwrap_or_else(|e| panic!("recv_multi round {round} failed: {e}"));
+                    assert_eq!(
+                        buf.as_slice(),
+                        format!("round-{round}").as_bytes(),
+                        "round {round} content"
+                    );
+                }
 
-        for round in 0..ROUNDS {
-            let buf = chunks
-                .next()
-                .await
-                .unwrap_or_else(|| panic!("recv stream ended early at {round}"))
-                .unwrap_or_else(|e| panic!("recv_multi round {round} failed: {e}"));
-            assert_eq!(
-                buf.as_slice(),
-                format!("round-{round}").as_bytes(),
-                "round {round} content"
-            );
-        }
-
-        // 对端关闭之后流结束，而不是无限产出空 buffer。
-        assert!(
-            chunks.next().await.is_none(),
-            "the stream must end when the peer closes"
-        );
-        assert_eq!(chunks.rearms(), 0, "a 256-deep ring must not run dry here");
-
-        client.join().expect("client thread panicked");
+                // 对端关闭之后流结束，而不是无限产出空 buffer。
+                assert!(
+                    chunks.next().await.is_none(),
+                    "the stream must end when the peer closes"
+                );
+                assert_eq!(chunks.rearms(), 0, "a 256-deep ring must not run dry here");
+            });
+        })
+        .await
+        .unwrap();
     });
 }
 

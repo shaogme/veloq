@@ -214,6 +214,68 @@ impl FileTable {
         Ok(SqeFd::Fixed(index))
     }
 
+    /// Resolves an `IoFd` into `SqeFd::Direct`, bypassing `IOSQE_FIXED_FILE` for multishot operations.
+    pub(crate) fn resolve_direct(
+        &self,
+        fd: IoFd,
+        expected_kind: Option<RawHandleKind>,
+        scope: &'static str,
+    ) -> UringResult<SqeFd> {
+        let (index, generation) = match fd {
+            IoFd::Direct(raw) => {
+                if let Some(expected_kind) = expected_kind {
+                    let current_kind = raw.kind();
+                    if current_kind != expected_kind {
+                        return UringError::ResolveFd
+                            .push_ctx("scope", scope)
+                            .with_ctx("fd", fd.to_string())
+                            .with_ctx("expected_kind", format!("{expected_kind:?}"))
+                            .with_ctx("current_kind", format!("{current_kind:?}"))
+                            .attach_note("direct file descriptor kind mismatch");
+                    }
+                }
+                return Ok(SqeFd::Direct(raw.as_fd()));
+            }
+            IoFd::Registered { index, generation } => (index, generation),
+        };
+
+        let Some(slot) = self.slots.get(index as usize) else {
+            return UringError::ResolveFd
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .attach_note("registered file descriptor index out of bounds");
+        };
+
+        if slot.generation != generation {
+            return UringError::ResolveFd
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .attach_note("stale registered file descriptor generation")
+                .with_ctx("current_generation", slot.generation);
+        }
+
+        let Some(entry) = slot.entry.as_ref() else {
+            return UringError::ResolveFd
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .attach_note("invalid registered file descriptor");
+        };
+
+        if let Some(expected_kind) = expected_kind {
+            let current_kind = entry.kind();
+            if current_kind != expected_kind {
+                return UringError::ResolveFd
+                    .push_ctx("scope", scope)
+                    .with_ctx("fd", fd.to_string())
+                    .with_ctx("expected_kind", format!("{expected_kind:?}"))
+                    .with_ctx("current_kind", format!("{current_kind:?}"))
+                    .attach_note("registered file descriptor kind mismatch");
+            }
+        }
+
+        Ok(SqeFd::Direct(entry.fd()))
+    }
+
     /// Reserves up to `count` kernel table slots, ascending.
     ///
     /// Returns fewer than `count` when the table runs out; the caller hands the remainder out

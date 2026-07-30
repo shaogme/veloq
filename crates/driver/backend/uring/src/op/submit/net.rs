@@ -14,7 +14,7 @@ use io_uring::{opcode, squeue, types};
 use std::{mem::size_of, ptr, slice::from_raw_parts};
 use veloq_driver_core::driver::SubmitTokenContext;
 
-use super::{invalid_buf_io_range, resolve_socket_fd, sqe_with_fd};
+use super::{invalid_buf_io_range, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd};
 
 pub(crate) unsafe fn make_sqe_recv(
     _kernel: &mut KernelRef<Recv>,
@@ -73,7 +73,7 @@ pub(crate) unsafe fn make_sqe_recv_multi(
 ) -> UringResult<squeue::Entry> {
     const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
     let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, SCOPE)?;
+    let fd = resolve_socket_fd_direct(env.file_table, val.fd, SCOPE)?;
     Ok(sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()))
 }
 
@@ -182,7 +182,7 @@ pub(crate) unsafe fn make_sqe_accept_multi(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(
+    let fd = resolve_socket_fd_direct(
         env.file_table,
         val.fd,
         "uring.op.submit.make_sqe_accept_multi",
