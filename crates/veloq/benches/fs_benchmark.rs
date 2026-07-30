@@ -177,7 +177,7 @@ async fn run_1gb_iteration<'rt, 'reg>(
 
         while offset < TOTAL_SIZE {
             if tasks.len() < concurrency_limit
-                && let Some(buf) = ctx.try_alloc_from_pool(CHUNK_SIZE)
+                && let Some(buf) = ctx.try_alloc_from_pool(CHUNK_SIZE, CHUNK_SIZE.get())
             {
                 let remaining = TOTAL_SIZE - offset;
                 let write_len = min(remaining, CHUNK_SIZE.get() as u64) as usize;
@@ -256,7 +256,7 @@ async fn run_worker_iteration<'rt, 'reg>(
             let Some(idx) = found else {
                 break;
             };
-            let Some(buf) = ctx.try_alloc_from_pool(chunk_size) else {
+            let Some(buf) = ctx.try_alloc_from_pool(chunk_size, chunk_size.get()) else {
                 break;
             };
 

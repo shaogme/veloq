@@ -35,8 +35,8 @@ type RecvMulti = CoreRecvMulti<UringRawHandle>;
 struct HeapPool;
 
 impl BufPool for HeapPool {
-    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
-        FixedBuf::alloc_heap(len).ok()
+    fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+        FixedBuf::alloc_heap(cap, len).ok()
     }
 }
 

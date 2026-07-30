@@ -31,7 +31,7 @@ fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
             let mut bufs = Vec::new();
             let mut expanded_chunk_id = None;
             for i in 0..16 {
-                let buf = pool.alloc(alloc_size).unwrap_or_else(|| {
+                let buf = pool.alloc_full(alloc_size).unwrap_or_else(|| {
                     panic!("allocation failed before expansion validation, i={i}")
                 });
                 let info = buf.resolve_region_info();
@@ -51,7 +51,7 @@ fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
             // Ensure expanded chunk is actually usable.
             let mut post_expansion_count = 0usize;
             for _ in 0..8 {
-                let buf = pool.alloc(alloc_size).expect("allocation failed");
+                let buf = pool.alloc_full(alloc_size).expect("allocation failed");
                 if buf.resolve_region_info().id == expanded_id {
                     post_expansion_count += 1;
                 }
@@ -83,7 +83,7 @@ fn run_expansion_immediate_registration_check(
             let mut expanded = false;
             for i in 0..16 {
                 let buf = pool
-                    .alloc(alloc_size)
+                    .alloc_full(alloc_size)
                     .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
                 let info = buf.resolve_region_info();
                 assert_slot_based(info, "expansion should not fallback to heap");
@@ -132,7 +132,7 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
             let mut expanded_chunk_id = None;
             for i in 0..16 {
                 let buf = pool
-                    .alloc(alloc_size)
+                    .alloc_full(alloc_size)
                     .unwrap_or_else(|| panic!("worker0 allocation failed, i={i}"));
                 let info = buf.resolve_region_info();
                 assert_slot_based(info, "expansion path should not fallback to heap");
@@ -153,7 +153,9 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                     handles.push(s.spawn_boxed(async move {
                         ctx.yield_now().await;
                         let pool = ctx.buf_pool();
-                        let buf = pool.alloc(alloc_size).expect("worker allocation failed");
+                        let buf = pool
+                            .alloc_full(alloc_size)
+                            .expect("worker allocation failed");
                         buf.resolve_region_info()
                     }));
                 }

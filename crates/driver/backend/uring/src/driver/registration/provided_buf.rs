@@ -316,8 +316,8 @@ impl ProvidedBufGroup {
         // 池空了就退回堆分配：provided buffer 不需要被注册进内核的固定缓冲表（环条目带的
         // 是裸地址），所以堆上的那一个一样能用，只是走不了 fixed-buffer 快路径。
         self.pool
-            .alloc(self.buf_size)
-            .or_else(|| FixedBuf::alloc_heap(self.buf_size).ok())
+            .alloc_full(self.buf_size)
+            .or_else(|| FixedBuf::alloc_heap_full(self.buf_size).ok())
     }
 
     /// 把 `bid` 的 buffer 写进环并推进 tail。

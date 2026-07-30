@@ -18,7 +18,7 @@ fn bench_alloc(c: &mut Criterion) {
     group.bench_function("alloc_dealloc_single_thread", |b| {
         let size = NonZeroUsize::new(4096).unwrap();
         b.iter(|| {
-            let buf = pool.alloc(size);
+            let buf = pool.alloc_full(size);
             black_box(buf);
         })
     });
@@ -90,7 +90,7 @@ fn bench_threaded(c: &mut Criterion) {
                     let mut warmup_bufs = Vec::with_capacity(1024);
                     // Warm up: trigger page faults and populate superblocks
                     for _ in 0..1024 {
-                        if let Some(buf) = pool.alloc(size) {
+                        if let Some(buf) = pool.alloc_full(size) {
                             warmup_bufs.push(buf);
                         }
                     }
@@ -98,7 +98,7 @@ fn bench_threaded(c: &mut Criterion) {
 
                     b.wait(); // Sync Start: Wait for all threads to be ready
                     for _ in 0..iters_per_thread {
-                        let buf = pool.alloc(size);
+                        let buf = pool.alloc_full(size);
                         black_box(buf);
                     }
                     b.wait(); // Sync End: Signal work completed

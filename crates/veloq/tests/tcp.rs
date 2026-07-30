@@ -71,8 +71,7 @@ fn tcp_read_exact_write_all() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
-                let mut read_buf = ctx.alloc(nz!(DATA.len()));
-                read_buf.set_len(DATA.len());
+                let read_buf = ctx.alloc_full(nz!(DATA.len()));
 
                 let (_, buf) = stream
                     .read_exact(read_buf)
@@ -90,17 +89,15 @@ fn tcp_read_exact_write_all() {
                 let client = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let mut write_buf = ctx.alloc(nz!(DATA.len()));
+                let mut write_buf = ctx.alloc_full(nz!(DATA.len()));
                 write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
-                write_buf.set_len(DATA.len());
 
                 client
                     .write_all(write_buf)
                     .await
                     .expect("Client write_all failed");
 
-                let mut read_buf = ctx.alloc(nz!(DATA.len()));
-                read_buf.set_len(DATA.len());
+                let read_buf = ctx.alloc_full(nz!(DATA.len()));
                 let (_, buf) = client
                     .read_exact(read_buf)
                     .await
@@ -184,7 +181,7 @@ fn tcp_recv_zero_bytes() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let buf = ctx.alloc(nz!(1024));
+                let buf = ctx.alloc_full(nz!(1024));
                 let result = stream.recv(buf).await;
                 match result {
                     Ok((bytes, _buf)) => {
@@ -208,7 +205,7 @@ fn tcp_heap_buffer() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
-                let buf = FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
+                let buf = FixedBuf::alloc_heap_full(nz!(4096)).expect("Heap allocation failed");
                 let (n, buf) = stream.recv(buf).await.expect("Server recv failed");
                 assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
             });
@@ -217,10 +214,10 @@ fn tcp_heap_buffer() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let mut buf = FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
                 let data = b"Hello from heap!";
+                let mut buf =
+                    FixedBuf::alloc_heap(nz!(4096), data.len()).expect("Heap allocation failed");
                 buf.as_slice_mut()[..data.len()].copy_from_slice(data);
-                buf.set_len(data.len());
 
                 stream.send(buf).await.expect("Client send failed");
             });
@@ -308,6 +305,7 @@ fn multithread_tcp_echo() {
         let (done_tx, mut done_rx) = state.split();
 
         scope!(ctx, async |s| {
+            let data = b"Hello from worker 1!";
             s.spawn_boxed(async move {
                 let listener =
                     TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
@@ -315,25 +313,23 @@ fn multithread_tcp_echo() {
                 addr_tx.send(listen_addr).unwrap();
 
                 let (stream, _) = listener.accept().await.expect("Accept failed");
-                let expect = b"Hello from worker 1!";
-                let mut recv_buf = ctx.alloc(nz!(1024));
-                let mut received = Vec::with_capacity(expect.len());
-                while received.len() < expect.len() {
+                let mut recv_buf = ctx.alloc_full(nz!(1024));
+                let mut received = Vec::with_capacity(data.len());
+                while received.len() < data.len() {
                     let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
                     recv_buf = buf;
                     assert!(n > 0, "Peer closed before sending full request");
-                    let remain = expect.len() - received.len();
+                    let remain = data.len() - received.len();
                     received.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
                 }
-                assert_eq!(received.as_slice(), expect);
+                assert_eq!(received.as_slice(), data);
 
                 let mut sent = 0usize;
-                while sent < expect.len() {
-                    let remain = &expect[sent..];
-                    let mut echo_buf = ctx.alloc(nz!(1024));
-                    let chunk = remain.len().min(echo_buf.capacity());
+                while sent < data.len() {
+                    let remain = &data[sent..];
+                    let chunk = remain.len().min(1024);
+                    let mut echo_buf = ctx.alloc(nz!(1024), chunk);
                     echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
-                    echo_buf.set_len(chunk);
 
                     let (n, _) = stream.send(echo_buf).await.expect("Send failed");
                     assert!(n > 0, "Send returned 0 before echo completed");
@@ -349,15 +345,13 @@ fn multithread_tcp_echo() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let data = b"Hello from worker 1!";
-                let mut send_buf = ctx.alloc(nz!(1024));
+                let mut send_buf = ctx.alloc(nz!(1024), data.len());
                 send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                send_buf.set_len(data.len());
 
                 let (sent, _) = stream.send(send_buf).await.expect("Send failed");
                 assert_eq!(sent, data.len());
 
-                let mut recv_buf = ctx.alloc(nz!(1024));
+                let mut recv_buf = ctx.alloc_full(nz!(1024));
                 let mut echoed = Vec::with_capacity(data.len());
                 while echoed.len() < data.len() {
                     let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
@@ -433,7 +427,7 @@ fn tcp_cancel_recv() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let buf = ctx.alloc(nz!(1024));
+                let buf = ctx.alloc_full(nz!(1024));
                 select! {
                     ctx;
                     biased;
@@ -640,9 +634,8 @@ fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
                     .expect("Failed to connect");
                 for round in 0..ROUNDS {
                     let payload = format!("round-{round}");
-                    let mut buf = ctx.alloc(nz!(64));
+                    let mut buf = ctx.alloc(nz!(64), payload.len());
                     buf.as_slice_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
-                    buf.set_len(payload.len());
                     let (written, _buf) = stream.send(buf).await.expect("send failed");
                     assert_eq!(written, payload.len());
                     // 一次一条，别让内核把两轮的数据合成一个 buffer 交上来。
@@ -769,9 +762,8 @@ fn dropping_a_recv_stream_leaves_the_connection_usable() {
                     .await
                     .expect("Failed to connect");
                 for _ in 0..16 {
-                    let mut buf = ctx.alloc(nz!(64));
+                    let mut buf = ctx.alloc(nz!(64), 5);
                     buf.as_slice_mut()[..5].copy_from_slice(b"chunk");
-                    buf.set_len(5);
                     if stream.send(buf).await.is_err() {
                         break;
                     }

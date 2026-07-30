@@ -423,10 +423,8 @@ pub(crate) mod test_helpers {
     pub(crate) static DEREGISTERED_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
     pub(crate) fn fixed_buf(capacity: usize, len: usize) -> FixedBuf {
-        let mut buf = FixedBuf::alloc_heap(NonZeroUsize::new(capacity).expect("non-zero capacity"))
-            .expect("heap buffer allocation failed");
-        buf.set_len(len);
-        buf
+        FixedBuf::alloc_heap(NonZeroUsize::new(capacity).expect("non-zero capacity"), len)
+            .expect("heap buffer allocation failed")
     }
 
     pub(crate) fn reset_dispatch_state() {

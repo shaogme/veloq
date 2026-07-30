@@ -65,15 +65,17 @@ fn register_borrowed_file(driver: &mut IocpDriver<'_>, file: &File) -> IoFd {
 }
 
 fn fixed_buf_from_bytes(bytes: &[u8]) -> FixedBuf {
-    let mut buf = FixedBuf::alloc_heap(NonZeroUsize::new(bytes.len()).expect("non-empty buffer"))
-        .expect("heap buffer allocation failed");
+    let mut buf = FixedBuf::alloc_heap(
+        NonZeroUsize::new(bytes.len()).expect("non-empty buffer"),
+        bytes.len(),
+    )
+    .expect("heap buffer allocation failed");
     buf.spare_capacity_mut()[..bytes.len()].copy_from_slice(bytes);
-    buf.set_len(bytes.len());
     buf
 }
 
 fn fixed_buf(len: usize) -> FixedBuf {
-    FixedBuf::alloc_heap(NonZeroUsize::new(len).expect("non-empty buffer"))
+    FixedBuf::alloc_heap(NonZeroUsize::new(len).expect("non-empty buffer"), len)
         .expect("heap buffer allocation failed")
 }
 

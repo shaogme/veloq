@@ -292,15 +292,15 @@ impl BackingPool for SlotBasedPool {
 }
 
 impl BufPool for SlotBasedPool {
-    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
-        if let Some(buf) = self.alloc_mem(len).into_buf(self) {
+    fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+        if let Some(buf) = self.alloc_mem(cap).into_buf(self, len) {
             return Some(buf);
         }
 
         // Fallback path:
         // `GlobalSlotPool` already attempts automatic chunk expansion internally.
         // We only fallback to heap after slot allocation (including expansion) is exhausted.
-        FixedBuf::alloc_heap(len).ok()
+        FixedBuf::alloc_heap(cap, len).ok()
     }
 }
 

@@ -14,6 +14,7 @@ use veloq_buf::{
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
 use veloq_driver_core::driver::{CancelRequest, Driver, RegisterFd};
+use veloq_std::nz;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
@@ -70,16 +71,13 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
         .expect("build buffer pool failed");
 
-    let mut send_buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
-        .expect("send alloc failed");
     let test_data = b"rio-udp-sendto-regression";
+    let mut send_buf = reg_pool
+        .alloc(nz!(8192), test_data.len())
+        .expect("send alloc failed");
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-    send_buf.set_len(test_data.len());
 
-    let recv_buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
-        .expect("recv alloc failed");
+    let recv_buf = reg_pool.alloc_full(nz!(8192)).expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &send_buf, "send");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
 
@@ -148,16 +146,13 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
         .expect("build buffer pool failed");
 
-    let mut send_buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
-        .expect("send alloc failed");
     let test_data = b"rio-udp-sendto-regression-ipv6";
+    let mut send_buf = reg_pool
+        .alloc(nz!(8192), test_data.len())
+        .expect("send alloc failed");
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-    send_buf.set_len(test_data.len());
 
-    let recv_buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
-        .expect("recv alloc failed");
+    let recv_buf = reg_pool.alloc_full(nz!(8192)).expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &send_buf, "send");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
 
@@ -212,9 +207,7 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
         .expect("build buffer pool failed");
 
-    let recv_buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
-        .expect("recv alloc failed");
+    let recv_buf = reg_pool.alloc_full(nz!(8192)).expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
 
     let recv_op = UdpRecvFrom {

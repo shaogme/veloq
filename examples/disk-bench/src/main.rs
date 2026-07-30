@@ -268,7 +268,7 @@ async fn run_iteration_measured<'rt, 'reg>(
             while in_flight < qdepth && current_op_idx < total_ops {
                 let buf = if let Some(b) = available_buffers.pop() {
                     b
-                } else if let Ok(b) = ctx.try_alloc(block_size) {
+                } else if let Ok(b) = ctx.try_alloc_full(block_size) {
                     // Fallback if initial set wasn't enough (shouldn't happen if properly sized)
                     b
                 } else {
@@ -346,7 +346,7 @@ async fn run_worker<'rt, 'reg>(
     // This mimics static buffer pools in standard benchmarks.
     let mut reuse_buffers = Vec::with_capacity(qdepth);
     for _ in 0..qdepth {
-        if let Ok(buf) = ctx.try_alloc(config.block_size) {
+        if let Ok(buf) = ctx.try_alloc_full(config.block_size) {
             reuse_buffers.push(buf);
         } else {
             panic!("Failed to allocate initial buffers for queue depth coverage");

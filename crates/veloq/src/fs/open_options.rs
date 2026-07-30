@@ -176,14 +176,13 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = ctx.try_alloc(len_nz).trans()?;
+        let mut buf = ctx.try_alloc(len_nz, len).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
             return FsError::PathTooLong.trans();
         }
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
-        buf.set_len(len);
 
         let mut flags = if self.read && !self.write && !self.append {
             libc::O_RDONLY
@@ -235,7 +234,7 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = ctx.try_alloc(len_bytes).trans()?;
+        let mut buf = ctx.try_alloc(len_bytes, len_bytes.get()).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
             return FsError::PathTooLong.trans();
@@ -247,7 +246,6 @@ impl OpenOptions {
                 slice.as_mut_ptr(),
                 len_bytes.get(),
             );
-            buf.set_len(len_bytes.get());
         }
 
         let mut access = 0;

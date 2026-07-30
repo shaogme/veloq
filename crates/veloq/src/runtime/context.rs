@@ -316,17 +316,29 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         self.registrar().sync_to_driver();
     }
 
-    pub fn try_alloc_from_pool(&self, size: NonZeroUsize) -> Option<FixedBuf> {
-        self.buf_pool().alloc(size)
+    pub fn try_alloc_from_pool(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+        self.buf_pool().alloc(cap, len)
     }
 
-    pub fn try_alloc(&self, size: NonZeroUsize) -> BufResult<FixedBuf> {
-        self.try_alloc_from_pool(size)
-            .map_or_else(|| FixedBuf::alloc_heap(size), Ok)
+    pub fn try_alloc_from_pool_full(&self, cap: NonZeroUsize) -> Option<FixedBuf> {
+        self.try_alloc_from_pool(cap, cap.get())
     }
 
-    pub fn alloc(&self, size: NonZeroUsize) -> FixedBuf {
-        self.try_alloc(size).expect("failed to allocate buffer")
+    pub fn try_alloc(&self, cap: NonZeroUsize, len: usize) -> BufResult<FixedBuf> {
+        self.try_alloc_from_pool(cap, len)
+            .map_or_else(|| FixedBuf::alloc_heap(cap, len), Ok)
+    }
+
+    pub fn try_alloc_full(&self, cap: NonZeroUsize) -> BufResult<FixedBuf> {
+        self.try_alloc(cap, cap.get())
+    }
+
+    pub fn alloc(&self, cap: NonZeroUsize, len: usize) -> FixedBuf {
+        self.try_alloc(cap, len).expect("failed to allocate buffer")
+    }
+
+    pub fn alloc_full(&self, cap: NonZeroUsize) -> FixedBuf {
+        self.alloc(cap, cap.get())
     }
 
     pub fn drive_wait(&self) -> VeloqResult<IdleDecision> {

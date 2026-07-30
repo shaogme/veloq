@@ -13,7 +13,7 @@ use super::{common::BufPool, handle::FixedBuf};
 
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
-    pub alloc: unsafe fn(*const u8, NonZeroUsize) -> Option<FixedBuf>,
+    pub alloc: unsafe fn(*const u8, NonZeroUsize, usize) -> Option<FixedBuf>,
     pub clone: unsafe fn(*const u8) -> AnyBufPool,
     pub drop: unsafe fn(*mut u8),
     pub fmt: unsafe fn(*const u8, &mut Formatter<'_>) -> FmtResult,
@@ -40,17 +40,18 @@ impl AnyBufPool {
 
         unsafe fn alloc_shim<P: BufPool + Clone>(
             ptr: *const u8,
-            size: NonZeroUsize,
+            cap: NonZeroUsize,
+            len: usize,
         ) -> Option<FixedBuf> {
             const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
             if mem::size_of::<P>() <= STORAGE_SIZE
                 && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
                 let pool = unsafe { &*(ptr as *const P) };
-                pool.alloc(size)
+                pool.alloc(cap, len)
             } else {
                 let pool = unsafe { &**(ptr as *const *const P) };
-                pool.alloc(size)
+                pool.alloc(cap, len)
             }
         }
 
@@ -121,8 +122,8 @@ impl AnyBufPool {
 }
 
 impl BufPool for AnyBufPool {
-    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
-        unsafe { (self.vtable.alloc)(self.storage.as_ptr() as *const u8, len) }
+    fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+        unsafe { (self.vtable.alloc)(self.storage.as_ptr() as *const u8, cap, len) }
     }
 }
 

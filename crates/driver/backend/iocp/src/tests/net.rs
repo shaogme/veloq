@@ -22,6 +22,7 @@ use std::{
 use veloq_buf::BufPool;
 use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
+use veloq_std::nz;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
@@ -149,7 +150,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Alloc buffer
     let buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
+        .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
 
     // Strict RIO path: ensure the exact chunk backing this buffer is registered in the driver.
@@ -225,7 +226,7 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
     wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
 
     let buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
+        .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
     let region = buf.resolve_region_info();
     let chunk = global_pool
@@ -298,7 +299,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     );
 
     let buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
+        .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
     let region = buf.resolve_region_info();
     let chunk = global_pool
@@ -369,7 +370,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     );
 
     let buf = reg_pool
-        .alloc(NonZeroUsize::new(8192).unwrap())
+        .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
     let region = buf.resolve_region_info();
     let chunk = global_pool

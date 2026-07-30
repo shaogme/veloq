@@ -31,8 +31,8 @@ pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufStats;
 pub(crate) use registration::{
-    FileTable, MAX_CHUNKS, ProvidedBufGroup, RegisteredFileEntry, SqeFd,
-    UringBufferRegistry, UringRegistrationStats,
+    FileTable, MAX_CHUNKS, ProvidedBufGroup, RegisteredFileEntry, SqeFd, UringBufferRegistry,
+    UringRegistrationStats,
 };
 
 /// 从 opcode 探测结果得出乐观的能力集合。

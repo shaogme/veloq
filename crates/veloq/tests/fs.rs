@@ -66,7 +66,7 @@ fn test_file_integrity() {
                     .await
                     .expect("Failed to create");
 
-                let mut write_buf = ctx.alloc(size);
+                let mut write_buf = ctx.alloc_full(size);
                 let data = b"Hello World!";
                 write_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
@@ -80,7 +80,7 @@ fn test_file_integrity() {
                 let file = LocalFile::open(ctx, &file_path)
                     .await
                     .expect("Failed to open");
-                let read_buf = ctx.alloc(size);
+                let read_buf = ctx.alloc_full(size);
                 let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                 assert_eq!(n, size.get());
                 assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
@@ -133,14 +133,13 @@ fn test_multithread_file_ops() {
                         .open(ctx, &file_name)
                         .await
                         .expect("Failed to create file");
-                    let mut write_buf = ctx.alloc(len);
-                    write_buf.set_len(len.get());
+                    let mut write_buf = ctx.alloc_full(len);
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
                     let (wrote, _) = file.write_at(write_buf, 0).await.expect("Write failed");
                     assert_eq!(wrote, len.get());
                     file.sync_all().await.expect("Sync failed");
 
-                    let read_buf = ctx.alloc(len);
+                    let read_buf = ctx.alloc_full(len);
                     let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                     assert_eq!(n, len.get());
                     assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
@@ -169,9 +168,8 @@ fn test_fs_read_exact_write_all() {
             .expect("Failed to create file");
 
         const DATA: &[u8] = b"Hello Exact World!";
-        let mut write_buf = ctx.alloc(nz!(DATA.len()));
+        let mut write_buf = ctx.alloc(nz!(DATA.len()), DATA.len());
         write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
-        write_buf.set_len(DATA.len());
 
         file.write_all(write_buf).await.expect("write_all failed");
         file.sync_all().await.expect("Sync failed");
@@ -180,8 +178,7 @@ fn test_fs_read_exact_write_all() {
         let file = LocalFile::open(ctx, &path)
             .await
             .expect("Failed to open file");
-        let mut read_buf = ctx.alloc(nz!(DATA.len()));
-        read_buf.set_len(DATA.len());
+        let read_buf = ctx.alloc_full(nz!(DATA.len()));
         let (n, read_buf) = file.read_exact(read_buf).await.expect("read_exact failed");
         assert_eq!(n, DATA.len());
         assert_eq!(read_buf.as_slice(), DATA);

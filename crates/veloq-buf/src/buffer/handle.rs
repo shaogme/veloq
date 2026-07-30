@@ -119,10 +119,12 @@ impl FixedBuf {
     pub unsafe fn new(
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
+        len: usize,
         pool_data: NonNull<()>,
         pool_kind: PoolKind,
         context: u64,
     ) -> Self {
+        assert!(len <= cap.get(), "len must be <= capacity");
         assert!(
             cap.get() <= u32::MAX as usize,
             "FixedBuf only supports capacity <= u32::MAX"
@@ -131,7 +133,7 @@ impl FixedBuf {
         let mut context = PackedContext::from(context);
         context.set_pool_kind(pool_kind);
 
-        unsafe { Self::from_parts(ptr, pool_data, context, cap.get(), cap.get()) }
+        unsafe { Self::from_parts(ptr, pool_data, context, len, cap.get()) }
     }
 
     /// Resolve which region this buffer belongs to and its offset.
@@ -254,15 +256,21 @@ impl FixedBuf {
         })
     }
 
+    /// Allocate a heap buffer with `len == capacity`.
+    pub fn alloc_heap_full(cap: NonZeroUsize) -> BufResult<Self> {
+        Self::alloc_heap(cap, cap.get())
+    }
+
     /// Allocate a buffer from the system heap (not from a pool).
     ///
     /// This is used as a fallback when the pool is full.
     /// Note: Heap-allocated buffers may not be registered with the I/O driver
     /// and thus may incur overhead for direct I/O operations.
-    pub fn alloc_heap(len: NonZeroUsize) -> BufResult<Self> {
+    pub fn alloc_heap(cap: NonZeroUsize, len: usize) -> BufResult<Self> {
+        assert!(len <= cap.get(), "len must be <= capacity");
         // Allocate space for the metadata block plus the payload.
         // We use os::alloc_pages to ensure page alignment for both.
-        let total_size = len.get().checked_add(4096).ok_or(BufError::Oom)?;
+        let total_size = cap.get().checked_add(4096).ok_or(BufError::Oom)?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
         let base_ptr = unsafe { alloc_pages(total_size_nz) }.trans()?;
@@ -279,6 +287,7 @@ impl FixedBuf {
         Ok(unsafe {
             Self::new(
                 ptr,
+                cap,
                 len,
                 NonNull::new_unchecked(base_ptr as *mut ()),
                 PoolKind::Heap,

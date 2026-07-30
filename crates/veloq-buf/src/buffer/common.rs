@@ -79,12 +79,13 @@ pub enum AllocResult {
 }
 
 impl AllocResult {
-    pub fn into_buf(self, pool: &dyn BackingPool) -> Option<FixedBuf> {
+    pub fn into_buf(self, pool: &dyn BackingPool, len: usize) -> Option<FixedBuf> {
         match self {
             AllocResult::Allocated { ptr, cap, context } => unsafe {
                 Some(FixedBuf::new(
                     ptr,
                     cap,
+                    len,
                     pool.pool_data(),
                     pool.pool_kind(),
                     context,
@@ -187,6 +188,11 @@ pub trait BackingPool: Debug {
 /// High-level Buffer Pool trait.
 /// Represents a pool that is ready for I/O operations (registered if necessary).
 pub trait BufPool: Debug {
-    /// Allocate a buffer ready for I/O.
-    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf>;
+    /// Allocate a buffer ready for I/O with explicit capacity and initial length.
+    fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf>;
+
+    /// Allocate a buffer with `len == capacity`.
+    fn alloc_full(&self, cap: NonZeroUsize) -> Option<FixedBuf> {
+        self.alloc(cap, cap.get())
+    }
 }

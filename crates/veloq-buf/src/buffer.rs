@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn heap_view_preserves_borrow_semantics() {
-        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(16).expect("non-zero length"))
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(16).expect("non-zero length"), 16)
             .expect("heap allocation failed");
         let mut buf = buf;
 
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn heap_view_supports_zero_length_ranges() {
-        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"))
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"), 8)
             .expect("heap allocation failed");
 
         let view = buf.view(0..0);
@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn heap_view_rejects_invalid_range_without_retaining() {
-        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"))
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"), 8)
             .expect("heap allocation failed");
 
         let start = 3;
