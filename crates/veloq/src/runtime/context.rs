@@ -536,7 +536,7 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
     let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
     match shared.enqueue_pinned(worker_id, task_ref) {
         EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {
-            let _ = shared.base.unparkers()[worker_id].unpark();
+            shared.base.unparkers()[worker_id].unpark();
         }
         EnqueuePinnedOutcome::AbortedAcknowledged
         | EnqueuePinnedOutcome::AlreadySettled

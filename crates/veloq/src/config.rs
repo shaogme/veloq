@@ -126,9 +126,9 @@ impl Config {
 
     /// 为每个 worker 注册一组 provided buffer（io_uring 5.19+），`None` 表示不开。
     ///
-    /// 开启之后 [`crate::net::TcpStream::recv_provided`] 才可用：那条路径不需要调用方先交
-    /// 出 buffer，内核在数据到达时才从环里挑一个。内核不支持时注册失败，驱动会静默降级，
-    /// `recv_provided` 随之返回 [`crate::net::error::NetError::ProvidedBuffersUnavailable`]。
+    /// 开启之后 [`crate::net::TcpStream::recv_provided`] 与 [`crate::net::TcpStream::recv_multi`]
+    /// 会使用底层 zero-allocation 接收优化。未开启或内核不支持时，系统会自动平滑降级为 Single-shot Buffer 模式，
+    /// 无需上层显式分支适配。
     #[cfg(not(windows))]
     pub fn uring_provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
         self.uring.provided_buffers = provided_buffers;

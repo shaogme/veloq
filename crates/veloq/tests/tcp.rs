@@ -762,12 +762,9 @@ fn dropping_a_recv_stream_leaves_the_connection_usable() {
     });
 }
 
-/// 没开这项能力时 `recv_multi` 明确报错，而不是悄悄退回普通 recv。
-///
-/// 与 `recv_provided` 同一个理由、同一个出口：调用方没有交出 buffer，「换一条路」意味着运
-/// 行时得凭空造一个。这条在两个平台上都跑——IOCP 恒无此能力。
+/// 没开这项能力时 `recv_multi` 自动透明降级为 Single-shot Recv 模式。
 #[test]
-fn recv_multi_reports_a_runtime_without_provided_buffers() {
+fn recv_multi_falls_back_when_provided_buffers_unavailable() {
     run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
@@ -775,21 +772,28 @@ fn recv_multi_reports_a_runtime_without_provided_buffers() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let (stream, _peer) = listener.accept().await.expect("Accept failed");
-                let err = stream
+                let mut chunks = stream
                     .recv_multi()
-                    .err()
-                    .expect("a runtime without provided buffers must refuse");
-                assert!(
-                    format!("{err}").contains("provided buffers are not available"),
-                    "unexpected error: {err}"
-                );
+                    .expect("recv_multi must fallback and succeed");
+                let polled = std::future::poll_fn(|cx| {
+                    use futures_core::Stream;
+                    unsafe { std::pin::Pin::new_unchecked(&mut chunks) }.poll_next(cx)
+                })
+                .await;
+                let buf = polled
+                    .expect("stream item")
+                    .expect("recv_multi fallback chunk failed");
+                assert_eq!(buf.as_slice(), b"fallback_multi_data");
             });
 
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                // 撑到服务端问完为止，否则连接先断、错误就变成别的了。
+                let payload = b"fallback_multi_data";
+                let mut buf = ctx.alloc(nz!(64), payload.len());
+                buf.as_slice_mut()[..payload.len()].copy_from_slice(payload);
+                stream.send(buf).await.expect("Failed to send data");
                 yield_now().await;
                 drop(stream);
             });
@@ -799,13 +803,9 @@ fn recv_multi_reports_a_runtime_without_provided_buffers() {
     });
 }
 
-/// 没开这项能力时 `recv_provided` 明确报错，而不是悄悄退回普通 recv。
-///
-/// 退回去是错的：调用方没有交出 buffer，「悄悄换一条路」意味着运行时得凭空造一个，那就把
-/// 这个 API 唯一的卖点丢掉了，还让配置项看起来无所谓。这条用例在两个平台上都跑——IOCP
-/// 恒无此能力，走的是同一个出口。
+/// 没开这项能力时 `recv_provided` 自动透明降级为 Single-shot Recv 模式。
 #[test]
-fn recv_provided_reports_a_runtime_without_provided_buffers() {
+fn recv_provided_falls_back_when_provided_buffers_unavailable() {
     run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
@@ -813,21 +813,21 @@ fn recv_provided_reports_a_runtime_without_provided_buffers() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let (stream, _peer) = listener.accept().await.expect("Accept failed");
-                let err = stream
+                let buf = stream
                     .recv_provided()
                     .await
-                    .expect_err("a runtime without provided buffers must refuse");
-                assert!(
-                    format!("{err}").contains("provided buffers are not available"),
-                    "unexpected error: {err}"
-                );
+                    .expect("recv_provided must fallback and succeed");
+                assert_eq!(buf.as_slice(), b"fallback_provided_data");
             });
 
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                // 撑到服务端问完为止，否则连接先断、错误就变成别的了。
+                let payload = b"fallback_provided_data";
+                let mut buf = ctx.alloc(nz!(64), payload.len());
+                buf.as_slice_mut()[..payload.len()].copy_from_slice(payload);
+                stream.send(buf).await.expect("Failed to send data");
                 yield_now().await;
                 drop(stream);
             });

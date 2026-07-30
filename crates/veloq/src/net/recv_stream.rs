@@ -33,11 +33,11 @@ use veloq_driver_native::{
     driver::{Driver, DriverCapability, PlatformSlotSpec},
     error::Error as DriverError,
     multishot::{is_buffer_ring_exhausted, is_capability_rejected},
-    op::{Op, OpItem, OpResult, OpSubmitter, RecvMulti, RecvProvided},
+    op::{Op, OpItem, OpResult, OpSubmitter, Recv, RecvMulti, RecvProvided},
 };
 
 use crate::{
-    error::Result,
+    error::{Error, Result},
     net::{
         common::{InnerSocket, SocketTokenPtr},
         error::NetError,
@@ -52,6 +52,12 @@ use crate::{
 /// 「一次提交产出几条」。
 type ProvidedItem = OpItem<RecvProvided, PlatformSlotSpec>;
 
+enum RecvItem {
+    Provided(ProvidedItem),
+    Single(OpItem<Recv, PlatformSlotSpec>),
+    AllocError(Report<Error>),
+}
+
 /// 环被掏空后连着重 arm 多少次仍然立刻 `-ENOBUFS`，就把错误交给用户。
 ///
 /// 重 arm 本身是必需的：`-ENOBUFS` 那条 CQE 不带 `IORING_CQE_F_MORE`，内核顺带把整个
@@ -62,10 +68,8 @@ const MAX_EXHAUSTED_REARMS: u32 = 8;
 /// 选哪条路是**运行期**的事，不是编译期的事。
 ///
 /// 与 [`AcceptStream`](crate::net::AcceptStream) 里的 `AcceptMode` 同理：三个变体在两个平
-/// 台上都在，IOCP 的 `capabilities()` 恒为全 `false`，于是 `RecvStream::new` 在那里根本走
-/// 不到构造这个枚举的那一步。IOCP 后端为 `RecvMulti` / `RecvProvided` 提供了提交即失败的
-/// 实现（见 `veloq-driver-iocp` 的 `impl_iocp_unsupported_op!`），单是为了让类型在两个平台
-/// 上对称。
+/// 台上都在，当 `capabilities().provided_buffers` 为 `false` 时（例如 IOCP 或未开启配置），
+/// `RecvStream` 会透明使用 `FallbackSingle` 降级路径，从 Runtime 缓冲池分配 Buffer 执行单发 recv。
 enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
     /// 一次提交，多条完成：句柄本身就是流。
     Native(S::Stream<RecvMulti>),
@@ -73,6 +77,8 @@ enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
     Emulated {
         pending: Option<S::Stream<RecvProvided>>,
     },
+    /// 当 Provided Buffers 不可用或降级时：从 Runtime 动态分配 Buffer 提交单发 Recv。
+    FallbackSingle { pending: Option<S::Stream<Recv>> },
     /// 不再提交任何东西：终态错误已经交给用户了。
     Done,
 }
@@ -114,12 +120,6 @@ where
         submitter: S,
     ) -> Result<Self> {
         let capabilities = ctx.driver(|driver| driver.capabilities());
-        if !capabilities.provided_buffers {
-            // 没有环，两条路都走不了（见模块文档）。这里明确报错而不是悄悄退回普通 recv：
-            // 调用方没有交出 buffer，「换一条路」意味着运行时得凭空造一个，那就把这个 API
-            // 唯一的卖点丢掉了。
-            Err(NetError::ProvidedBuffersUnavailable)?;
-        }
 
         if let Some((mode, native_delivered, rearms, exhausted_streak)) = inner
             .token()
@@ -136,10 +136,14 @@ where
             });
         }
 
-        let mode = if capabilities.recv_multi {
-            RecvMode::Native(Self::arm_native(ctx, &inner, submitter))
+        let mode = if capabilities.provided_buffers {
+            if capabilities.recv_multi {
+                RecvMode::Native(Self::arm_native(ctx, &inner, submitter))
+            } else {
+                RecvMode::Emulated { pending: None }
+            }
         } else {
-            RecvMode::Emulated { pending: None }
+            RecvMode::FallbackSingle { pending: None }
         };
 
         Ok(Self {
@@ -171,29 +175,47 @@ where
         ctx.submit_stream(&submitter, Op::new(RecvMulti { fd }))
     }
 
-    /// 这一项是不是「内核不认识 multishot recv」，是的话就地降级。
+    /// 这一项是不是「内核不认识 multishot recv」或不支持 provided buffers，是的话就地降级。
     ///
-    /// 与 [`AcceptStream`](crate::net::AcceptStream) 上同名方法逐条同理：`IORING_OP_RECV`
-    /// 从 5.6 就在，它的 multishot 变体要 6.0，probe 分不出这两者。
-    fn downgraded(&mut self, item: &ProvidedItem) -> bool {
+    /// 与 [`AcceptStream`](crate::net::AcceptStream) 上同名方法逐条同理。
+    fn downgraded(&mut self, item: &RecvItem) -> bool {
         let Some(mode) = self.mode.as_ref() else {
             return false;
         };
-        if self.native_delivered || !matches!(mode, RecvMode::Native(_)) {
+        let RecvItem::Provided(provided_item) = item else {
+            return false;
+        };
+        if self.native_delivered {
             return false;
         }
-        let OpResult::Completed(Err(report), _) = item else {
+        let OpResult::Completed(Err(report), _) = provided_item else {
             return false;
         };
         if !is_capability_rejected(report) {
             return false;
         }
-        // 关掉的是 driver 上的能力，不是这条流的：同一个 worker 后续开的每条流都直接从
-        // `Emulated` 起步，不再各自付一次失败提交。
-        self.ctx
-            .driver(|mut driver| driver.note_capability_rejected(DriverCapability::RecvMulti));
-        self.mode = Some(RecvMode::Emulated { pending: None });
-        true
+
+        match mode {
+            RecvMode::Native(_) => {
+                self.ctx.driver(|mut driver| {
+                    driver.note_capability_rejected(DriverCapability::RecvMulti)
+                });
+                let provided = self
+                    .ctx
+                    .driver(|driver| driver.capabilities().provided_buffers);
+                if provided {
+                    self.mode = Some(RecvMode::Emulated { pending: None });
+                } else {
+                    self.mode = Some(RecvMode::FallbackSingle { pending: None });
+                }
+                true
+            }
+            RecvMode::Emulated { .. } => {
+                self.mode = Some(RecvMode::FallbackSingle { pending: None });
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 环空了：重新 arm 并要求再来一轮，除非已经连着试了太多次。
@@ -220,7 +242,7 @@ where
     }
 
     /// 从当前模式取一轮原始结果。`Ready(None)` 表示后端句柄的流空了。
-    fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Option<ProvidedItem>> {
+    fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Option<RecvItem>> {
         let Some(mode) = self.mode.as_mut() else {
             return Poll::Ready(None);
         };
@@ -229,7 +251,7 @@ where
             RecvMode::Native(stream) => {
                 // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
                 let stream = unsafe { Pin::new_unchecked(stream) };
-                stream.poll_next(cx)
+                stream.poll_next(cx).map(|opt| opt.map(RecvItem::Provided))
             }
             RecvMode::Emulated { pending } => {
                 if pending.is_none() {
@@ -253,39 +275,89 @@ where
                 };
                 // 这一次已经结束，下一轮会重新提交。
                 *pending = None;
-                Poll::Ready(Some(result))
+                Poll::Ready(Some(RecvItem::Provided(result)))
+            }
+            RecvMode::FallbackSingle { pending } => {
+                if pending.is_none() {
+                    let buf = match self.ctx.try_alloc_full(veloq_std::nz!(8192)) {
+                        Ok(buf) => buf,
+                        Err(err) => return Poll::Ready(Some(RecvItem::AllocError(err.trans()))),
+                    };
+                    let fd = self.inner.fd();
+                    *pending = Some(self.ctx.submit_stream(
+                        &self.submitter,
+                        Op::new(Recv {
+                            fd,
+                            buf,
+                            buf_offset: 0,
+                        }),
+                    ));
+                }
+
+                let Some(op) = pending.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                // SAFETY: 与上面同理。
+                let op = unsafe { Pin::new_unchecked(op) };
+                let result = match op.poll_next(cx) {
+                    Poll::Ready(Some(result)) => result,
+                    Poll::Ready(None) => unreachable!("a single-shot recv was polled twice"),
+                    Poll::Pending => return Poll::Pending,
+                };
+                *pending = None;
+                Poll::Ready(Some(RecvItem::Single(result)))
             }
         }
     }
 
     /// 把一条完成变成这条流的下一步动作。
-    fn classify(&mut self, item: ProvidedItem) -> Flow {
+    fn classify(&mut self, item: RecvItem) -> Flow {
         if self.downgraded(&item) {
             return Flow::Retry;
         }
         self.native_delivered = true;
 
-        let (res, provided) = item.into_inner();
-        let received = match res {
-            // 对端关闭。那个（空的）buffer 随 `provided` 一起回池。
-            Ok(0) => return Flow::End,
-            Ok(received) => received,
-            Err(report) => return self.classify_error(report),
-        };
+        match item {
+            RecvItem::Provided(provided_item) => {
+                let (res, provided) = provided_item.into_inner();
+                let received = match res {
+                    // 对端关闭。那个（空的）buffer 随 `provided` 一起回池。
+                    Ok(0) => return Flow::End,
+                    Ok(received) => received,
+                    Err(report) => return self.classify_error(report),
+                };
 
-        self.exhausted_streak = 0;
-        Flow::Yield(match provided.and_then(|provided| provided.buf) {
-            Some(buf) => {
-                debug_assert_eq!(
-                    buf.len(),
-                    received,
-                    "the driver sizes the buffer it hands out"
-                );
-                Ok(buf)
+                self.exhausted_streak = 0;
+                Flow::Yield(match provided.and_then(|provided| provided.buf) {
+                    Some(buf) => {
+                        debug_assert_eq!(
+                            buf.len(),
+                            received,
+                            "the driver sizes the buffer it hands out"
+                        );
+                        Ok(buf)
+                    }
+                    None => Err(NetError::ProvidedBufferMissing).trans(),
+                })
             }
-            // 内核写了字节数却没给 bid，只可能是驱动那一侧的账错了。
-            None => Err(NetError::ProvidedBufferMissing).trans(),
-        })
+            RecvItem::Single(single_item) => {
+                let (res, recv_op) = single_item.into_inner();
+                let received = match res {
+                    Ok(0) => return Flow::End,
+                    Ok(received) => received,
+                    Err(report) => return Flow::Yield(Err(report).trans()),
+                };
+
+                self.exhausted_streak = 0;
+                let Some(recv_op) = recv_op else {
+                    return Flow::Yield(Err(NetError::OpBufferLost).trans());
+                };
+                let mut buf = recv_op.buf;
+                buf.set_len(received);
+                Flow::Yield(Ok(buf))
+            }
+            RecvItem::AllocError(err) => Flow::Yield(Err(err)),
+        }
     }
 
     fn classify_error(&mut self, report: Report<DriverError>) -> Flow {

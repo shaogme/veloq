@@ -554,7 +554,10 @@ fn multithread_udp_cross_worker_drop_is_routed() {
             s.spawn_boxed(async move {
                 let socket = clone_rx.recv().await.expect("clone channel closed");
                 // 在跨 Worker 线程上直接显式 close().await 彻底完成解绑
-                socket.close().await.expect("cross worker socket close failed");
+                socket
+                    .close()
+                    .await
+                    .expect("cross worker socket close failed");
             });
         })
         .await

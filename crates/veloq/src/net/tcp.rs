@@ -200,50 +200,35 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
         Ok((res.trans()?, buf))
     }
 
-    /// 这个运行时是否真的注册上了 provided buffer 环。
+    /// 接收一段数据，buffer 由内核在数据到达时才从 provided buffer 环里挑。
     ///
-    /// 查的是**当前 worker** 的驱动。所有 worker 用同一份配置构造，所以答案一致；真正会
-    /// 让它变成 `false` 的是内核不支持（`IORING_REGISTER_PBUF_RING` 要 5.19），而那对整个
-    /// 进程是一样的。
-    ///
-    /// IOCP 的 `capabilities()` 恒为全 `false`，所以这一条在那里总是失败——**同一个判据**，
-    /// 不是另写一条平台分支。
-    fn ensure_provided_buffers(&self) -> Result<()> {
+    /// 若当前 Runtime 或 OS 不支持 provided buffer，该方法将自动降级为由 Runtime 动态分配 Buffer
+    /// 并执行单发 recv，保持透明可控。
+    async fn recv_provided_direct(&self) -> Result<FixedBuf> {
         if self
             .ctx
             .driver(|driver| driver.capabilities().provided_buffers)
         {
-            return Ok(());
+            let op = RecvProvided {
+                fd: self.inner.fd(),
+            };
+            let (res, op_back) = self
+                .ctx
+                .submit(&self.submitter, Op::new(op))
+                .await
+                .into_inner();
+            if let Ok(received) = res
+                && let Some(buf) = op_back.and_then(|provided| provided.buf)
+            {
+                debug_assert_eq!(buf.len(), received);
+                return Ok(buf);
+            }
         }
-        Err(NetError::ProvidedBuffersUnavailable)?
-    }
 
-    /// 接收一段数据，buffer 由内核在数据到达时才从 provided buffer 环里挑。
-    ///
-    /// 与 [`Self::recv_subset_direct`] 的差别在**谁提供 buffer**：这里调用方不必先交出一
-    /// 个，于是一个空闲连接不占任何接收缓冲。代价是必须先开这项能力（
-    /// [`crate::config::Config::uring_provided_buffers`]），否则返回
-    /// [`NetError::ProvidedBuffersUnavailable`]。
-    ///
-    /// 返回的 `FixedBuf` 的长度已经是内核实际写入的字节数；读到 0 字节表示对端关闭。
-    async fn recv_provided_direct(&self) -> Result<FixedBuf> {
-        self.ensure_provided_buffers()?;
-
-        let op = RecvProvided {
-            fd: self.inner.fd(),
-        };
-        let (res, op_back) = self
-            .ctx
-            .submit(&self.submitter, Op::new(op))
-            .await
-            .into_inner();
-        // 先取结果：出错的完成通常一个 buffer 都没消费，此时 `buf` 本就是 `None`。
-        res.trans()?;
-        // 长度由驱动在取出 buffer 时按 CQE 的结果设好，这里不重复设一次。
-        op_back
-            .and_then(|provided| provided.buf)
-            .ok_or(NetError::ProvidedBufferMissing)
-            .trans()
+        let buf = self.ctx.try_alloc_full(veloq_std::nz!(8192)).trans()?;
+        let (n, mut buf) = self.recv_subset_direct(buf, 0).await?;
+        buf.set_len(n);
+        Ok(buf)
     }
 
     /// 把这条连接变成一条数据流，每一项的 buffer 由内核在数据到达时才从 provided buffer
@@ -418,15 +403,27 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
     /// `FixedBuf` 属于**那个** worker 的池，跨 worker drop 走池自己的归还路径，与其它任何
     /// `FixedBuf` 没有区别。
     pub async fn recv_provided(&self) -> Result<FixedBuf> {
-        self.ensure_provided_buffers()?;
+        if self
+            .ctx
+            .driver(|driver| driver.capabilities().provided_buffers)
+        {
+            let owner = self.inner.owner_worker_id();
+            let op = RecvProvided {
+                fd: self.inner.fd(),
+            };
+            let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
+            if let Ok(received) = res
+                && let Some(buf) = provided.buf
+            {
+                debug_assert_eq!(buf.len(), received);
+                return Ok(buf);
+            }
+        }
 
-        let owner = self.inner.owner_worker_id();
-        let op = RecvProvided {
-            fd: self.inner.fd(),
-        };
-        let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.trans()?;
-        provided.buf.ok_or(NetError::ProvidedBufferMissing).trans()
+        let buf = self.ctx.try_alloc_full(veloq_std::nz!(8192)).trans()?;
+        let (n, mut buf) = self.recv_subset(buf, 0).await?;
+        buf.set_len(n);
+        Ok(buf)
     }
 
     /// 显式优雅关闭 TcpStream 并解绑底层资源。
