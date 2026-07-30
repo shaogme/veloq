@@ -365,6 +365,11 @@ where
     pub fn is_armed(&self) -> bool {
         self.token.is_some()
     }
+
+    /// 确保该操作已被 Arm。
+    pub fn arm(&mut self) -> bool {
+        self.is_armed() || self.immediate.is_some()
+    }
 }
 
 impl<T, Spec> Drop for DetachedOp<T, Spec>
@@ -449,6 +454,7 @@ where
     pub(crate) data: Option<T>,
     pub(crate) provider: P,
     pub(crate) token: Option<OpToken>,
+    pub(crate) immediate: Option<OpItem<T, P::SlotSpec>>,
     pub(crate) marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -469,8 +475,24 @@ where
             data: Some(data),
             provider,
             token: None,
+            immediate: None,
             marker: std::marker::PhantomData,
         }
+    }
+
+    /// 查询该操作当前是否处于 Armed 状态或已同步定局。
+    pub fn is_armed(&self) -> bool {
+        matches!(self.state, LocalState::Submitted) || self.immediate.is_some()
+    }
+
+    /// 确保该操作已被 Arm (提交到底层驱动)。
+    pub fn arm(&mut self) -> bool {
+        if let LocalState::Defined = self.state
+            && let Some(item) = self.submit()
+        {
+            self.immediate = Some(item);
+        }
+        self.is_armed()
     }
 
     /// 提交。返回 `Some` 表示这次提交同步就定局了（操作一条完成都不会产生）。
@@ -555,6 +577,10 @@ where
 
     /// 取下一项。`Ready(None)` 表示这个操作已经终止。
     fn poll_item(&mut self, cx: &mut Context<'_>) -> Poll<Option<OpItem<T, P::SlotSpec>>> {
+        if let Some(item) = self.immediate.take() {
+            return Poll::Ready(Some(item));
+        }
+
         if let LocalState::Defined = self.state
             && let Some(item) = self.submit()
         {

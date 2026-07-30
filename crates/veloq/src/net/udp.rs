@@ -1,7 +1,10 @@
 use std::{
+    future::Future,
     net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
     rc::Rc,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use crate::{
@@ -17,12 +20,15 @@ use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::{
     Socket,
+    driver::{DriverRaw, PlatformDriver},
     op::{
-        DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect,
-        UdpRecv as OpUdpRecv, UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
+        DetachedOp, DetachedSubmitter, LocalOp, LocalSubmitter, Op, OpItem, OpSubmitter, SendTo,
+        UdpConnect, UdpRecv as OpUdpRecv, UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf,
+        UdpSend as OpUdpSend,
     },
     socket_addr_to_storage,
 };
+use veloq_runtime::runtime::context::RoutedFuture;
 
 #[derive(Clone)]
 pub struct GenericUdpSocket<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
@@ -35,6 +41,113 @@ pub type LocalUdpSocket<'rt, 'reg> =
     GenericUdpSocket<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
 pub type UdpSocket<'rt, 'reg> =
     GenericUdpSocket<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
+
+type UdpRecvLocalOp<'rt, 'reg> = LocalOp<'rt, UdpRecvFrom, Ctx<'rt, 'reg>>;
+type UdpRecvDetachedOp<'reg> =
+    DetachedOp<UdpRecvFrom, <PlatformDriver<'reg> as DriverRaw>::SlotSpec>;
+
+pub struct PreparedLocalUdpRecv<'rt, 'reg> {
+    pub(crate) op_fut: UdpRecvLocalOp<'rt, 'reg>,
+}
+
+impl<'rt, 'reg> PreparedLocalUdpRecv<'rt, 'reg> {
+    pub fn arm(&mut self) -> bool {
+        self.op_fut.arm()
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.op_fut.is_armed()
+    }
+}
+
+impl<'rt, 'reg> Future for PreparedLocalUdpRecv<'rt, 'reg> {
+    type Output = Result<UdpRecvPacket>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let item = match Pin::new(&mut self.op_fut).poll(cx) {
+            Poll::Ready(item) => item,
+            Poll::Pending => return Poll::Pending,
+        };
+        Poll::Ready(parse_udp_recv_item(item))
+    }
+}
+
+fn parse_udp_recv_item<'reg>(
+    item: OpItem<UdpRecvFrom, <PlatformDriver<'reg> as DriverRaw>::SlotSpec>,
+) -> Result<UdpRecvPacket> {
+    let (res, op_back_opt) = item.into_inner();
+    let op_back = op_back_opt.ok_or(NetError::UdpRecvFromOpLost).trans()?;
+    let n = res.trans()?;
+    let mut recv_buf = op_back.buf;
+    recv_buf.set_len(n);
+    let addr = op_back
+        .addr
+        .ok_or(NetError::UdpRecvFromMissingAddr)
+        .trans()?;
+    Ok(UdpRecvPacket {
+        buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
+        addr,
+    })
+}
+
+pub enum PreparedUdpRecvState<'reg> {
+    Local(UdpRecvDetachedOp<'reg>),
+    Remote(RoutedFuture<UdpRecvDetachedOp<'reg>>),
+    Done,
+}
+
+pub struct PreparedUdpRecv<'reg> {
+    pub(crate) state: PreparedUdpRecvState<'reg>,
+}
+
+impl<'reg> PreparedUdpRecv<'reg> {
+    pub fn arm(&mut self) -> bool {
+        match &mut self.state {
+            PreparedUdpRecvState::Local(op) => op.arm(),
+            PreparedUdpRecvState::Remote(_) => true,
+            PreparedUdpRecvState::Done => false,
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        match &self.state {
+            PreparedUdpRecvState::Local(op) => op.is_armed(),
+            PreparedUdpRecvState::Remote(_) => true,
+            PreparedUdpRecvState::Done => false,
+        }
+    }
+}
+
+impl<'reg> Future for PreparedUdpRecv<'reg> {
+    type Output = Result<UdpRecvPacket>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match &mut this.state {
+            PreparedUdpRecvState::Local(op_fut) => {
+                let item = match Pin::new(op_fut).poll(cx) {
+                    Poll::Ready(item) => item,
+                    Poll::Pending => return Poll::Pending,
+                };
+                this.state = PreparedUdpRecvState::Done;
+                Poll::Ready(parse_udp_recv_item(item))
+            }
+            PreparedUdpRecvState::Remote(routed) => {
+                let item_res = match Pin::new(routed).poll(cx) {
+                    Poll::Ready(res) => res,
+                    Poll::Pending => return Poll::Pending,
+                };
+                this.state = PreparedUdpRecvState::Done;
+                let item = match item_res.trans() {
+                    Ok(item) => item,
+                    Err(e) => return Poll::Ready(Err(e)),
+                };
+                Poll::Ready(parse_udp_recv_item(item))
+            }
+            PreparedUdpRecvState::Done => panic!("PreparedUdpRecv polled after completion"),
+        }
+    }
+}
 
 fn bind_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
     ctx: Ctx<'rt, 'reg>,
@@ -82,32 +195,6 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
             .ok_or(NetError::OpBufferLost)
             .trans()?;
         Ok((res.trans()?, buf))
-    }
-
-    async fn recv_from_direct(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
-        let op = UdpRecvFrom {
-            fd: self.inner.fd(),
-            buf,
-            buf_offset: 0,
-            addr: None,
-        };
-        let (res, op_back_opt) = self
-            .ctx
-            .submit(&self.submitter, Op::new(op))
-            .await
-            .into_inner();
-        let op_back = op_back_opt.ok_or(NetError::UdpRecvFromOpLost).trans()?;
-        let n = res.trans()?;
-        let mut recv_buf = op_back.buf;
-        recv_buf.set_len(n);
-        let addr = op_back
-            .addr
-            .ok_or(NetError::UdpRecvFromMissingAddr)
-            .trans()?;
-        Ok(UdpRecvPacket {
-            buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
-            addr,
-        })
     }
 
     async fn connect_direct(&self, addr: SocketAddr) -> Result<()> {
@@ -184,8 +271,19 @@ impl<'rt, 'reg> LocalUdpSocket<'rt, 'reg> {
         self.send_to_direct(buf, target).await
     }
 
+    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedLocalUdpRecv<'rt, 'reg> {
+        let op = UdpRecvFrom {
+            fd: self.inner.fd(),
+            buf,
+            buf_offset: 0,
+            addr: None,
+        };
+        let op_fut = self.ctx.submit(&self.submitter, Op::new(op));
+        PreparedLocalUdpRecv { op_fut }
+    }
+
     pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
-        self.recv_from_direct(buf).await
+        self.prepare_recv_from(buf).await
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
@@ -230,7 +328,7 @@ impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
         Ok((res.trans()?, op.buf))
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
+    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedUdpRecv<'reg> {
         let owner = self.inner.owner_worker_id();
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
@@ -238,15 +336,31 @@ impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
             buf_offset: 0,
             addr: None,
         };
-        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        let n = res.trans()?;
-        let mut recv_buf = op.buf;
-        recv_buf.set_len(n);
-        let addr = op.addr.ok_or(NetError::UdpRecvFromMissingAddr).trans()?;
-        Ok(UdpRecvPacket {
-            buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
-            addr,
-        })
+        if self.ctx.runtime_ctx.worker_id() == owner {
+            let op_fut = self.ctx.submit(&self.submitter, Op::new(op));
+            PreparedUdpRecv {
+                state: PreparedUdpRecvState::Local(op_fut),
+            }
+        } else {
+            let runtime_ctx_clone = self.ctx.runtime_ctx;
+            let routed = self
+                .ctx
+                .runtime_ctx
+                .route_to(owner, move || {
+                    let ctx = Ctx {
+                        runtime_ctx: runtime_ctx_clone,
+                    };
+                    ctx.driver(|mut driver| Op::new(op).submit_detached(&mut driver))
+                })
+                .expect("Failed to route submit_detached");
+            PreparedUdpRecv {
+                state: PreparedUdpRecvState::Remote(routed),
+            }
+        }
+    }
+
+    pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
+        self.prepare_recv_from(buf).await
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> Result<()> {

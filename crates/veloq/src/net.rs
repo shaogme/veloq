@@ -10,4 +10,4 @@ pub use accept_stream::AcceptStream;
 pub use recv_stream::RecvStream;
 pub use socket::{TcpSocket, UdpSocketBuilder};
 pub use tcp::{TcpListener, TcpStream};
-pub use udp::UdpSocket;
+pub use udp::{LocalUdpSocket, PreparedLocalUdpRecv, PreparedUdpRecv, UdpSocket};
