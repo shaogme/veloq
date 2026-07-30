@@ -405,6 +405,11 @@ impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         Ok((res.trans()?, op.buf))
     }
+
+    /// 显式优雅关闭 Socket 并解绑底层资源。
+    pub async fn close(self) -> Result<()> {
+        self.inner.close_async().await
+    }
 }
 
 impl<'rt, 'reg> AsyncBufRead for LocalUdpSocket<'rt, 'reg> {

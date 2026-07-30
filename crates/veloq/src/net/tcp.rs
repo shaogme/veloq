@@ -133,6 +133,11 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
         self.inner.local_addr()
     }
 
+    /// 显式优雅关闭 Listener 并解绑底层资源。
+    pub async fn close(self) -> Result<()> {
+        self.inner.close_async().await
+    }
+
     /// 把这个 listener 变成一条连接流。
     ///
     /// 与反复 `accept()` 语义相同，但在支持 multishot accept 的内核上只提交一次 SQE、
@@ -422,6 +427,11 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
         let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.trans()?;
         provided.buf.ok_or(NetError::ProvidedBufferMissing).trans()
+    }
+
+    /// 显式优雅关闭 TcpStream 并解绑底层资源。
+    pub async fn close(self) -> Result<()> {
+        self.inner.close_async().await
     }
 }
 

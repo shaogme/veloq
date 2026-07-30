@@ -215,4 +215,9 @@ where
             .ok_or(NetError::LocalAddrUnavailable)
             .trans()
     }
+
+    pub async fn close_async(self) -> Result<()> {
+        drop(self.token);
+        Ok(())
+    }
 }

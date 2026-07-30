@@ -504,19 +504,13 @@ fn multithread_udp_cross_worker_drop_is_routed() {
     run_test_with_workers(nz!(2), async |ctx| {
         let state = mpsc::unbounded::<UdpSocket<'_, '_>>();
         let (clone_tx, mut clone_rx) = state.split();
-        let state = mpsc::unbounded::<()>();
-        let (ready_tx, mut ready_rx) = state.split();
-        let state = mpsc::unbounded::<()>();
-        let (done_tx, mut done_rx) = state.split();
 
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let socket = bind_udp_socket(ctx, "127.0.0.1:0");
                 clone_tx.send(socket.clone()).unwrap();
-                drop(socket);
-                ready_tx.send(()).unwrap();
-
-                done_rx.recv().await.expect("cross-worker drop ack missing");
+                // 显式关闭本端的 socket 引用，底层 Token 在跨 Worker 端关闭后将回收解绑
+                socket.close().await.expect("socket close failed");
 
                 let probe_server = bind_udp_socket(ctx, "127.0.0.1:0");
                 let probe_client =
@@ -559,9 +553,8 @@ fn multithread_udp_cross_worker_drop_is_routed() {
 
             s.spawn_boxed(async move {
                 let socket = clone_rx.recv().await.expect("clone channel closed");
-                ready_rx.recv().await.expect("ready channel closed");
-                drop(socket);
-                done_tx.send(()).unwrap();
+                // 在跨 Worker 线程上直接显式 close().await 彻底完成解绑
+                socket.close().await.expect("cross worker socket close failed");
             });
         })
         .await
