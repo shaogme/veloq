@@ -21,7 +21,7 @@
 //!
 //! 见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §6 / §7。
 
-use std::{
+use veloq_std::{
     pin::Pin,
     task::{Context, Poll},
 };
@@ -91,7 +91,7 @@ enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
 /// per-worker 的，provided buffer 环也是。
 pub struct RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: SocketTokenPtr<'rt, 'reg>>
 {
-    mode: RecvMode<'rt, 'reg, S>,
+    mode: Option<RecvMode<'rt, 'reg, S>>,
     inner: InnerSocket<'rt, 'reg, P>,
     submitter: S,
     ctx: Ctx<'rt, 'reg>,
@@ -121,6 +121,21 @@ where
             Err(NetError::ProvidedBuffersUnavailable)?;
         }
 
+        if let Some((mode, native_delivered, rearms, exhausted_streak)) = inner
+            .token()
+            .take_recv::<(RecvMode<'rt, 'reg, S>, bool, u32, u32)>()
+        {
+            return Ok(Self {
+                mode: Some(mode),
+                inner,
+                submitter,
+                ctx,
+                native_delivered,
+                rearms,
+                exhausted_streak,
+            });
+        }
+
         let mode = if capabilities.recv_multi {
             RecvMode::Native(Self::arm_native(ctx, &inner, submitter))
         } else {
@@ -128,7 +143,7 @@ where
         };
 
         Ok(Self {
-            mode,
+            mode: Some(mode),
             inner,
             submitter,
             ctx,
@@ -161,7 +176,10 @@ where
     /// 与 [`AcceptStream`](crate::net::AcceptStream) 上同名方法逐条同理：`IORING_OP_RECV`
     /// 从 5.6 就在，它的 multishot 变体要 6.0，probe 分不出这两者。
     fn downgraded(&mut self, item: &ProvidedItem) -> bool {
-        if self.native_delivered || !matches!(self.mode, RecvMode::Native(_)) {
+        let Some(mode) = self.mode.as_ref() else {
+            return false;
+        };
+        if self.native_delivered || !matches!(mode, RecvMode::Native(_)) {
             return false;
         }
         let OpResult::Completed(Err(report), _) = item else {
@@ -174,7 +192,7 @@ where
         // `Emulated` 起步，不再各自付一次失败提交。
         self.ctx
             .driver(|mut driver| driver.note_capability_rejected(DriverCapability::RecvMulti));
-        self.mode = RecvMode::Emulated { pending: None };
+        self.mode = Some(RecvMode::Emulated { pending: None });
         true
     }
 
@@ -184,13 +202,17 @@ where
     fn rearm_exhausted(&mut self) -> bool {
         self.exhausted_streak += 1;
         if self.exhausted_streak > MAX_EXHAUSTED_REARMS {
-            self.mode = RecvMode::Done;
+            self.mode = Some(RecvMode::Done);
             return false;
         }
         self.rearms = self.rearms.saturating_add(1);
-        if matches!(self.mode, RecvMode::Native(_)) {
+        if matches!(self.mode.as_ref(), Some(RecvMode::Native(_))) {
             // multishot 已经被内核连同这条 `-ENOBUFS` 一起终止了，句柄里那条流是空的。
-            self.mode = RecvMode::Native(Self::arm_native(self.ctx, &self.inner, self.submitter));
+            self.mode = Some(RecvMode::Native(Self::arm_native(
+                self.ctx,
+                &self.inner,
+                self.submitter,
+            )));
         }
         // `Emulated` 不必做什么：`poll_step` 取走结果时已经把 `pending` 清了，下一轮自然会
         // 重新提交。
@@ -199,7 +221,10 @@ where
 
     /// 从当前模式取一轮原始结果。`Ready(None)` 表示后端句柄的流空了。
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Option<ProvidedItem>> {
-        match &mut self.mode {
+        let Some(mode) = self.mode.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match mode {
             RecvMode::Done => Poll::Ready(None),
             RecvMode::Native(stream) => {
                 // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
@@ -215,7 +240,9 @@ where
                     );
                 }
 
-                let op = pending.as_mut().expect("just armed above");
+                let Some(op) = pending.as_mut() else {
+                    return Poll::Ready(None);
+                };
                 // SAFETY: 与上面同理。
                 let op = unsafe { Pin::new_unchecked(op) };
                 let result = match op.poll_next(cx) {
@@ -277,6 +304,23 @@ enum Flow {
     Retry,
     /// 流正常结束。
     End,
+}
+
+impl<'rt, 'reg, S, P> Drop for RecvStream<'rt, 'reg, S, P>
+where
+    S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
+    P: SocketTokenPtr<'rt, 'reg>,
+{
+    fn drop(&mut self) {
+        if let Some(mode) = self.mode.take() {
+            self.inner.token().stash_recv((
+                mode,
+                self.native_delivered,
+                self.rearms,
+                self.exhausted_streak,
+            ));
+        }
+    }
 }
 
 impl<'rt, 'reg, S, P> Stream for RecvStream<'rt, 'reg, S, P>

@@ -91,6 +91,18 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     GenericTcpListener<'rt, 'reg, S, P>
 {
     async fn accept_direct(&self) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+        if self.inner.token().has_stashed_accept() {
+            let mut stream = self.accept_multi();
+            let polled = std::future::poll_fn(|cx| {
+                use futures_core::Stream;
+                unsafe { std::pin::Pin::new_unchecked(&mut stream) }.poll_next(cx)
+            })
+            .await;
+            if let Some(res) = polled {
+                return res;
+            }
+        }
+
         let op = Accept {
             fd: self.inner.fd(),
             addr: SockAddrStorage::default(),
@@ -287,6 +299,18 @@ impl<'rt, 'reg> TcpListener<'rt, 'reg> {
     }
 
     pub async fn accept(&self) -> Result<(TcpStream<'rt, 'reg>, SocketAddr)> {
+        if self.inner.token().has_stashed_accept() {
+            let mut stream = self.accept_multi();
+            let polled = std::future::poll_fn(|cx| {
+                use futures_core::Stream;
+                unsafe { std::pin::Pin::new_unchecked(&mut stream) }.poll_next(cx)
+            })
+            .await;
+            if let Some(res) = polled {
+                return res;
+            }
+        }
+
         let owner = self.inner.owner_worker_id();
         let op = Accept {
             fd: self.inner.fd(),

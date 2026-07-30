@@ -1,4 +1,10 @@
-use std::{marker::PhantomData, net::SocketAddr, ops::Deref, rc::Rc, sync::Arc};
+use veloq_std::{
+    marker::PhantomData,
+    net::SocketAddr,
+    ops::Deref,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     error::Result,
@@ -17,10 +23,29 @@ use diagweave::prelude::*;
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
+struct StashedBox {
+    ptr: *mut (),
+    drop_fn: unsafe fn(*mut ()),
+}
+
+unsafe impl Send for StashedBox {}
+unsafe impl Sync for StashedBox {}
+
+impl Drop for StashedBox {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { (self.drop_fn)(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 pub struct SocketToken<'rt, 'reg> {
     fd: IoFd,
     owner_worker_id: usize,
     ctx: Ctx<'rt, 'reg>,
+    accept_stash: Mutex<Option<StashedBox>>,
+    recv_stash: Mutex<Option<StashedBox>>,
 }
 
 impl<'rt, 'reg> SocketToken<'rt, 'reg> {
@@ -41,12 +66,70 @@ impl<'rt, 'reg> SocketToken<'rt, 'reg> {
             fd,
             owner_worker_id: ctx.runtime_ctx.worker_id(),
             ctx,
+            accept_stash: Mutex::new(None),
+            recv_stash: Mutex::new(None),
         })
     }
 
     #[inline]
     pub(crate) fn fd(&self) -> IoFd {
         self.fd
+    }
+
+    pub(crate) fn stash_accept<T>(&self, val: T) {
+        unsafe fn drop_ptr<T>(ptr: *mut ()) {
+            let _ = unsafe { Box::from_raw(ptr as *mut T) };
+        }
+
+        let ptr = Box::into_raw(Box::new(val)) as *mut ();
+        let stashed = StashedBox {
+            ptr,
+            drop_fn: drop_ptr::<T>,
+        };
+        let mut guard = self.accept_stash.lock();
+        *guard = Some(stashed);
+    }
+
+    pub(crate) fn take_accept<T>(&self) -> Option<T> {
+        let mut guard = self.accept_stash.lock();
+        if let Some(mut stashed) = guard.take() {
+            let ptr = stashed.ptr;
+            stashed.ptr = std::ptr::null_mut();
+            let boxed = unsafe { Box::from_raw(ptr as *mut T) };
+            Some(*boxed)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_stashed_accept(&self) -> bool {
+        self.accept_stash.lock().is_some()
+    }
+
+    pub(crate) fn stash_recv<T>(&self, val: T) {
+        unsafe fn drop_ptr<T>(ptr: *mut ()) {
+            let _ = unsafe { Box::from_raw(ptr as *mut T) };
+        }
+
+        let ptr = Box::into_raw(Box::new(val)) as *mut ();
+        let stashed = StashedBox {
+            ptr,
+            drop_fn: drop_ptr::<T>,
+        };
+        let mut guard = self.recv_stash.lock();
+        *guard = Some(stashed);
+    }
+
+    pub(crate) fn take_recv<T>(&self) -> Option<T> {
+        let mut guard = self.recv_stash.lock();
+        if let Some(mut stashed) = guard.take() {
+            let ptr = stashed.ptr;
+            stashed.ptr = std::ptr::null_mut();
+            let boxed = unsafe { Box::from_raw(ptr as *mut T) };
+            Some(*boxed)
+        } else {
+            None
+        }
     }
 }
 
@@ -116,6 +199,11 @@ where
     #[inline]
     pub fn fd(&self) -> IoFd {
         self.token.fd()
+    }
+
+    #[inline]
+    pub fn token(&self) -> &SocketToken<'rt, 'reg> {
+        &self.token
     }
 
     pub fn owner_worker_id(&self) -> usize {

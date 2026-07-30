@@ -77,7 +77,7 @@ pub struct AcceptStream<
     S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
     P: SocketTokenPtr<'rt, 'reg>,
 > {
-    mode: AcceptMode<'rt, 'reg, S>,
+    mode: Option<AcceptMode<'rt, 'reg, S>>,
     inner: InnerSocket<'rt, 'reg, P>,
     submitter: S,
     ctx: Ctx<'rt, 'reg>,
@@ -94,13 +94,26 @@ where
     P: SocketTokenPtr<'rt, 'reg>,
 {
     pub(crate) fn new(ctx: Ctx<'rt, 'reg>, inner: InnerSocket<'rt, 'reg, P>, submitter: S) -> Self {
+        if let Some((mode, native_delivered)) = inner
+            .token()
+            .take_accept::<(AcceptMode<'rt, 'reg, S>, bool)>()
+        {
+            return Self {
+                mode: Some(mode),
+                inner,
+                submitter,
+                ctx,
+                native_delivered,
+            };
+        }
+
         // 能力由 driver 缓存：第一次被内核以 EINVAL 拒绝之后就不会再试（见
         // `Driver::note_capability_rejected`），后续的 listener 不重复付探测代价。
         let native = ctx.driver(|driver| driver.capabilities().accept_multi);
         let mode = Self::arm(ctx, &inner, submitter, native);
 
         Self {
-            mode,
+            mode: Some(mode),
             inner,
             submitter,
             ctx,
@@ -180,7 +193,7 @@ where
         // `Emulated` 起步，不再各自付一次失败提交。
         self.ctx
             .driver(|mut driver| driver.note_capability_rejected(DriverCapability::AcceptMulti));
-        self.mode = AcceptMode::Emulated { pending: None };
+        self.mode = Some(AcceptMode::Emulated { pending: None });
         true
     }
 
@@ -190,7 +203,10 @@ where
     /// 重新提交一次单发 accept，本轮照样交得出一项。降级至多发生一次（此后 `mode` 已经是
     /// `Emulated`），所以这里没有循环也不会漏。
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
-        let polled = match &mut self.mode {
+        let Some(mode) = self.mode.as_mut() else {
+            return Poll::Ready(Step::Ended);
+        };
+        let polled = match mode {
             // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
             AcceptMode::Native(stream) => unsafe { Pin::new_unchecked(stream) }.poll_next(cx),
             AcceptMode::Emulated { .. } => Poll::Ready(None),
@@ -205,7 +221,7 @@ where
             // `Emulated` 用 `Ready(None)` 表示「这一轮不归 Native」，所以只有真的处在
             // `Native` 时它才意味着流结束。
             Poll::Ready(None) => {
-                if matches!(self.mode, AcceptMode::Native(_)) {
+                if matches!(self.mode.as_ref(), Some(AcceptMode::Native(_))) {
                     return Poll::Ready(Step::Ended);
                 }
             }
@@ -217,7 +233,10 @@ where
 
     /// 提交（必要时）并取走这一次单发 accept 的结果。
     fn poll_emulated(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
-        let pending = match &mut self.mode {
+        let Some(mode) = self.mode.as_mut() else {
+            return Poll::Ready(Step::Ended);
+        };
+        let pending = match mode {
             AcceptMode::Emulated { pending } => pending,
             AcceptMode::Native(_) => {
                 unreachable!("poll_emulated runs only once the mode settled on Emulated")
@@ -237,7 +256,9 @@ where
             ));
         }
 
-        let op = pending.as_mut().expect("just armed above");
+        let Some(op) = pending.as_mut() else {
+            return Poll::Ready(Step::Ended);
+        };
         // SAFETY: 句柄不是自引用的，投影出 `&mut` 不违反 pin 契约。
         let op = unsafe { Pin::new_unchecked(op) };
         let result = match op.poll_next(cx) {
@@ -249,6 +270,20 @@ where
         // 这一次已经结束，下一轮 `poll_next` 会重新提交。
         *pending = None;
         Poll::Ready(Step::Emulated(result))
+    }
+}
+
+impl<'rt, 'reg, S, P> Drop for AcceptStream<'rt, 'reg, S, P>
+where
+    S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
+    P: SocketTokenPtr<'rt, 'reg>,
+{
+    fn drop(&mut self) {
+        if let Some(mode) = self.mode.take() {
+            self.inner
+                .token()
+                .stash_accept((mode, self.native_delivered));
+        }
     }
 }
 

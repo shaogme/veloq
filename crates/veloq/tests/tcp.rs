@@ -489,44 +489,34 @@ fn accept_stream_yields_every_connection() {
     });
 }
 
-/// 丢弃一条仍在途的 `AcceptStream` 之后，listener 上还能重新开一条并继续工作。
+/// 丢弃一条仍在途的 `AcceptStream` 之后，listener 上的常驻 multishot 不会被静默取消或丢弃连接。
 ///
-/// 覆盖的是取消路径：句柄的 `Drop` 要把 slot 从 `InFlightWaiting` 收进
-/// `InFlightOrphaned`（**不推进 generation**），内核随后的完成才找得到 slot 去跑
-/// `orphan_cleanup`。做错的话这里会挂住或泄漏 fd。
+/// 重新开启 `accept_multi` 能够无损连贯地接管之前在该 listener 上建立的连接（第一个连接归新流）。
 #[test]
 fn dropping_an_accept_stream_leaves_the_listener_usable() {
     run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        // 开一条流、不取任何东西就丢弃：multishot 已经提交给内核了。
+        // 开一条流、不取任何东西就丢弃：multishot 已经提交给内核并托管于 Socket。
         drop(listener.accept_multi());
         yield_now().await;
 
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
+                // 客户端只连接一次
+                let _stream = TcpStream::connect(ctx, listen_addr)
+                    .await
+                    .expect("Failed to connect");
+            });
+
+            s.spawn_boxed(async move {
+                // 验证新流可以 100% 拿到第一个连接，不会因为之前的 drop 被静默关闭
                 let mut accepted = listener.accept_multi();
                 let item = accepted.next().await.expect("accept stream ended early");
                 let (_stream, peer) =
                     item.expect("accept failed after an earlier stream was dropped");
                 assert!(peer.ip().is_ipv4());
-            });
-
-            s.spawn_boxed(async move {
-                // 取消是异步的：在它生效之前，那条已被放弃的 multishot 仍然会从同一个
-                // 内核 accept 队列里取走连接（取走之后走 orphan cleanup 直接关掉）。所以
-                // 这里连多次——断言的是「新流最终拿得到连接」，不是「第一个连接归新流」。
-                //
-                // 连接失败就停：说明服务端已经拿到它要的那一个并关掉了 listener，那正是
-                // 成功路径。真正的断言在服务端那一侧。
-                for _ in 0..8 {
-                    match TcpStream::connect(ctx, listen_addr).await {
-                        Ok(stream) => drop(stream),
-                        Err(_) => break,
-                    }
-                    yield_now().await;
-                }
             });
         })
         .await
@@ -747,30 +737,24 @@ fn dropping_a_recv_stream_leaves_the_connection_usable() {
                 drop(stream.recv_multi().expect("recv_multi must be available"));
                 yield_now().await;
 
-                // 取消是异步的：在它生效之前那条已被放弃的 recv 仍会从同一条连接上取走数
-                // 据（取走后走 orphan cleanup 直接丢掉）。所以客户端发很多次，断言的是
-                // 「新流最终收得到东西」，不是「第一段数据归新流」。
+                // 验证 Socket 级常驻 multishot：即便前一条 RecvStream 被 drop，
+                // 在窗口内收到的第一段数据也会被保存在在途完成表中，新流可以 100% 接收到第一段数据！
                 let mut chunks = stream.recv_multi().expect("recv_multi must be available");
                 let buf = chunks
                     .next()
                     .await
                     .expect("recv stream ended early")
                     .expect("recv failed after an earlier stream was dropped");
-                assert!(buf.as_slice().starts_with(b"chunk"));
+                assert_eq!(buf.as_slice(), b"first_chunk_data");
             });
 
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                for _ in 0..16 {
-                    let mut buf = ctx.alloc(nz!(64), 5);
-                    buf.as_slice_mut()[..5].copy_from_slice(b"chunk");
-                    if stream.send(buf).await.is_err() {
-                        break;
-                    }
-                    yield_now().await;
-                }
+                let mut buf = ctx.alloc(nz!(64), 16);
+                buf.as_slice_mut()[..16].copy_from_slice(b"first_chunk_data");
+                stream.send(buf).await.expect("Failed to send first chunk");
             });
         })
         .await
