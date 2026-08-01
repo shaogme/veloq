@@ -1,4 +1,7 @@
+use std::convert::Infallible;
+
 use veloq_runtime::{
+    Outcome,
     runtime::Runtime,
     scope,
     scope::JoinOutcome,
@@ -30,12 +33,15 @@ fn test_scope_local_nested() {
             let h1 = outer.spawn_boxed_local(async move {
                 scope_local!(ctx, async |inner| {
                     let h2 = inner.spawn_boxed_local(async { 10 });
-                    h2.await.unwrap()
+                    Outcome::<_, Infallible>::Ok(h2.await.unwrap())
                 })
                 .await
                 .unwrap()
             });
-            assert_eq!(h1.await.unwrap(), 10);
+            match h1.await.unwrap() {
+                Outcome::Ok(value) => assert_eq!(value, 10),
+                _ => panic!("nested scope did not return a value"),
+            }
         })
         .await
         .unwrap();

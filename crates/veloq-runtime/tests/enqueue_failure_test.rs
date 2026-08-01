@@ -3,9 +3,10 @@
 //! 这些路径正是 RUNTIME_REVIEW §1.1（job cell 双重释放）与 §4.4（入队失败时 scope 义务
 //! 未结算 → `wait_all` 永久挂起）的触发条件，用 `with_queue_capacity(1)` 把它们逼出来。
 
-use std::num::NonZeroUsize;
+use std::{convert::Infallible, num::NonZeroUsize};
 
 use veloq_runtime::{
+    Outcome,
     error::RuntimeError,
     runtime::RuntimeBuilder,
     scope,
@@ -61,12 +62,16 @@ fn local_queue_exhaustion_settles_scope_obligations() {
                 for handle in handles {
                     tally.record(handle.await);
                 }
-                tally
+                Outcome::<_, Infallible>::Ok(tally)
             })
             .await
             .expect("local scope")
         })
         .expect("runtime");
+    let tally = match tally {
+        Outcome::Ok(tally) => tally,
+        _ => panic!("local scope did not return a tally"),
+    };
 
     assert_eq!(tally.total(), SPAWNS, "所有 handle 都必须结算: {tally:?}");
     assert!(tally.ok >= 1, "至少一个任务应当真正执行: {tally:?}");
@@ -97,12 +102,16 @@ fn routed_spawn_boxed_survives_pinned_queue_exhaustion() {
                 for handle in handles {
                     tally.record(handle.await);
                 }
-                tally
+                Outcome::<_, Infallible>::Ok(tally)
             })
             .await
             .expect("send scope")
         })
         .expect("runtime");
+    let tally = match tally {
+        Outcome::Ok(tally) => tally,
+        _ => panic!("send scope did not return a tally"),
+    };
 
     assert_eq!(tally.total(), SPAWNS, "所有 handle 都必须结算: {tally:?}");
 }

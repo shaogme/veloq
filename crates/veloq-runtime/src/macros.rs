@@ -206,20 +206,21 @@ macro_rules! select {
 /// demand that the closure be higher-ranked over those regions too, which async closures
 /// cannot be (`implementation of AsyncFnOnce is not general enough`). That is why the scope is
 /// built and driven here, calling the closure in the same body where its argument exists.
-/// Everything with actual semantics — parent lookup, `wait_all`, and the join/cancel/panic
-/// handling in [`AsyncScope`](crate::scope::AsyncScope)'s `Drop` — is shared with the method.
+/// The body may return `()`, a `Result`, or an explicit [`Outcome`](crate::Outcome); returned
+/// errors cancel child tasks before the macro completes. Everything with actual semantics —
+/// parent lookup, `wait_all`, and the join/cancel/panic handling in
+/// [`AsyncScope`](crate::scope::AsyncScope)'s `Drop` — is shared with the method.
 #[macro_export]
 macro_rules! scope {
     ($ctx:expr, $closure:expr) => {
         async {
-            use $crate::macros::helpers::{_constrain, _constrain_result};
+            use $crate::macros::helpers::{_constrain, _constrain_result, run_scope_eval};
             use $crate::scope::AsyncScope;
 
             let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
             let __parent = $crate::runtime::current_scope().await;
             let scope = AsyncScope::new(__ctx, __parent);
-            let res = _constrain($closure)(&scope).await;
-            scope.wait_all().await?;
+            let res = run_scope_eval(&scope, _constrain($closure)(&scope)).await?;
             _constrain_result(Ok(res))
         }
     };
@@ -231,14 +232,13 @@ macro_rules! scope {
 macro_rules! scope_local {
     ($ctx:expr, $closure:expr) => {
         async {
-            use $crate::macros::helpers::{_constrain_local, _constrain_result};
+            use $crate::macros::helpers::{_constrain_local, _constrain_result, run_scope_eval};
             use $crate::scope::LocalAsyncScope;
 
             let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
             let __parent = $crate::runtime::current_scope().await;
             let scope = LocalAsyncScope::new(__ctx, __parent);
-            let res = _constrain_local($closure)(&scope).await;
-            scope.wait_all().await?;
+            let res = run_scope_eval(&scope, _constrain_local($closure)(&scope)).await?;
             _constrain_result(Ok(res))
         }
     };

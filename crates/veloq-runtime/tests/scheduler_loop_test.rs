@@ -7,6 +7,7 @@
 //! 把它掩盖过去，现在则直接挂死，由 nextest 的 20s 超时抓住。
 
 use std::{
+    convert::Infallible,
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -20,6 +21,7 @@ use std::{
 };
 
 use veloq_runtime::{
+    Outcome,
     runtime::{RuntimeBuilder, RuntimeCtx, RuntimeShared},
     scope, select,
     task::yield_now,
@@ -143,12 +145,16 @@ fn nested_scope_chain<'a>(ctx: RuntimeCtx<'a, ()>, depth: u32) -> BoxedU32Future
         if depth == 0 {
             return 0;
         }
-        scope!(ctx, async move |s| {
+        let outcome = scope!(ctx, async move |s| {
             let child = s.spawn_boxed(nested_scope_chain(ctx, depth - 1));
-            child.await.unwrap() + 1
+            Outcome::<_, Infallible>::Ok(child.await.unwrap() + 1)
         })
         .await
-        .unwrap()
+        .unwrap();
+        match outcome {
+            Outcome::Ok(value) => value,
+            _ => panic!("nested scope did not return a value"),
+        }
     })
 }
 
@@ -162,8 +168,12 @@ fn deeply_nested_scopes_stay_flat() {
     const DEPTH: u32 = 128;
 
     let depth = with_workers(2)
-        .scope(async |ctx| nested_scope_chain(ctx, DEPTH).await)
+        .scope(async |ctx| Outcome::<_, Infallible>::Ok(nested_scope_chain(ctx, DEPTH).await))
         .unwrap();
+    let depth = match depth {
+        Outcome::Ok(value) => value,
+        _ => panic!("runtime scope did not return a value"),
+    };
 
     assert_eq!(depth, DEPTH);
 }
@@ -236,12 +246,16 @@ fn cross_worker_task_storm_does_not_lose_wakeups() {
                 for handle in handles {
                     sum += handle.await.unwrap();
                 }
-                sum
+                Outcome::<_, Infallible>::Ok(sum)
             })
             .await
             .unwrap()
         })
         .unwrap();
+    let sum = match sum {
+        Outcome::Ok(value) => value,
+        _ => panic!("scope did not return a sum"),
+    };
 
     assert_eq!(sum, (0..TASKS).sum::<usize>());
 }

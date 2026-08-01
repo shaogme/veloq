@@ -14,6 +14,8 @@ use std::{
 use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
 use crate::{
     error::{Result, RuntimeError},
+    macros::helpers::run_scope_eval,
+    outcome::{IntoOutcome, Outcome},
     scope::{AsyncScope, LocalAsyncScope},
     task::{
         AnyScopeRef, GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
@@ -188,32 +190,42 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
     /// pinned down; the macro exists for `async |s| ..` literals, and explains in its own docs
     /// why it cannot just forward here. `self` is taken by value (the context is `Copy`) so the
     /// returned future owns everything it needs.
-    pub async fn scope<'env, 'scope, F, R>(self, f: F) -> Result<R>
+    ///
+    /// The body may return `()`, a `Result`, or an explicit [`Outcome`]. A returned error cancels
+    /// the child tasks before this method completes.
+    pub async fn scope<'env, 'scope, F, Body>(
+        self,
+        f: F,
+    ) -> Result<Outcome<Body::Output, Body::Error>>
     where
         'env: 'scope,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, 'env, T>) -> R,
+        Body: IntoOutcome,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, 'env, T>) -> Body,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let scope = AsyncScope::new(self, parent);
         let s_ref = &scope;
-        let res = f(s_ref).await;
-        scope.wait_all().await?;
-        Ok(res)
+        run_scope_eval(s_ref, f(s_ref)).await
     }
 
     /// Thread-local counterpart of [`RuntimeCtx::scope`], forwarded to by
     /// [`scope_local!`](crate::scope_local).
-    pub async fn scope_local<'env, 'scope, F, R>(self, f: F) -> Result<R>
+    ///
+    /// The body may return `()`, a `Result`, or an explicit [`Outcome`]. A returned error cancels
+    /// the child tasks before this method completes.
+    pub async fn scope_local<'env, 'scope, F, Body>(
+        self,
+        f: F,
+    ) -> Result<Outcome<Body::Output, Body::Error>>
     where
         'env: 'scope,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, 'env, T>) -> R,
+        Body: IntoOutcome,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, 'env, T>) -> Body,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let scope = LocalAsyncScope::new(self, parent);
         let s_ref = &scope;
-        let res = f(s_ref).await;
-        scope.wait_all().await?;
-        Ok(res)
+        run_scope_eval(s_ref, f(s_ref)).await
     }
 
     pub fn route_to<'scope_ref, F, Fut>(

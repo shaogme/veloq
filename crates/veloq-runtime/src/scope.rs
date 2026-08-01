@@ -107,6 +107,42 @@ pub type AsyncScope<'rt, 'scope, 'env, TExtra> =
 pub type LocalAsyncScope<'rt, 'scope, 'env, TExtra> =
     GenericAsyncScope<'rt, 'scope, 'env, LocalStorage, RcOwnership, TExtra>;
 
+/// Cancels and joins a scope if the surrounding scope body unwinds.
+pub(crate) struct ScopeExitGuard<
+    'guard,
+    'rt,
+    'scope,
+    'env: 'scope,
+    S: ScopeStorage,
+    O: Ownership + 'static,
+    TExtra,
+> {
+    scope: &'guard GenericAsyncScope<'rt, 'scope, 'env, S, O, TExtra>,
+    armed: bool,
+}
+
+impl<'guard, 'rt, 'scope, 'env: 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
+    ScopeExitGuard<'guard, 'rt, 'scope, 'env, S, O, TExtra>
+{
+    pub(crate) fn new(scope: &'guard GenericAsyncScope<'rt, 'scope, 'env, S, O, TExtra>) -> Self {
+        Self { scope, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<'guard, 'rt, 'scope, 'env: 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
+    for ScopeExitGuard<'guard, 'rt, 'scope, 'env, S, O, TExtra>
+{
+    fn drop(&mut self) {
+        if self.armed {
+            self.scope.cancel_and_join();
+        }
+    }
+}
+
 impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
     for GenericAsyncScope<'rt, 'scope, 'env, S, O, TExtra>
 {
@@ -216,6 +252,13 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         self.context.shared()
     }
 
+    pub(crate) fn cancel_and_join(&self) {
+        if !self.completion.is_done() {
+            self.completion.cancel();
+            self.context.shared().join_scope::<S, O>(&self.completion);
+        }
+    }
+
     unsafe fn spawn_task_impl<'scope_ref, T, H, TTask>(
         &'scope_ref self,
         worker_id: usize,
@@ -317,10 +360,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     /// （RUNTIME_REVIEW §1.4）。这正是 `std::thread::scope` 必须在 `Drop` 里阻塞 join 的
     /// 原因。
     fn drop(&mut self) {
-        if !self.completion.is_done() {
-            self.completion.cancel();
-            self.context.shared().join_scope::<S, O>(&self.completion);
-        }
+        self.cancel_and_join();
 
         // panic payload 的归属：正常路径由 `wait_all()` 取走并抛出。走到这里说明没人 join
         // （上面那两条路径），payload 交给上一层 scope，由它的 `wait_all()` 抛出；已经没有
