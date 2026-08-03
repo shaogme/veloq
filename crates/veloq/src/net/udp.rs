@@ -31,26 +31,24 @@ use veloq_driver_native::{
 use veloq_runtime::runtime::context::RoutedFuture;
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
-    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
+pub struct GenericUdpSocket<'rt, S, P: SocketTokenPtr<'rt>> {
+    pub(crate) inner: InnerSocket<'rt, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'rt, 'reg>,
+    pub(crate) ctx: Ctx<'rt>,
 }
 
-pub type LocalUdpSocket<'rt, 'reg> =
-    GenericUdpSocket<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
-pub type UdpSocket<'rt, 'reg> =
-    GenericUdpSocket<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
+pub type LocalUdpSocket<'rt> =
+    GenericUdpSocket<'rt, LocalSubmitter<Ctx<'rt>>, Rc<SocketToken<'rt>>>;
+pub type UdpSocket<'rt> = GenericUdpSocket<'rt, DetachedSubmitter, Arc<SocketToken<'rt>>>;
 
-type UdpRecvLocalOp<'rt, 'reg> = LocalOp<'rt, UdpRecvFrom, Ctx<'rt, 'reg>>;
-type UdpRecvDetachedOp<'reg> =
-    DetachedOp<UdpRecvFrom, <PlatformDriver<'reg> as DriverRaw>::SlotSpec>;
+type UdpRecvLocalOp<'rt> = LocalOp<'rt, UdpRecvFrom, Ctx<'rt>>;
+type UdpRecvDetachedOp<'rt> = DetachedOp<UdpRecvFrom, <PlatformDriver<'rt> as DriverRaw>::SlotSpec>;
 
-pub struct PreparedLocalUdpRecv<'rt, 'reg> {
-    pub(crate) op_fut: UdpRecvLocalOp<'rt, 'reg>,
+pub struct PreparedLocalUdpRecv<'rt> {
+    pub(crate) op_fut: UdpRecvLocalOp<'rt>,
 }
 
-impl<'rt, 'reg> PreparedLocalUdpRecv<'rt, 'reg> {
+impl<'rt> PreparedLocalUdpRecv<'rt> {
     pub fn arm(&mut self) -> bool {
         self.op_fut.arm()
     }
@@ -60,7 +58,7 @@ impl<'rt, 'reg> PreparedLocalUdpRecv<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> Future for PreparedLocalUdpRecv<'rt, 'reg> {
+impl<'rt> Future for PreparedLocalUdpRecv<'rt> {
     type Output = Result<UdpRecvPacket>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -72,8 +70,8 @@ impl<'rt, 'reg> Future for PreparedLocalUdpRecv<'rt, 'reg> {
     }
 }
 
-fn parse_udp_recv_item<'reg>(
-    item: OpItem<UdpRecvFrom, <PlatformDriver<'reg> as DriverRaw>::SlotSpec>,
+fn parse_udp_recv_item<'rt>(
+    item: OpItem<UdpRecvFrom, <PlatformDriver<'rt> as DriverRaw>::SlotSpec>,
 ) -> Result<UdpRecvPacket> {
     let (res, op_back_opt) = item.into_inner();
     let op_back = op_back_opt.ok_or(NetError::UdpRecvFromOpLost).trans()?;
@@ -90,17 +88,17 @@ fn parse_udp_recv_item<'reg>(
     })
 }
 
-pub enum PreparedUdpRecvState<'reg> {
-    Local(UdpRecvDetachedOp<'reg>),
-    Remote(RoutedFuture<UdpRecvDetachedOp<'reg>>),
+pub enum PreparedUdpRecvState<'rt> {
+    Local(UdpRecvDetachedOp<'rt>),
+    Remote(RoutedFuture<UdpRecvDetachedOp<'rt>>),
     Done,
 }
 
-pub struct PreparedUdpRecv<'reg> {
-    pub(crate) state: PreparedUdpRecvState<'reg>,
+pub struct PreparedUdpRecv<'rt> {
+    pub(crate) state: PreparedUdpRecvState<'rt>,
 }
 
-impl<'reg> PreparedUdpRecv<'reg> {
+impl<'rt> PreparedUdpRecv<'rt> {
     pub fn arm(&mut self) -> bool {
         match &mut self.state {
             PreparedUdpRecvState::Local(op) => op.arm(),
@@ -118,7 +116,7 @@ impl<'reg> PreparedUdpRecv<'reg> {
     }
 }
 
-impl<'reg> Future for PreparedUdpRecv<'reg> {
+impl<'rt> Future for PreparedUdpRecv<'rt> {
     type Output = Result<UdpRecvPacket>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -149,10 +147,10 @@ impl<'reg> Future for PreparedUdpRecv<'reg> {
     }
 }
 
-fn bind_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
-    ctx: Ctx<'rt, 'reg>,
+fn bind_inner<'rt, A: ToSocketAddrs, P: SocketTokenPtr<'rt>>(
+    ctx: Ctx<'rt>,
     addr: A,
-) -> Result<InnerSocket<'rt, 'reg, P>> {
+) -> Result<InnerSocket<'rt, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
@@ -171,8 +169,8 @@ fn bind_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
-    GenericUdpSocket<'rt, 'reg, S, P>
+impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
+    GenericUdpSocket<'rt, S, P>
 {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.inner.local_addr()
@@ -258,8 +256,8 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     }
 }
 
-impl<'rt, 'reg> LocalUdpSocket<'rt, 'reg> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
+impl<'rt> LocalUdpSocket<'rt> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -271,7 +269,7 @@ impl<'rt, 'reg> LocalUdpSocket<'rt, 'reg> {
         self.send_to_direct(buf, target).await
     }
 
-    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedLocalUdpRecv<'rt, 'reg> {
+    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedLocalUdpRecv<'rt> {
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
             buf,
@@ -307,8 +305,8 @@ impl<'rt, 'reg> LocalUdpSocket<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
+impl<'rt> UdpSocket<'rt> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -328,7 +326,7 @@ impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
         Ok((res.trans()?, op.buf))
     }
 
-    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedUdpRecv<'reg> {
+    pub fn prepare_recv_from(&self, buf: FixedBuf) -> PreparedUdpRecv<'rt> {
         let owner = self.inner.owner_worker_id();
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
@@ -412,7 +410,7 @@ impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for LocalUdpSocket<'rt, 'reg> {
+impl<'rt> AsyncBufRead for LocalUdpSocket<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -434,7 +432,7 @@ impl<'rt, 'reg> AsyncBufRead for LocalUdpSocket<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for UdpSocket<'rt, 'reg> {
+impl<'rt> AsyncBufRead for UdpSocket<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -456,7 +454,7 @@ impl<'rt, 'reg> AsyncBufRead for UdpSocket<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for LocalUdpSocket<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for LocalUdpSocket<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -486,7 +484,7 @@ impl<'rt, 'reg> AsyncBufWrite for LocalUdpSocket<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for UdpSocket<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for UdpSocket<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

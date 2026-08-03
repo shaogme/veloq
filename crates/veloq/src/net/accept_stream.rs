@@ -53,7 +53,7 @@ type EmulatedItem = OpItem<Accept, PlatformSlotSpec>;
 /// `Native` 在那里永远构造不出来——但它构造得**出类型**，代价只是一段编译出来却走不到的
 /// 分支，换来的是这个文件里一处 `#[cfg]` 都不需要。IOCP 后端为此给 `AcceptMulti` 提供了
 /// 一个提交即失败的实现（见 `veloq-driver-iocp` 的 `impl_iocp_unsupported_op!`）。
-enum AcceptMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
+enum AcceptMode<'rt, S: OpSubmitter<'rt, Ctx<'rt>>> {
     /// 一次提交，多条完成：句柄本身就是流。
     Native(S::Stream<AcceptMulti>),
     /// 每取一条都重新提交一次单发 accept。`None` 表示当前没有在途的那一次。
@@ -71,16 +71,11 @@ enum AcceptMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
 /// 流被丢弃时会取消在途的 multishot 操作（句柄的 `Drop` → `mark_orphaned` +
 /// `CancelRequest::abandon`），内核随后投递的完成走 orphan cleanup，其中已经建立好的连接
 /// 会被关闭而不是泄漏。
-pub struct AcceptStream<
-    'rt,
-    'reg,
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
-    P: SocketTokenPtr<'rt, 'reg>,
-> {
-    mode: Option<AcceptMode<'rt, 'reg, S>>,
-    inner: InnerSocket<'rt, 'reg, P>,
+pub struct AcceptStream<'rt, S: OpSubmitter<'rt, Ctx<'rt>>, P: SocketTokenPtr<'rt>> {
+    mode: Option<AcceptMode<'rt, S>>,
+    inner: InnerSocket<'rt, P>,
     submitter: S,
-    ctx: Ctx<'rt, 'reg>,
+    ctx: Ctx<'rt>,
     /// `Native` 路径有没有产出过至少一项。
     ///
     /// 「内核不认识 multishot accept」只可能在**第一条**完成上表现出来，所以降级判据仅在
@@ -88,15 +83,14 @@ pub struct AcceptStream<
     native_delivered: bool,
 }
 
-impl<'rt, 'reg, S, P> AcceptStream<'rt, 'reg, S, P>
+impl<'rt, S, P> AcceptStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>> + Copy,
+    P: SocketTokenPtr<'rt>,
 {
-    pub(crate) fn new(ctx: Ctx<'rt, 'reg>, inner: InnerSocket<'rt, 'reg, P>, submitter: S) -> Self {
-        if let Some((mode, native_delivered)) = inner
-            .token()
-            .take_accept::<(AcceptMode<'rt, 'reg, S>, bool)>()
+    pub(crate) fn new(ctx: Ctx<'rt>, inner: InnerSocket<'rt, P>, submitter: S) -> Self {
+        if let Some((mode, native_delivered)) =
+            inner.token().take_accept::<(AcceptMode<'rt, S>, bool)>()
         {
             return Self {
                 mode: Some(mode),
@@ -122,11 +116,11 @@ where
     }
 
     fn arm(
-        ctx: Ctx<'rt, 'reg>,
-        inner: &InnerSocket<'rt, 'reg, P>,
+        ctx: Ctx<'rt>,
+        inner: &InnerSocket<'rt, P>,
         submitter: S,
         native: bool,
-    ) -> AcceptMode<'rt, 'reg, S> {
+    ) -> AcceptMode<'rt, S> {
         if !native {
             return AcceptMode::Emulated { pending: None };
         }
@@ -139,7 +133,7 @@ where
         &self,
         accepted: OwnedRawHandle,
         addr: SocketAddr,
-    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+    ) -> Result<(GenericTcpStream<'rt, S, P>, SocketAddr)> {
         Ok((
             GenericTcpStream {
                 inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -151,10 +145,7 @@ where
     }
 
     /// `Native` 的一项：新连接的 fd 来自 CQE，对端地址要另外问内核。
-    fn native_item(
-        &self,
-        item: NativeItem,
-    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+    fn native_item(&self, item: NativeItem) -> Result<(GenericTcpStream<'rt, S, P>, SocketAddr)> {
         let (res, _) = item.into_inner();
         let accepted = res.trans()?;
         // multishot accept 不带对端地址——见模块文档。`getpeername` 失败只让**这一条**
@@ -167,7 +158,7 @@ where
     fn emulated_item(
         &self,
         result: EmulatedItem,
-    ) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+    ) -> Result<(GenericTcpStream<'rt, S, P>, SocketAddr)> {
         let (res, op) = result.into_inner();
         let op = op.ok_or(NetError::AcceptOpLost)?;
         let accepted = res.trans()?;
@@ -273,10 +264,10 @@ where
     }
 }
 
-impl<'rt, 'reg, S, P> Drop for AcceptStream<'rt, 'reg, S, P>
+impl<'rt, S, P> Drop for AcceptStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>>,
+    P: SocketTokenPtr<'rt>,
 {
     fn drop(&mut self) {
         if let Some(mode) = self.mode.take() {
@@ -287,12 +278,12 @@ where
     }
 }
 
-impl<'rt, 'reg, S, P> Stream for AcceptStream<'rt, 'reg, S, P>
+impl<'rt, S, P> Stream for AcceptStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>> + Copy,
+    P: SocketTokenPtr<'rt>,
 {
-    type Item = Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)>;
+    type Item = Result<(GenericTcpStream<'rt, S, P>, SocketAddr)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // SAFETY: `AcceptStream` 的字段都不是自引用的，投影出 `&mut` 不违反 pin 契约。

@@ -72,7 +72,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 
     pub fn scope<F, R>(self, f: F) -> VeloqResult<R>
     where
-        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+        F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
     {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
@@ -118,7 +118,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn scope<F, R>(topology: T, f: F) -> VeloqResult<R>
     where
-        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+        F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
     {
         RuntimeBuilder::new(topology).scope(f)
     }
@@ -129,7 +129,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> VeloqResult<R>
     where
-        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+        F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
     {
         let Runtime {
             worker_count,
@@ -226,6 +226,14 @@ impl<T: PoolTopology> Runtime<T> {
                 }
             })
             .scope(async move |runtime_ctx| {
+                // SAFETY: runtime_ctx 内部包含的 RuntimeShared 悬挂指针在 block_on 期间始终有效，
+                // transmute 仅调整句柄的生命周期标记以匹配 Ctx<'s> 结构体定义。
+                let runtime_ctx = unsafe {
+                    std::mem::transmute::<
+                        async_runtime::RuntimeCtx<'_, WorkerState<'_>>,
+                        async_runtime::RuntimeCtx<'_, WorkerState<'_>>,
+                    >(runtime_ctx)
+                };
                 let ctx = Ctx { runtime_ctx };
                 f(ctx).await
             })

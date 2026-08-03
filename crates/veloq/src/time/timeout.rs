@@ -12,22 +12,14 @@ use std::{
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'rt, 'reg, T>(
-    ctx: Ctx<'rt, 'reg>,
-    duration: Duration,
-    future: T,
-) -> Timeout<'rt, 'reg, T>
+pub fn timeout<'rt, T>(ctx: Ctx<'rt>, duration: Duration, future: T) -> Timeout<'rt, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'rt, 'reg, T>(
-    ctx: Ctx<'rt, 'reg>,
-    deadline: Instant,
-    future: T,
-) -> Timeout<'rt, 'reg, T>
+pub fn timeout_at<'rt, T>(ctx: Ctx<'rt>, deadline: Instant, future: T) -> Timeout<'rt, T>
 where
     T: Future,
 {
@@ -37,14 +29,13 @@ where
     }
 }
 
-pub struct Timeout<'rt, 'reg, T> {
+pub struct Timeout<'rt, T> {
     value: T,
-    delay: Sleep<'rt, 'reg>,
+    delay: Sleep<'rt>,
 }
 
-impl<'rt, 'reg, T> Future for Timeout<'rt, 'reg, T>
+impl<'rt, T> Future for Timeout<'rt, T>
 where
-    'reg: 'rt,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;
@@ -74,22 +65,14 @@ where
 // Local Timeout
 // ============================================================================
 
-pub fn timeout_local<'rt, 'reg, T>(
-    ctx: Ctx<'rt, 'reg>,
-    duration: Duration,
-    future: T,
-) -> LocalTimeout<'rt, 'reg, T>
+pub fn timeout_local<'rt, T>(ctx: Ctx<'rt>, duration: Duration, future: T) -> LocalTimeout<'rt, T>
 where
     T: Future,
 {
     timeout_at_local(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at_local<'rt, 'reg, T>(
-    ctx: Ctx<'rt, 'reg>,
-    deadline: Instant,
-    future: T,
-) -> LocalTimeout<'rt, 'reg, T>
+pub fn timeout_at_local<'rt, T>(ctx: Ctx<'rt>, deadline: Instant, future: T) -> LocalTimeout<'rt, T>
 where
     T: Future,
 {
@@ -99,14 +82,13 @@ where
     }
 }
 
-pub struct LocalTimeout<'rt, 'reg, T> {
+pub struct LocalTimeout<'rt, T> {
     value: T,
-    delay: LocalSleep<'rt, 'reg>,
+    delay: LocalSleep<'rt>,
 }
 
-impl<'rt, 'reg, T> Future for LocalTimeout<'rt, 'reg, T>
+impl<'rt, T> Future for LocalTimeout<'rt, T>
 where
-    'reg: 'rt,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;

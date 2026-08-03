@@ -29,33 +29,31 @@ use veloq_driver_native::{
 };
 
 #[derive(Clone)]
-pub struct GenericTcpListener<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
-    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
+pub struct GenericTcpListener<'rt, S, P: SocketTokenPtr<'rt>> {
+    pub(crate) inner: InnerSocket<'rt, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'rt, 'reg>,
+    pub(crate) ctx: Ctx<'rt>,
 }
 
 #[derive(Clone)]
-pub struct GenericTcpStream<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
-    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
+pub struct GenericTcpStream<'rt, S, P: SocketTokenPtr<'rt>> {
+    pub(crate) inner: InnerSocket<'rt, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'rt, 'reg>,
+    pub(crate) ctx: Ctx<'rt>,
 }
 
-pub type LocalTcpListener<'rt, 'reg> =
-    GenericTcpListener<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
-pub type LocalTcpStream<'rt, 'reg> =
-    GenericTcpStream<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
+pub type LocalTcpListener<'rt> =
+    GenericTcpListener<'rt, LocalSubmitter<Ctx<'rt>>, Rc<SocketToken<'rt>>>;
+pub type LocalTcpStream<'rt> =
+    GenericTcpStream<'rt, LocalSubmitter<Ctx<'rt>>, Rc<SocketToken<'rt>>>;
 
-pub type TcpListener<'rt, 'reg> =
-    GenericTcpListener<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
-pub type TcpStream<'rt, 'reg> =
-    GenericTcpStream<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
+pub type TcpListener<'rt> = GenericTcpListener<'rt, DetachedSubmitter, Arc<SocketToken<'rt>>>;
+pub type TcpStream<'rt> = GenericTcpStream<'rt, DetachedSubmitter, Arc<SocketToken<'rt>>>;
 
-fn bind_listener_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
-    ctx: Ctx<'rt, 'reg>,
+fn bind_listener_inner<'rt, A: ToSocketAddrs, P: SocketTokenPtr<'rt>>(
+    ctx: Ctx<'rt>,
     addr: A,
-) -> Result<InnerSocket<'rt, 'reg, P>> {
+) -> Result<InnerSocket<'rt, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
@@ -75,10 +73,10 @@ fn bind_listener_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-fn new_stream_inner<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>(
-    ctx: Ctx<'rt, 'reg>,
+fn new_stream_inner<'rt, P: SocketTokenPtr<'rt>>(
+    ctx: Ctx<'rt>,
     addr: &SocketAddr,
-) -> Result<InnerSocket<'rt, 'reg, P>> {
+) -> Result<InnerSocket<'rt, P>> {
     let socket = if addr.is_ipv4() {
         Socket::new_tcp_v4().trans()?
     } else {
@@ -87,10 +85,10 @@ fn new_stream_inner<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
 
-impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
-    GenericTcpListener<'rt, 'reg, S, P>
+impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
+    GenericTcpListener<'rt, S, P>
 {
-    async fn accept_direct(&self) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
+    async fn accept_direct(&self) -> Result<(GenericTcpStream<'rt, S, P>, SocketAddr)> {
         if self.inner.token().has_stashed_accept() {
             let mut stream = self.accept_multi();
             let polled = std::future::poll_fn(|cx| {
@@ -146,18 +144,18 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     ///
     /// 注意 `accept()` 与本方法**不要同时用在同一个 listener 上**：两者都会从同一个内核
     /// accept 队列取连接，谁拿到哪一个不确定。
-    pub fn accept_multi(&self) -> AcceptStream<'rt, 'reg, S, P> {
+    pub fn accept_multi(&self) -> AcceptStream<'rt, S, P> {
         AcceptStream::new(self.ctx, self.inner.clone(), self.submitter)
     }
 }
 
-impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
-    GenericTcpStream<'rt, 'reg, S, P>
+impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
+    GenericTcpStream<'rt, S, P>
 {
     async fn connect_from_inner_direct(
-        inner: InnerSocket<'rt, 'reg, P>,
+        inner: InnerSocket<'rt, P>,
         submitter: S,
-        ctx: Ctx<'rt, 'reg>,
+        ctx: Ctx<'rt>,
         addr: SocketAddr,
     ) -> Result<Self> {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
@@ -241,7 +239,7 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     /// 见 [`RecvStream`]。
     ///
     /// 对端关闭时流正常结束。流在当前 worker 上提交，与这个 socket 上的其它操作一样。
-    pub fn recv_multi(&self) -> Result<RecvStream<'rt, 'reg, S, P>> {
+    pub fn recv_multi(&self) -> Result<RecvStream<'rt, S, P>> {
         RecvStream::new(self.ctx, self.inner.clone(), self.submitter)
     }
 
@@ -265,8 +263,8 @@ impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'
     }
 }
 
-impl<'rt, 'reg> LocalTcpListener<'rt, 'reg> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
+impl<'rt> LocalTcpListener<'rt> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -274,13 +272,13 @@ impl<'rt, 'reg> LocalTcpListener<'rt, 'reg> {
         })
     }
 
-    pub async fn accept(&self) -> Result<(LocalTcpStream<'rt, 'reg>, SocketAddr)> {
+    pub async fn accept(&self) -> Result<(LocalTcpStream<'rt>, SocketAddr)> {
         self.accept_direct().await
     }
 }
 
-impl<'rt, 'reg> TcpListener<'rt, 'reg> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
+impl<'rt> TcpListener<'rt> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -288,7 +286,7 @@ impl<'rt, 'reg> TcpListener<'rt, 'reg> {
         })
     }
 
-    pub async fn accept(&self) -> Result<(TcpStream<'rt, 'reg>, SocketAddr)> {
+    pub async fn accept(&self) -> Result<(TcpStream<'rt>, SocketAddr)> {
         if self.inner.token().has_stashed_accept() {
             let mut stream = self.accept_multi();
             let polled = std::future::poll_fn(|cx| {
@@ -323,8 +321,8 @@ impl<'rt, 'reg> TcpListener<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> LocalTcpStream<'rt, 'reg> {
-    pub async fn connect(ctx: Ctx<'rt, 'reg>, addr: SocketAddr) -> Result<Self> {
+impl<'rt> LocalTcpStream<'rt> {
+    pub async fn connect(ctx: Ctx<'rt>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, LocalSubmitter::new(), ctx, addr).await
     }
@@ -352,15 +350,15 @@ impl<'rt, 'reg> LocalTcpStream<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> TcpStream<'rt, 'reg> {
-    pub async fn connect(ctx: Ctx<'rt, 'reg>, addr: SocketAddr) -> Result<Self> {
+impl<'rt> TcpStream<'rt> {
+    pub async fn connect(ctx: Ctx<'rt>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
     }
 
     pub(crate) async fn connect_from_inner(
-        ctx: Ctx<'rt, 'reg>,
-        inner: InnerSocket<'rt, 'reg, Arc<SocketToken<'rt, 'reg>>>,
+        ctx: Ctx<'rt>,
+        inner: InnerSocket<'rt, Arc<SocketToken<'rt>>>,
         addr: SocketAddr,
     ) -> Result<Self> {
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
@@ -432,7 +430,7 @@ impl<'rt, 'reg> TcpStream<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for LocalTcpStream<'rt, 'reg> {
+impl<'rt> AsyncBufRead for LocalTcpStream<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -454,7 +452,7 @@ impl<'rt, 'reg> AsyncBufRead for LocalTcpStream<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for TcpStream<'rt, 'reg> {
+impl<'rt> AsyncBufRead for TcpStream<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -476,7 +474,7 @@ impl<'rt, 'reg> AsyncBufRead for TcpStream<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for LocalTcpStream<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for LocalTcpStream<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -506,7 +504,7 @@ impl<'rt, 'reg> AsyncBufWrite for LocalTcpStream<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for TcpStream<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for TcpStream<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

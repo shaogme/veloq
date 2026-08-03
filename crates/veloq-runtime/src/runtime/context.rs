@@ -103,7 +103,7 @@ pub(crate) struct RuntimeTlsInner {
 /// `'rt` is carried by a marker rather than by a `&'rt RuntimeShared<T>` field on purpose.
 /// A reference field would imply `T: 'rt`, and a higher-ranked `for<'rt>` bound on the entry
 /// closure would then collapse into `T: 'static` — which rules out the intended use of the
-/// extra worker state (`veloq`'s `WorkerState<'reg>` borrows back into `RuntimeShared`).
+/// extra worker state (`veloq`'s `WorkerState<'rt>` borrows back into `RuntimeShared`).
 /// With the pointer, `for<'rt> AsyncFnOnce(RuntimeCtx<'rt, T>) -> R` is expressible for any
 /// `T`, and that bound is what keeps the context from escaping `block_on` inside `R`
 /// (RUNTIME_REVIEW §1.15).

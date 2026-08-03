@@ -40,16 +40,16 @@ impl Drop for StashedBox {
     }
 }
 
-pub struct SocketToken<'rt, 'reg> {
+pub struct SocketToken<'rt> {
     fd: IoFd,
     owner_worker_id: usize,
-    ctx: Ctx<'rt, 'reg>,
+    ctx: Ctx<'rt>,
     accept_stash: Mutex<Option<StashedBox>>,
     recv_stash: Mutex<Option<StashedBox>>,
 }
 
-impl<'rt, 'reg> SocketToken<'rt, 'reg> {
-    pub(crate) fn new(ctx: Ctx<'rt, 'reg>, handle: RawHandle) -> Result<Self> {
+impl<'rt> SocketToken<'rt> {
+    pub(crate) fn new(ctx: Ctx<'rt>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
             return NetError::InvalidSocketHandle.trans();
         }
@@ -133,7 +133,7 @@ impl<'rt, 'reg> SocketToken<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> Drop for SocketToken<'rt, 'reg> {
+impl<'rt> Drop for SocketToken<'rt> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -151,44 +151,31 @@ impl<'rt, 'reg> Drop for SocketToken<'rt, 'reg> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'rt, 'reg>: Deref<Target = SocketToken<'rt, 'reg>> + Clone
-where
-    'reg: 'rt,
-{
-    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self;
+pub trait SocketTokenPtr<'rt>: Deref<Target = SocketToken<'rt>> + Clone {
+    fn new_ptr(token: SocketToken<'rt>) -> Self;
 }
 
-impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Rc<SocketToken<'rt, 'reg>> {
-    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
+impl<'rt> SocketTokenPtr<'rt> for Rc<SocketToken<'rt>> {
+    fn new_ptr(token: SocketToken<'rt>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Arc<SocketToken<'rt, 'reg>> {
-    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
+impl<'rt> SocketTokenPtr<'rt> for Arc<SocketToken<'rt>> {
+    fn new_ptr(token: SocketToken<'rt>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>
-where
-    'reg: 'rt,
-{
+pub struct InnerSocket<'rt, P: SocketTokenPtr<'rt>> {
     token: P,
     local_addr: Option<SocketAddr>,
-    marker: PhantomData<(&'rt (), &'reg ())>,
+    marker: PhantomData<&'rt ()>,
 }
 
-impl<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>> InnerSocket<'rt, 'reg, P>
-where
-    'reg: 'rt,
-{
-    pub fn new(
-        ctx: Ctx<'rt, 'reg>,
-        handle: RawHandle,
-        local_addr: Option<SocketAddr>,
-    ) -> Result<Self> {
+impl<'rt, P: SocketTokenPtr<'rt>> InnerSocket<'rt, P> {
+    pub fn new(ctx: Ctx<'rt>, handle: RawHandle, local_addr: Option<SocketAddr>) -> Result<Self> {
         Ok(Self {
             token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
@@ -202,7 +189,7 @@ where
     }
 
     #[inline]
-    pub fn token(&self) -> &SocketToken<'rt, 'reg> {
+    pub fn token(&self) -> &SocketToken<'rt> {
         &self.token
     }
 

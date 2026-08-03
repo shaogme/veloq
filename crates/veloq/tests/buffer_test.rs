@@ -13,7 +13,7 @@ fn assert_slot_based(info: RegionInfo, message: &str) {
 }
 
 #[cfg(feature = "test-hooks")]
-fn current_chunk_register_attempts(ctx: Ctx<'_, '_>) -> u64 {
+fn current_chunk_register_attempts(ctx: Ctx<'_>) -> u64 {
     ctx.driver(|driver| {
         let hooks = &driver as &dyn DriverTestHooks;
         hooks.debug_chunk_register_attempts()

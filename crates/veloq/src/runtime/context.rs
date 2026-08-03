@@ -41,24 +41,24 @@ pub struct WorkerRegistrarState {
     pub chunks: Vec<ChunkInfo>,
 }
 
-pub struct WorkerState<'reg> {
-    pub driver: RefCell<PlatformDriver<'reg>>,
+pub struct WorkerState<'rt> {
+    pub driver: RefCell<PlatformDriver<'rt>>,
     pub buf_pool: AnyBufPool,
     pub registrar_state: RefCell<WorkerRegistrarState>,
     pub registration_mode: BufferRegistrationMode,
 }
 
 #[derive(Clone)]
-pub struct DriverRegistrar<'rt, 'reg> {
-    shared: &'rt RuntimeShared<WorkerState<'reg>>,
+pub struct DriverRegistrar<'rt> {
+    shared: &'rt RuntimeShared<WorkerState<'rt>>,
 }
 
-impl<'rt, 'reg> DriverRegistrar<'rt, 'reg> {
-    pub(crate) fn new(shared: &'rt RuntimeShared<WorkerState<'reg>>) -> Self {
+impl<'rt> DriverRegistrar<'rt> {
+    pub(crate) fn new(shared: &'rt RuntimeShared<WorkerState<'rt>>) -> Self {
         Self { shared }
     }
 
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'reg>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'rt>) -> R) -> R {
         self.shared
             .extra_tls
             .try_with(|extra| f(extra))
@@ -76,7 +76,7 @@ impl<'rt, 'reg> DriverRegistrar<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> BufferRegistrar for DriverRegistrar<'rt, 'reg> {
+impl<'rt> BufferRegistrar for DriverRegistrar<'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
@@ -94,22 +94,22 @@ impl<'rt, 'reg> BufferRegistrar for DriverRegistrar<'rt, 'reg> {
 }
 
 #[repr(transparent)]
-pub struct SharedRegistrar<'reg> {
-    _shared: RuntimeShared<WorkerState<'reg>>,
+pub struct SharedRegistrar<'rt> {
+    _shared: RuntimeShared<WorkerState<'rt>>,
 }
 
-impl<'reg> SharedRegistrar<'reg> {
+impl<'rt> SharedRegistrar<'rt> {
     /// # Safety
-    /// The memory layout of `SharedRegistrar` is identical to `RuntimeShared<WorkerState<'reg>>`.
+    /// The memory layout of `SharedRegistrar` is identical to `RuntimeShared<WorkerState<'rt>>`.
     #[inline]
-    pub unsafe fn from_shared<'rt>(shared: &'rt RuntimeShared<WorkerState<'reg>>) -> &'rt Self {
-        unsafe { &*(shared as *const RuntimeShared<WorkerState<'reg>> as *const Self) }
+    pub unsafe fn from_shared(shared: &'rt RuntimeShared<WorkerState<'rt>>) -> &'rt Self {
+        unsafe { &*(shared as *const RuntimeShared<WorkerState<'rt>> as *const Self) }
     }
 }
 
-impl<'reg> BufferRegistrar for SharedRegistrar<'reg> {
+impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'reg>>) };
+        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
         shared
             .extra_tls
             .try_with(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
@@ -117,7 +117,7 @@ impl<'reg> BufferRegistrar for SharedRegistrar<'reg> {
     }
 
     fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'reg>>) };
+        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
         shared
             .extra_tls
             .try_with(|extra| {
@@ -132,13 +132,13 @@ impl<'reg> BufferRegistrar for SharedRegistrar<'reg> {
     }
 }
 
-pub(crate) struct BorrowedRegistrar<'rt, 'reg> {
-    pub driver: &'rt RefCell<PlatformDriver<'reg>>,
-    pub state: &'rt RefCell<WorkerRegistrarState>,
+pub(crate) struct BorrowedRegistrar<'a, 'rt> {
+    pub driver: &'a RefCell<PlatformDriver<'rt>>,
+    pub state: &'a RefCell<WorkerRegistrarState>,
     pub registration_mode: BufferRegistrationMode,
 }
 
-impl<'rt, 'reg> BufferRegistrar for BorrowedRegistrar<'rt, 'reg> {
+impl<'a, 'rt> BufferRegistrar for BorrowedRegistrar<'a, 'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         register_internal(self.driver, self.state, regions)
     }
@@ -234,43 +234,40 @@ fn sync_to_driver_internal(
 }
 
 #[derive(Clone, Copy)]
-pub struct Ctx<'rt, 'reg>
-where
-    'reg: 'rt,
-{
-    pub runtime_ctx: RuntimeCtx<'rt, WorkerState<'reg>>,
+pub struct Ctx<'rt> {
+    pub runtime_ctx: RuntimeCtx<'rt, WorkerState<'rt>>,
 }
 
-impl<'rt, 'reg> IntoRuntimeCtx<'rt, WorkerState<'reg>> for Ctx<'rt, 'reg> {
+impl<'rt> IntoRuntimeCtx<'rt, WorkerState<'rt>> for Ctx<'rt> {
     #[inline]
-    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'rt>> {
         self.runtime_ctx
     }
 }
 
-impl<'rt, 'reg> IntoRuntimeCtx<'rt, WorkerState<'reg>> for &Ctx<'rt, 'reg> {
+impl<'rt> IntoRuntimeCtx<'rt, WorkerState<'rt>> for &Ctx<'rt> {
     #[inline]
-    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'rt>> {
         self.runtime_ctx
     }
 }
 
-impl<'rt, 'reg> ContextDriverProvider<PlatformDriver<'reg>> for Ctx<'rt, 'reg> {
+impl<'rt> ContextDriverProvider<PlatformDriver<'rt>> for Ctx<'rt> {
     #[inline]
-    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'reg>) -> R) -> R {
+    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'rt>) -> R) -> R {
         self.extra(|extra| f(&mut extra.driver.borrow_mut()))
     }
 
     #[inline]
-    fn with_driver_ref<R>(&self, f: impl FnOnce(&PlatformDriver<'reg>) -> R) -> R {
+    fn with_driver_ref<R>(&self, f: impl FnOnce(&PlatformDriver<'rt>) -> R) -> R {
         self.extra(|extra| f(&extra.driver.borrow()))
     }
 }
 
-impl<'rt, 'reg> DriverProvider for Ctx<'rt, 'reg> {
-    type SlotSpec = <PlatformDriver<'reg> as DriverRaw>::SlotSpec;
+impl<'rt> DriverProvider for Ctx<'rt> {
+    type SlotSpec = <PlatformDriver<'rt> as DriverRaw>::SlotSpec;
     type Driver<'d>
-        = RuntimeContextDriver<'d, PlatformDriver<'reg>, Ctx<'rt, 'reg>>
+        = RuntimeContextDriver<'d, PlatformDriver<'rt>, Ctx<'rt>>
     where
         Self: 'd;
 
@@ -280,9 +277,9 @@ impl<'rt, 'reg> DriverProvider for Ctx<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> Ctx<'rt, 'reg> {
+impl<'rt> Ctx<'rt> {
     #[inline]
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'reg>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'rt>) -> R) -> R {
         self.runtime_ctx
             .shared()
             .extra_tls
@@ -296,9 +293,10 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     }
 
     #[inline]
-    pub fn registrar(&self) -> DriverRegistrar<'rt, 'reg> {
+    pub fn registrar(&self) -> DriverRegistrar<'rt> {
         DriverRegistrar::new(self.runtime_ctx.shared())
     }
+
     #[inline]
     pub fn select_poll_start(&self, branches: u32) -> u32 {
         self.runtime_ctx.select_poll_start(branches)
@@ -306,7 +304,7 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
 
     pub fn driver<'d, R>(
         &'d self,
-        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'reg>, Ctx<'rt, 'reg>>) -> R,
+        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'rt>, Ctx<'rt>>) -> R,
     ) -> R {
         f(RuntimeContextDriver::new(self))
     }
@@ -361,8 +359,8 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
 
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
-        S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
-        T: SingleShotOp<<PlatformDriver<'reg> as DriverRaw>::SlotSpec> + Send,
+        S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
+        T: SingleShotOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
         self.sync_registrar();
         submitter.submit(op, *self)
@@ -374,8 +372,8 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     /// 与 [`Self::submit`] 的区别只在「怎么看这个句柄」，提交路径完全相同。
     pub fn submit_stream<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Stream<T>
     where
-        S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
-        T: IntoPlatformOp<<PlatformDriver<'reg> as DriverRaw>::SlotSpec> + Send,
+        S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
+        T: IntoPlatformOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
         self.sync_registrar();
         submitter.submit_stream(op, *self)
@@ -392,13 +390,13 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         op: Op<T>,
     ) -> VeloqResult<(
         Result<
-            <T as IntoPlatformOp<<PlatformDriver<'reg> as DriverRaw>::SlotSpec>>::Completion,
+            <T as IntoPlatformOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec>>::Completion,
             DriverReport<DriverError>,
         >,
         T::Output,
     )>
     where
-        T: SingleShotOp<<PlatformDriver<'reg> as DriverRaw>::SlotSpec> + Send + 'd + 'reg,
+        T: SingleShotOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send + 'd + 'rt,
     {
         if self.runtime_ctx.worker_id() == worker_id {
             let (res, op_back) = self
@@ -425,8 +423,8 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     }
 }
 
-pub fn poll_current_driver<'reg>(
-    shared: &RuntimeShared<WorkerState<'reg>>,
+pub fn poll_current_driver<'rt>(
+    shared: &RuntimeShared<WorkerState<'rt>>,
 ) -> RuntimeResult<IdleDecision> {
     shared
         .extra_tls
@@ -463,8 +461,8 @@ pub fn poll_current_driver<'reg>(
         })?
 }
 
-pub(crate) fn submit_control_task<'rt, 'reg>(
-    shared: &'rt RuntimeShared<WorkerState<'reg>>,
+pub(crate) fn submit_control_task<'rt>(
+    shared: &'rt RuntimeShared<WorkerState<'rt>>,
     worker_id: usize,
     fd: IoFd,
 ) {
@@ -473,16 +471,16 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
     /// the compiler is free to reorder the fields — and does, depending on the size and
     /// alignment of `fd`. Same reason `GenericTaskNode` and `RouteJobTask` carry it.
     #[repr(C)]
-    struct UnregisterFileTask<'reg> {
+    struct UnregisterFileTask<'rt> {
         header: TaskHeader,
         fd: IoFd,
-        shared_ptr: *const RuntimeShared<WorkerState<'reg>>,
+        shared_ptr: *const RuntimeShared<WorkerState<'rt>>,
     }
 
-    unsafe impl<'reg> Send for UnregisterFileTask<'reg> {}
-    unsafe impl<'reg> Sync for UnregisterFileTask<'reg> {}
+    unsafe impl<'rt> Send for UnregisterFileTask<'rt> {}
+    unsafe impl<'rt> Sync for UnregisterFileTask<'rt> {}
 
-    impl<'reg> RawTask for UnregisterFileTask<'reg> {
+    impl<'rt> RawTask for UnregisterFileTask<'rt> {
         type Storage = AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
@@ -504,7 +502,7 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
         }
     }
 
-    impl<'reg> UnregisterFileTask<'reg> {
+    impl<'rt> UnregisterFileTask<'rt> {
         const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
             wake: |_| {},
             wake_by_ref: |_| {},
@@ -521,7 +519,7 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
 
     let task = Box::new(UnregisterFileTask {
         header: TaskHeader::new(
-            UnregisterFileTask::<'reg>::VTABLE,
+            UnregisterFileTask::<'rt>::VTABLE,
             &shared.base,
             worker_id,
             ScopeRef::<AtomicStorage>::dummy(),
@@ -546,8 +544,8 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
     }
 }
 
-pub fn park_current_driver<'reg>(
-    shared: &RuntimeShared<WorkerState<'reg>>,
+pub fn park_current_driver<'rt>(
+    shared: &RuntimeShared<WorkerState<'rt>>,
     _wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
     let res = shared.extra_tls.try_with(|extra| {

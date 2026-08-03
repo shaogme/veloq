@@ -104,11 +104,11 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local<'rt, 'reg>(
+    pub async fn open_local<'rt>(
         &self,
-        ctx: Ctx<'rt, 'reg>,
+        ctx: Ctx<'rt>,
         path: impl AsRef<Path>,
-    ) -> Result<LocalFile<'rt, 'reg>> {
+    ) -> Result<LocalFile<'rt>> {
         let op = self.build_op(&ctx, path.as_ref())?;
 
         let submitter = LocalSubmitter::new();
@@ -136,11 +136,7 @@ impl OpenOptions {
         })
     }
 
-    pub async fn open<'rt, 'reg>(
-        &self,
-        ctx: Ctx<'rt, 'reg>,
-        path: impl AsRef<Path>,
-    ) -> Result<File<'rt, 'reg>> {
+    pub async fn open<'rt>(&self, ctx: Ctx<'rt>, path: impl AsRef<Path>) -> Result<File<'rt>> {
         let op = self.build_op(&ctx, path.as_ref())?;
 
         let submitter = DetachedSubmitter::new();
@@ -171,7 +167,7 @@ impl OpenOptions {
     }
 
     #[cfg(unix)]
-    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
+    fn build_op(&self, ctx: &Ctx<'_>, path: &Path) -> Result<Open> {
         let path_bytes = path.as_os_str().as_bytes();
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
@@ -224,7 +220,7 @@ impl OpenOptions {
     }
 
     #[cfg(windows)]
-    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
+    fn build_op(&self, ctx: &Ctx<'_>, path: &Path) -> Result<Open> {
         const FAKE_NO_BUFFERING: u32 = 1 << 8;
         const FAKE_WRITE_THROUGH: u32 = 1 << 9;
 

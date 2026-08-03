@@ -41,7 +41,7 @@ impl Drop for CleanupGuard {
 
 fn run_with_runtime<F, R>(f: F) -> R
 where
-    F: for<'s1, 's2> std::ops::AsyncFnOnce(veloq::runtime::context::Ctx<'s1, 's2>) -> R,
+    F: for<'s> std::ops::AsyncFnOnce(veloq::runtime::context::Ctx<'s>) -> R,
 {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(Some(nz!(1)))

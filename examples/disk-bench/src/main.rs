@@ -175,8 +175,8 @@ fn get_file_path(t_idx: usize) -> PathBuf {
 
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
-async fn prepare_files_for_thread<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
+async fn prepare_files_for_thread<'rt>(
+    ctx: Ctx<'rt>,
     file_size: u64,
     t_idx: usize,
     buffering_mode: BufferingMode,
@@ -213,7 +213,7 @@ fn cleanup_files(threads: usize) {
     }
 }
 
-async fn apply_sync<'rt, 'reg>(file: &File<'rt, 'reg>, mode: SyncMode, bytes: u64) {
+async fn apply_sync<'rt>(file: &File<'rt>, mode: SyncMode, bytes: u64) {
     match mode {
         SyncMode::None => {}
         SyncMode::SyncRange => {
@@ -233,10 +233,10 @@ async fn apply_sync<'rt, 'reg>(file: &File<'rt, 'reg>, mode: SyncMode, bytes: u6
     }
 }
 
-async fn run_iteration_measured<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
+async fn run_iteration_measured<'rt>(
+    ctx: Ctx<'rt>,
     qdepth: usize,
-    file: &File<'rt, 'reg>,
+    file: &File<'rt>,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
@@ -323,8 +323,8 @@ async fn run_iteration_measured<'rt, 'reg>(
     }
 }
 
-async fn run_worker<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
+async fn run_worker<'rt>(
+    ctx: Ctx<'rt>,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,

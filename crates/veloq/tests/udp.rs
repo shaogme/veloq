@@ -22,14 +22,14 @@ use veloq_runtime::{select, task::yield_now};
 
 fn run_test<F, R>(f: F) -> R
 where
-    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     run_test_with_workers(nz!(1), f)
 }
 
 fn run_test_with_workers<F, R>(worker_threads: NonZeroUsize, f: F) -> R
 where
-    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(Some(worker_threads))
@@ -37,7 +37,7 @@ where
         .expect("failed to run scope")
 }
 
-fn bind_udp_socket<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, bind_addr: &str) -> UdpSocket<'rt, 'reg> {
+fn bind_udp_socket<'rt>(ctx: Ctx<'rt>, bind_addr: &str) -> UdpSocket<'rt> {
     UdpSocket::bind(ctx, bind_addr).expect("Failed to bind UDP socket")
 }
 
@@ -502,7 +502,7 @@ fn multithread_udp_echo() {
 #[test]
 fn multithread_udp_cross_worker_drop_is_routed() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::unbounded::<UdpSocket<'_, '_>>();
+        let state = mpsc::unbounded::<UdpSocket<'_>>();
         let (clone_tx, mut clone_rx) = state.split();
 
         scope!(ctx, async |s| {

@@ -70,7 +70,7 @@ const MAX_EXHAUSTED_REARMS: u32 = 8;
 /// 与 [`AcceptStream`](crate::net::AcceptStream) 里的 `AcceptMode` 同理：三个变体在两个平
 /// 台上都在，当 `capabilities().provided_buffers` 为 `false` 时（例如 IOCP 或未开启配置），
 /// `RecvStream` 会透明使用 `FallbackSingle` 降级路径，从 Runtime 缓冲池分配 Buffer 执行单发 recv。
-enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
+enum RecvMode<'rt, S: OpSubmitter<'rt, Ctx<'rt>>> {
     /// 一次提交，多条完成：句柄本身就是流。
     Native(S::Stream<RecvMulti>),
     /// 每取一条都重新提交一次单发 recv。`None` 表示当前没有在途的那一次。
@@ -95,12 +95,11 @@ enum RecvMode<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>> {
 ///
 /// 与所有其它操作一样，这条流在**创建它的那个 worker** 上提交——socket 的注册描述符是
 /// per-worker 的，provided buffer 环也是。
-pub struct RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: SocketTokenPtr<'rt, 'reg>>
-{
-    mode: Option<RecvMode<'rt, 'reg, S>>,
-    inner: InnerSocket<'rt, 'reg, P>,
+pub struct RecvStream<'rt, S: OpSubmitter<'rt, Ctx<'rt>>, P: SocketTokenPtr<'rt>> {
+    mode: Option<RecvMode<'rt, S>>,
+    inner: InnerSocket<'rt, P>,
     submitter: S,
-    ctx: Ctx<'rt, 'reg>,
+    ctx: Ctx<'rt>,
     /// `Native` 路径有没有产出过至少一项，见 [`RecvStream::downgraded`]。
     native_delivered: bool,
     /// 因为环空了而重新 arm 的累计次数（诊断用）。
@@ -109,21 +108,17 @@ pub struct RecvStream<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>>, P: Socket
     exhausted_streak: u32,
 }
 
-impl<'rt, 'reg, S, P> RecvStream<'rt, 'reg, S, P>
+impl<'rt, S, P> RecvStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>> + Copy,
+    P: SocketTokenPtr<'rt>,
 {
-    pub(crate) fn new(
-        ctx: Ctx<'rt, 'reg>,
-        inner: InnerSocket<'rt, 'reg, P>,
-        submitter: S,
-    ) -> Result<Self> {
+    pub(crate) fn new(ctx: Ctx<'rt>, inner: InnerSocket<'rt, P>, submitter: S) -> Result<Self> {
         let capabilities = ctx.driver(|driver| driver.capabilities());
 
         if let Some((mode, native_delivered, rearms, exhausted_streak)) = inner
             .token()
-            .take_recv::<(RecvMode<'rt, 'reg, S>, bool, u32, u32)>()
+            .take_recv::<(RecvMode<'rt, S>, bool, u32, u32)>()
         {
             return Ok(Self {
                 mode: Some(mode),
@@ -167,8 +162,8 @@ where
     }
 
     fn arm_native(
-        ctx: Ctx<'rt, 'reg>,
-        inner: &InnerSocket<'rt, 'reg, P>,
+        ctx: Ctx<'rt>,
+        inner: &InnerSocket<'rt, P>,
         submitter: S,
     ) -> S::Stream<RecvMulti> {
         let fd = inner.fd();
@@ -378,10 +373,10 @@ enum Flow {
     End,
 }
 
-impl<'rt, 'reg, S, P> Drop for RecvStream<'rt, 'reg, S, P>
+impl<'rt, S, P> Drop for RecvStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>>,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>>,
+    P: SocketTokenPtr<'rt>,
 {
     fn drop(&mut self) {
         if let Some(mode) = self.mode.take() {
@@ -395,10 +390,10 @@ where
     }
 }
 
-impl<'rt, 'reg, S, P> Stream for RecvStream<'rt, 'reg, S, P>
+impl<'rt, S, P> Stream for RecvStream<'rt, S, P>
 where
-    S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy,
-    P: SocketTokenPtr<'rt, 'reg>,
+    S: OpSubmitter<'rt, Ctx<'rt>> + Copy,
+    P: SocketTokenPtr<'rt>,
 {
     type Item = Result<FixedBuf>;
 

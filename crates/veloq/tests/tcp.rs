@@ -22,14 +22,14 @@ use veloq_runtime::{select, task::yield_now};
 
 fn run_test<F, R>(f: F) -> R
 where
-    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     run_test_with_workers(nz!(1), f)
 }
 
 fn run_test_with_workers<F, R>(worker_threads: NonZeroUsize, f: F) -> R
 where
-    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(Some(worker_threads))
@@ -570,7 +570,7 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
 #[cfg(target_os = "linux")]
 fn run_test_with_provided_buffers<F, R>(f: F) -> R
 where
-    F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     use veloq::config::ProvidedBufConfig;
 

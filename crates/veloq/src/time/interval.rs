@@ -17,15 +17,11 @@ pub enum MissedTickBehavior {
 // Sync/Send Interval
 // ============================================================================
 
-pub fn interval<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, period: Duration) -> Interval<'rt, 'reg> {
+pub fn interval<'rt>(ctx: Ctx<'rt>, period: Duration) -> Interval<'rt> {
     interval_at(ctx, Instant::now(), period)
 }
 
-pub fn interval_at<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
-    start: Instant,
-    period: Duration,
-) -> Interval<'rt, 'reg> {
+pub fn interval_at<'rt>(ctx: Ctx<'rt>, start: Instant, period: Duration) -> Interval<'rt> {
     Interval {
         period,
         next_tick: start,
@@ -34,14 +30,14 @@ pub fn interval_at<'rt, 'reg>(
     }
 }
 
-pub struct Interval<'rt, 'reg> {
+pub struct Interval<'rt> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: Sleep<'rt, 'reg>,
+    delay: Sleep<'rt>,
 }
 
-impl<'rt, 'reg> Interval<'rt, 'reg> {
+impl<'rt> Interval<'rt> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }
@@ -88,18 +84,15 @@ impl<'rt, 'reg> Interval<'rt, 'reg> {
 // Local Interval
 // ============================================================================
 
-pub fn interval_local<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
-    period: Duration,
-) -> LocalInterval<'rt, 'reg> {
+pub fn interval_local<'rt>(ctx: Ctx<'rt>, period: Duration) -> LocalInterval<'rt> {
     interval_at_local(ctx, Instant::now(), period)
 }
 
-pub fn interval_at_local<'rt, 'reg>(
-    ctx: Ctx<'rt, 'reg>,
+pub fn interval_at_local<'rt>(
+    ctx: Ctx<'rt>,
     start: Instant,
     period: Duration,
-) -> LocalInterval<'rt, 'reg> {
+) -> LocalInterval<'rt> {
     LocalInterval {
         period,
         next_tick: start,
@@ -108,14 +101,14 @@ pub fn interval_at_local<'rt, 'reg>(
     }
 }
 
-pub struct LocalInterval<'rt, 'reg> {
+pub struct LocalInterval<'rt> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: LocalSleep<'rt, 'reg>,
+    delay: LocalSleep<'rt>,
 }
 
-impl<'rt, 'reg> LocalInterval<'rt, 'reg> {
+impl<'rt> LocalInterval<'rt> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }

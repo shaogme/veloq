@@ -56,24 +56,24 @@ fn close_raw_handle(raw: RawHandle) {
 
 // fn unregister_fixed_fd is no longer needed globally
 
-pub struct LocalFile<'rt, 'reg> {
+pub struct LocalFile<'rt> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter<Ctx<'rt, 'reg>>,
+    pub(crate) submitter: LocalSubmitter<Ctx<'rt>>,
     pub(crate) pos: Cell<u64>,
-    pub(crate) ctx: Ctx<'rt, 'reg>,
+    pub(crate) ctx: Ctx<'rt>,
 }
 
-pub struct File<'rt, 'reg> {
+pub struct File<'rt> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
     pub(crate) owner_worker_id: usize,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
-    pub(crate) ctx: Ctx<'rt, 'reg>,
+    pub(crate) ctx: Ctx<'rt>,
 }
 
-impl<'rt, 'reg> Drop for LocalFile<'rt, 'reg> {
+impl<'rt> Drop for LocalFile<'rt> {
     fn drop(&mut self) {
         self.ctx.runtime_ctx.shared().extra_tls.with(|extra| {
             let mut driver = extra.driver.borrow_mut();
@@ -83,7 +83,7 @@ impl<'rt, 'reg> Drop for LocalFile<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> Drop for File<'rt, 'reg> {
+impl<'rt> Drop for File<'rt> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -97,7 +97,7 @@ impl<'rt, 'reg> Drop for File<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> LocalFile<'rt, 'reg> {
+impl<'rt> LocalFile<'rt> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -219,7 +219,7 @@ impl<'rt, 'reg> LocalFile<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for LocalFile<'rt, 'reg> {
+impl<'rt> AsyncBufRead for LocalFile<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -246,7 +246,7 @@ impl<'rt, 'reg> AsyncBufRead for LocalFile<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for LocalFile<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for LocalFile<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -281,7 +281,7 @@ impl<'rt, 'reg> AsyncBufWrite for LocalFile<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> File<'rt, 'reg> {
+impl<'rt> File<'rt> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -397,20 +397,20 @@ impl<'rt, 'reg> File<'rt, 'reg> {
         res.map(|_| ()).trans()
     }
 
-    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'rt, 'reg> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'rt> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 }
 
-pub struct SyncRangeBuilder<'f, 'rt, 'reg> {
-    file: &'f File<'rt, 'reg>,
+pub struct SyncRangeBuilder<'f, 'rt> {
+    file: &'f File<'rt>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'f, 'rt, 'reg> SyncRangeBuilder<'f, 'rt, 'reg> {
-    fn new(file: &'f File<'rt, 'reg>, offset: u64, nbytes: u64) -> Self {
+impl<'f, 'rt> SyncRangeBuilder<'f, 'rt> {
+    fn new(file: &'f File<'rt>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -463,9 +463,9 @@ impl<'f, 'rt, 'reg> SyncRangeBuilder<'f, 'rt, 'reg> {
     }
 }
 
-impl<'f, 'rt, 'reg> IntoFuture for SyncRangeBuilder<'f, 'rt, 'reg> {
+impl<'f, 'rt> IntoFuture for SyncRangeBuilder<'f, 'rt> {
     type Output = Result<usize>;
-    type IntoFuture = SyncRangeFuture<'rt, 'reg>;
+    type IntoFuture = SyncRangeFuture<'rt>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op = FileSyncFileRangeRaw {
@@ -481,11 +481,11 @@ impl<'f, 'rt, 'reg> IntoFuture for SyncRangeBuilder<'f, 'rt, 'reg> {
     }
 }
 
-pub struct SyncRangeFuture<'rt, 'reg> {
-    inner: <DetachedSubmitter as OpSubmitter<'reg, Ctx<'rt, 'reg>>>::Future<FileSyncFileRangeRaw>,
+pub struct SyncRangeFuture<'rt> {
+    inner: <DetachedSubmitter as OpSubmitter<'rt, Ctx<'rt>>>::Future<FileSyncFileRangeRaw>,
 }
 
-impl<'rt, 'reg> Future for SyncRangeFuture<'rt, 'reg> {
+impl<'rt> Future for SyncRangeFuture<'rt> {
     type Output = Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -500,7 +500,7 @@ impl<'rt, 'reg> Future for SyncRangeFuture<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufRead for File<'rt, 'reg> {
+impl<'rt> AsyncBufRead for File<'rt> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -527,7 +527,7 @@ impl<'rt, 'reg> AsyncBufRead for File<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> AsyncBufWrite for File<'rt, 'reg> {
+impl<'rt> AsyncBufWrite for File<'rt> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -562,15 +562,12 @@ impl<'rt, 'reg> AsyncBufWrite for File<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> LocalFile<'rt, 'reg> {
-    pub async fn open(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<LocalFile<'rt, 'reg>> {
+impl<'rt> LocalFile<'rt> {
+    pub async fn open(ctx: Ctx<'rt>, path: impl AsRef<Path>) -> Result<LocalFile<'rt>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
-    pub async fn create(
-        ctx: Ctx<'rt, 'reg>,
-        path: impl AsRef<Path>,
-    ) -> Result<LocalFile<'rt, 'reg>> {
+    pub async fn create(ctx: Ctx<'rt>, path: impl AsRef<Path>) -> Result<LocalFile<'rt>> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -580,12 +577,12 @@ impl<'rt, 'reg> LocalFile<'rt, 'reg> {
     }
 }
 
-impl<'rt, 'reg> File<'rt, 'reg> {
-    pub async fn open(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<File<'rt, 'reg>> {
+impl<'rt> File<'rt> {
+    pub async fn open(ctx: Ctx<'rt>, path: impl AsRef<Path>) -> Result<File<'rt>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
-    pub async fn create(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<File<'rt, 'reg>> {
+    pub async fn create(ctx: Ctx<'rt>, path: impl AsRef<Path>) -> Result<File<'rt>> {
         OpenOptions::new()
             .write(true)
             .create(true)
