@@ -1,42 +1,43 @@
 services:
+  # Base configuration for the application
+  app-base: &app-base
+    image: ghcr.io/shaogme/coding-images/rust-common:latest
+    environment:
+      - ROOT_PASSWORD=root # Set your secure password here
+    security_opt:
+      - seccomp:unconfined # Required for some low-level operations
+    cap_add:
+      - SYS_PTRACE
+      - NET_ADMIN
+    tty: true
+
   # Develop mode: Mounts local directory for hot-reloading (Default)
   dev:
-    image: ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
-    environment:
-      - ROOT_PASSWORD=root # Set your secure password here
-    security_opt:
-      - seccomp:unconfined # Required for some low-level operations
-    cap_add:
-      - SYS_PTRACE
-      - NET_ADMIN
-    tty: true
-    container_name: dev
+    <<: *app-base
+    container_name: veloq-dev
     volumes:
+      # Mount host source code
       - .:/root/workspace
-      # Mount host SSH public key to temporary location
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
-    ports:
-      # SSH port mapping: connect via `ssh root@localhost -p 2222`
-      - "2222:22"
+      # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
+      - rust-target:/root/workspace/target
+      # Persist Cargo dependencies, crate index, and git checkouts
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      # Persist direnv data
+      - direnv-data:/root/.local/share/direnv
+      # Persist codex configuration
+      - codex-config:/root/.codex
+      - gemini-config:/root/.gemini
+      - opencode-config:/root/.config/opencode
+      - claude-config:/root/.claude
 
-  # Standalone mode: Uses code copied into the image (No host mounting)
-  standalone:
-    build:
-      context: .
-      dockerfile: .docker/Dockerfile.standalone
-    image: veloq-workspace-standalone:latest
-    environment:
-      - ROOT_PASSWORD=root # Set your secure password here
-    security_opt:
-      - seccomp:unconfined # Required for some low-level operations
-    cap_add:
-      - SYS_PTRACE
-      - NET_ADMIN
-    tty: true
-    container_name: standalone
-    volumes:
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
-    ports:
-      - "2223:22"
-    profiles:
-      - standalone
+volumes:
+  rust-target:
+  cargo-registry:
+  cargo-git:
+  mise-cache:
+  direnv-data:
+  codex-config:
+  gemini-config:
+  opencode-config:
+  claude-config:
