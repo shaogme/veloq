@@ -102,8 +102,10 @@ fn owned_wide_path(bytes: &[u8]) -> IocpResult<Vec<u16>> {
     }
 
     let mut path = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_ne_bytes(*chunk))
         .collect::<Vec<_>>();
     if path.last().copied() != Some(0) {
         path.push(0);

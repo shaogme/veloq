@@ -30,7 +30,7 @@ pub(crate) mod sys {
     mod win {
         use std::ffi::c_void;
 
-        #[link(name = "Synchronization")]
+        #[link(name = "synchronization")]
         unsafe extern "system" {
             pub fn WaitOnAddress(
                 address: *const c_void,
