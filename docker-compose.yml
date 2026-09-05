@@ -1,14 +1,29 @@
 services:
   # Base configuration for the application
   app-base: &app-base
-    image: ghcr.io/shaogme/coding-images/rust-common:latest
+    image: ghcr.io/shaogme/coding-images/rust-cross:latest
+    privileged: true
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
+      - MISE_YES=1 # Non-interactive mode for mise
+      - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+      - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
+      - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
+      - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
+      - RUSTC_WRAPPER=${RUSTC_WRAPPER:-sccache} # Enable sccache compiler wrapper by default
+      - SCCACHE_DIR=/data/sccache # Directory for sccache compiler cache storage
+      - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
+      - CROSS_CONTAINER_ENGINE=podman # Direct cross to use containerized Podman engine
     security_opt:
-      - seccomp:unconfined # Required for some low-level operations
+      - seccomp:unconfined # Required for inner container execution and trace
+      - label:disable # Disable SELinux labeling separation for containers
     cap_add:
+      - SYS_ADMIN
       - SYS_PTRACE
       - NET_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse # Allow fuse-overlayfs inside container
+      - /dev/net/tun:/dev/net/tun # Allow TUN/TAP devices for Podman to create network interfaces
     tty: true
 
   # Develop mode: Mounts local directory for hot-reloading (Default)
@@ -17,27 +32,28 @@ services:
     container_name: veloq-dev
     volumes:
       # Mount host source code
-      - .:/root/workspace
+      - .:/workspace
+      - /workspace/.git
       # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
-      - rust-target:/root/workspace/target
+      - rust-target:/data/.cargo/target
       # Persist Cargo dependencies, crate index, and git checkouts
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
+      - cargo-registry:${CONTAINER_HOME:-/home/dev}/.cargo/registry
+      - cargo-git:${CONTAINER_HOME:-/home/dev}/.cargo/git
+      # Persist sccache compiler cache
+      - sccache-cache:/data/sccache
+      # Persist Podman containers and cached cross-compilation toolchain images
+      - podman-containers:/var/lib/containers
       # Persist direnv data
-      - direnv-data:/root/.local/share/direnv
-      # Persist codex configuration
-      - codex-config:/root/.codex
-      - gemini-config:/root/.gemini
-      - opencode-config:/root/.config/opencode
-      - claude-config:/root/.claude
+      - direnv-data:/data/direnv
+      # Persist unified AI credentials and tool configurations
+      - coding-config:/data/coding-config
 
 volumes:
   rust-target:
   cargo-registry:
   cargo-git:
+  sccache-cache:
+  podman-containers:
   mise-cache:
   direnv-data:
-  codex-config:
-  gemini-config:
-  opencode-config:
-  claude-config:
+  coding-config:
